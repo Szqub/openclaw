@@ -427,6 +427,8 @@ const subagentSweeper = createSubagentRegistrySweeper({
     subagentRunManager.abandonSubagentRestartRecoveryLaunch(params),
   clearAcceptedSubagentRestartRecovery: (params) =>
     subagentRunManager.clearAcceptedSubagentRestartRecovery(params),
+  clearPendingSubagentRecoveryNotice: (params) =>
+    subagentRunManager.clearPendingSubagentRecoveryNotice(params),
   resumeSettledSubagentRestartRecovery: (params) =>
     subagentRunManager.resumeSettledSubagentRestartRecovery(params),
   replaceSubagentRunAfterSteer: (params) => subagentRunManager.replaceSubagentRunAfterSteer(params),
@@ -436,6 +438,8 @@ const subagentSweeper = createSubagentRegistrySweeper({
     subagentRunManager.markSubagentRestartRecoveryLaunchAccepted(params),
   markSubagentRestartRecoveryLaunchConsumed: (params) =>
     subagentRunManager.markSubagentRestartRecoveryLaunchConsumed(params),
+  markPendingSubagentRecoveryNotice: (params) =>
+    subagentRunManager.markPendingSubagentRecoveryNotice(params),
   reserveSubagentRestartRecoveryLaunch: (params) =>
     subagentRunManager.reserveSubagentRestartRecoveryLaunch(params),
   resetSubagentRestartRecoveryLaunchAttempt: (params) =>

@@ -258,6 +258,8 @@ export type SubagentRunRecord = {
   suppressAnnounceReason?: "steer-restart" | "killed";
   /** Sticky owner while restart recovery replays this exact terminal run. */
   terminalOwner?: "interrupted-recovery";
+  /** Durable requester notice debt, independent of restart execution ownership. */
+  resumptionNotice?: { idempotencyKey: string };
   /** Present only while a current-version killed run awaits bounded reconciliation. */
   killReconciliation?: SubagentKillReconciliationState;
   /** Durable operator cancellation ownership before runtime side effects complete. */

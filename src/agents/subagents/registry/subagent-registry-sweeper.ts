@@ -48,6 +48,7 @@ const restartRecoveryLoader = createLazyImportLoader(
   () => import("./subagent-registry-restart-recovery.js"),
 );
 const killRuntimeLoader = createLazyImportLoader(() => import("./subagent-control.runtime.js"));
+type SubagentRunManager = ReturnType<typeof createSubagentRunManager>;
 
 export function createSubagentRegistrySweeper(params: {
   runs: Map<string, SubagentRunRecord>;
@@ -61,33 +62,17 @@ export function createSubagentRegistrySweeper(params: {
     source: string,
   ) => Promise<void>;
   getGatewayRecoveryRuntime: () => GatewayRecoveryRuntime | undefined;
-  abandonSubagentRestartRecoveryLaunch: ReturnType<
-    typeof createSubagentRunManager
-  >["abandonSubagentRestartRecoveryLaunch"];
-  clearAcceptedSubagentRestartRecovery: ReturnType<
-    typeof createSubagentRunManager
-  >["clearAcceptedSubagentRestartRecovery"];
-  resumeSettledSubagentRestartRecovery: ReturnType<
-    typeof createSubagentRunManager
-  >["resumeSettledSubagentRestartRecovery"];
-  replaceSubagentRunAfterSteer: ReturnType<
-    typeof createSubagentRunManager
-  >["replaceSubagentRunAfterSteer"];
-  markSubagentRestartRecoveryLaunchAttempted: ReturnType<
-    typeof createSubagentRunManager
-  >["markSubagentRestartRecoveryLaunchAttempted"];
-  markSubagentRestartRecoveryLaunchAccepted: ReturnType<
-    typeof createSubagentRunManager
-  >["markSubagentRestartRecoveryLaunchAccepted"];
-  markSubagentRestartRecoveryLaunchConsumed: ReturnType<
-    typeof createSubagentRunManager
-  >["markSubagentRestartRecoveryLaunchConsumed"];
-  reserveSubagentRestartRecoveryLaunch: ReturnType<
-    typeof createSubagentRunManager
-  >["reserveSubagentRestartRecoveryLaunch"];
-  resetSubagentRestartRecoveryLaunchAttempt: ReturnType<
-    typeof createSubagentRunManager
-  >["resetSubagentRestartRecoveryLaunchAttempt"];
+  abandonSubagentRestartRecoveryLaunch: SubagentRunManager["abandonSubagentRestartRecoveryLaunch"];
+  clearAcceptedSubagentRestartRecovery: SubagentRunManager["clearAcceptedSubagentRestartRecovery"];
+  clearPendingSubagentRecoveryNotice: SubagentRunManager["clearPendingSubagentRecoveryNotice"];
+  resumeSettledSubagentRestartRecovery: SubagentRunManager["resumeSettledSubagentRestartRecovery"];
+  replaceSubagentRunAfterSteer: SubagentRunManager["replaceSubagentRunAfterSteer"];
+  markSubagentRestartRecoveryLaunchAttempted: SubagentRunManager["markSubagentRestartRecoveryLaunchAttempted"];
+  markSubagentRestartRecoveryLaunchAccepted: SubagentRunManager["markSubagentRestartRecoveryLaunchAccepted"];
+  markSubagentRestartRecoveryLaunchConsumed: SubagentRunManager["markSubagentRestartRecoveryLaunchConsumed"];
+  markPendingSubagentRecoveryNotice: SubagentRunManager["markPendingSubagentRecoveryNotice"];
+  reserveSubagentRestartRecoveryLaunch: SubagentRunManager["reserveSubagentRestartRecoveryLaunch"];
+  resetSubagentRestartRecoveryLaunchAttempt: SubagentRunManager["resetSubagentRestartRecoveryLaunchAttempt"];
   finalizeInterruptedSubagentRun: ReturnType<
     typeof createSubagentRegistryCompletionRuntime
   >["finalizeInterruptedSubagentRun"];
@@ -174,11 +159,13 @@ export function createSubagentRegistrySweeper(params: {
     getGatewayRuntime: params.getGatewayRecoveryRuntime,
     abandonLaunch: params.abandonSubagentRestartRecoveryLaunch,
     clearAcceptedRecovery: params.clearAcceptedSubagentRestartRecovery,
+    clearPendingNotice: params.clearPendingSubagentRecoveryNotice,
     resumeAcceptedRecovery: params.resumeSettledSubagentRestartRecovery,
     replaceRun: params.replaceSubagentRunAfterSteer,
     markLaunchAttempted: params.markSubagentRestartRecoveryLaunchAttempted,
     markLaunchAccepted: params.markSubagentRestartRecoveryLaunchAccepted,
     markLaunchConsumed: params.markSubagentRestartRecoveryLaunchConsumed,
+    markPendingNotice: params.markPendingSubagentRecoveryNotice,
     reserveLaunch: params.reserveSubagentRestartRecoveryLaunch,
     resetLaunchAttempt: params.resetSubagentRestartRecoveryLaunchAttempt,
     finalizeRun: params.finalizeInterruptedSubagentRun,
@@ -353,7 +340,8 @@ export function createSubagentRegistrySweeper(params: {
           continue;
         }
         if (
-          (entry.execution.restartRecovery?.phase === "accepted" ||
+          (entry.resumptionNotice !== undefined ||
+            entry.execution.restartRecovery?.phase === "accepted" ||
             entry.terminalOwner === "interrupted-recovery" ||
             (!getAgentRunContext(runId) && typeof entry.execution.endedAt !== "number")) &&
           (await recovery.recover(runId, entry, now))
