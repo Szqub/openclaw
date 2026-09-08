@@ -14,7 +14,7 @@ import {
   publishChatSessionProjection,
   reduceChatSessionProjection,
 } from "./history-merge.ts";
-import { appendChatDraftText, handleChatDraftChange } from "./input-history.ts";
+import { handleChatDraftChange } from "./input-history.ts";
 import {
   cacheChatSessionSnapshot,
   readChatMessagesFromCache,
@@ -71,30 +71,6 @@ function activeHistory(runId: string): ChatHistoryResult {
   } satisfies ChatHistoryResult;
 }
 
-describe("appendChatDraftText", () => {
-  it("appends an inline command without changing an existing mention", () => {
-    const state = createState({ messages: [] }) as TestState &
-      Parameters<typeof handleChatDraftChange>[0] & {
-        handleChatDraftChange: (
-          next: string,
-          mentions?: readonly { profileId: string; start: number; end: number }[],
-        ) => void;
-      };
-    const mention = { profileId: "alex-profile", start: 7, end: 12 };
-    state.chatMessage = "Review @Alex";
-    state.chatMentions = [mention];
-    const handleDraftChange = vi.fn((next: string, mentions?: ChatState["chatMentions"]) =>
-      handleChatDraftChange(state, next, mentions),
-    );
-    state.handleChatDraftChange = handleDraftChange;
-
-    expect(appendChatDraftText(state, "/dashboard ")).toBe("Review @Alex /dashboard ");
-    expect(state.chatMessage).toBe("Review @Alex /dashboard ");
-    expect(state.chatMentions).toEqual([mention]);
-    expect(handleDraftChange).toHaveBeenCalledWith("Review @Alex /dashboard ", state.chatMentions);
-  });
-});
-
 it.each(["main", "workspace"])(
   "requests the configured default agent for global main alias %s",
   async (sessionKey) => {
@@ -107,7 +83,8 @@ it.each(["main", "workspace"])(
     expect(request).toHaveBeenCalledWith("chat.history", {
       sessionKey,
       agentId: "main",
-      limit: 800,
+      limit: 80,
+      maxBytes: 256 * 1024,
     });
   },
 );
@@ -390,10 +367,7 @@ describe("rewindChatHistory", () => {
   });
 
   it("reconciles committed rewind history without overwriting a replacement draft", async () => {
-    let resolveRewind!: (result: { editorText?: string }) => void;
-    const rewind = new Promise<{ editorText?: string }>((resolve) => {
-      resolveRewind = resolve;
-    });
+    const { promise: rewind, resolve: resolveRewind } = createDeferred<{ editorText?: string }>();
     const canonical = { role: "assistant", content: "canonical history after rewind" };
     const state = createState({ messages: [canonical] }) as TestState & {
       handleChatDraftChange: ReturnType<typeof vi.fn>;
@@ -543,10 +517,8 @@ describe("switchChatHistoryBranch", () => {
   });
 
   it("starts a fresh snapshot and rejects in-flight history after a same-key branch switch", async () => {
-    let resolvePreviousHistory!: (result: ChatHistoryResult) => void;
-    const previousHistory = new Promise<ChatHistoryResult>((resolve) => {
-      resolvePreviousHistory = resolve;
-    });
+    const { promise: previousHistory, resolve: resolvePreviousHistory } =
+      createDeferred<ChatHistoryResult>();
     const previous = { role: "assistant", content: "private old branch" };
     const selected = { role: "assistant", content: "selected branch" };
     const state = createState({ messages: [selected] }) as TestState & {
@@ -724,10 +696,7 @@ describe("canonical history snapshot projection", () => {
   });
 
   it("coalesces stale history while distinct live peer messages update the transcript", async () => {
-    let resolveHistory!: (history: ChatHistoryResult) => void;
-    const history = new Promise<ChatHistoryResult>((resolve) => {
-      resolveHistory = resolve;
-    });
+    const { promise: history, resolve: resolveHistory } = createDeferred<ChatHistoryResult>();
     const first = message("user", "shared prompt", {
       id: "canonical-web-same-text",
       idempotencyKey: "web-same-text-run:user",
@@ -772,10 +741,7 @@ describe("canonical history snapshot projection", () => {
   });
 
   it("preserves pending input appended while the authoritative request is in flight", async () => {
-    let resolveHistory!: (history: ChatHistoryResult) => void;
-    const history = new Promise<ChatHistoryResult>((resolve) => {
-      resolveHistory = resolve;
-    });
+    const { promise: history, resolve: resolveHistory } = createDeferred<ChatHistoryResult>();
     const first = message("user", "first prompt", { id: "first-user", seq: 1 });
     const pending = message("user", "concurrent prompt", {
       idempotencyKey: "concurrent-run:user",
