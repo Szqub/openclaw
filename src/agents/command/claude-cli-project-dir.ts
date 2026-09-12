@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
-const CLAUDE_PROJECTS_DIRNAME = path.join(".claude", "projects");
 const MAX_SANITIZED_PROJECT_LENGTH = 200;
 
 // Claude CLI stores project state under a sanitized workspace key. Add a stable
@@ -42,12 +41,18 @@ function canonicalizeWorkspaceDir(workspaceDir: string): string {
 export function resolveClaudeCliProjectDirForWorkspace(params: {
   workspaceDir: string;
   homeDir?: string;
+  env?: NodeJS.ProcessEnv;
 }): string {
-  const homeDir = normalizeOptionalString(params.homeDir) || process.env.HOME || os.homedir();
+  const env = params.env ?? process.env;
+  const homeDir = normalizeOptionalString(params.homeDir) || env.HOME || os.homedir();
   const canonicalWorkspaceDir = canonicalizeWorkspaceDir(params.workspaceDir);
-  return path.join(
-    homeDir,
-    CLAUDE_PROJECTS_DIRNAME,
+  // Claude Code uses nullish selection and NFC, preserving empty values and spaces.
+  // Relative config roots belong to the Claude child cwd, not the Gateway cwd.
+  const configDir = (env.CLAUDE_CONFIG_DIR ?? path.join(homeDir, ".claude")).normalize("NFC");
+  return path.resolve(
+    canonicalWorkspaceDir,
+    configDir,
+    "projects",
     sanitizeClaudeCliProjectKey(canonicalWorkspaceDir),
   );
 }
