@@ -16,7 +16,10 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const EXPECTED_HEAD = "d165b4954dcc0b5ad0fb3cf999a6ce28753420ea";
+const candidateArg = process.argv.indexOf("--candidate");
+const EXPECTED_HEAD =
+  candidateArg < 0 ? "d165b4954dcc0b5ad0fb3cf999a6ce28753420ea" : process.argv[candidateArg + 1];
+if (!/^[a-f0-9]{40}$/.test(EXPECTED_HEAD)) throw new Error("invalid candidate SHA");
 const CLAUDE_VERSION = "2.1.269";
 const GATEWAY_TOKEN = "pr145895-proof-token";
 const MODEL = "claude-cli/claude-sonnet-4-6";
