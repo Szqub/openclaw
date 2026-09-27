@@ -17,85 +17,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  schema20:
-    if: github.repository == 'Szqub/openclaw'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 80
-    env:
-      CI: "1"
-      OPENCLAW_VITEST_MAX_WORKERS: "2"
-      OPENCLAW_TEST_PROJECTS_PARALLEL: "1"
-    steps:
-      - name: Checkout exact schema-20 candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: d165b4954dcc0b5ad0fb3cf999a6ce28753420ea
-          fetch-depth: 5
-          persist-credentials: false
-      - name: Checkout proof tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          path: tooling
-          sparse-checkout: scripts/pr145895-proof
-          sparse-checkout-cone-mode: false
-      - name: Verify candidate and prepare evidence
-        run: |
-          test "$(git rev-parse HEAD)" = d165b4954dcc0b5ad0fb3cf999a6ce28753420ea
-          mkdir -p "$RUNNER_TEMP/pr145895-evidence"
-          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' d165b4954dcc0b5ad0fb3cf999a6ce28753420ea c23b86fc222700517d1e8a6d32784f80668fdde6 20 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
-      - name: Setup frozen candidate toolchain
-        uses: ./.github/actions/setup-node-env
-        with:
-          node-version: "26.x"
-          install-bun: "false"
-          install-deps: "false"
-          cache-mode: "off"
-      - name: Install candidate dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Run focused regression coverage
-        run: |
-          set -o pipefail
-          node scripts/run-vitest.mjs run \
-            src/agents/cli-runner.claude-config-dir.test.ts \
-            src/agents/cli-runner/execute.claude-config-dir.test.ts \
-            src/agents/cli-runner/cli-run-settlement.test.ts \
-            src/agents/cli-runner/prepare.test.ts \
-            src/agents/command/attempt-execution.test.ts \
-            src/agents/command/attempt-execution.cli.test.ts \
-            src/agents/command/claude-cli-project-dir.test.ts \
-            src/agents/command/claude-cli-project-dir.windows.test.ts \
-            src/agents/cli-session.test.ts \
-            src/skills/loading/skills.test.ts \
-            src/commands/doctor-claude-cli.test.ts \
-            src/gateway/cli-session-history.claude-config-dir.test.ts \
-            src/gateway/server-methods/chat-history-handler.cli-import.test.ts \
-            2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/focused-tests.log"
-      - name: Verify same-schema older-writer compatibility and migration
-        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate d165b4954dcc0b5ad0fb3cf999a6ce28753420ea --parent c23b86fc222700517d1e8a6d32784f80668fdde6 --schema 20 --output "$RUNNER_TEMP/pr145895-evidence" --export-fixture "$RUNNER_TEMP/schema20-fixture"
-      - name: Upload synthetic schema-20 migration fixture
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: pr145895-schema20-upgrade-fixture
-          path: ${{ runner.temp }}/schema20-fixture/
-          if-no-files-found: error
-          retention-days: 7
-      - name: Verify tracked source stayed unchanged
-        if: always()
-        run: git diff --exit-code HEAD
-      - name: Upload schema-20 proof evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: pr145895-schema20-proof
-          path: ${{ runner.temp }}/pr145895-evidence/
-          if-no-files-found: error
-          retention-days: 30
   schema23:
     if: github.repository == 'Szqub/openclaw'
     runs-on: ubuntu-24.04
     timeout-minutes: 80
-    needs: schema20
     env:
       CI: "1"
       OPENCLAW_VITEST_MAX_WORKERS: "2"
@@ -104,7 +29,7 @@ jobs:
       - name: Checkout exact schema-23 candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: a1107fbefda226456bd643d7bb6eb2cfaa3ba4bc
+          ref: 671383ccbf054ebaeb7d41df6bc0348e83352e28
           fetch-depth: 5
           persist-credentials: false
       - name: Checkout proof tooling
@@ -116,9 +41,10 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Verify candidate and prepare evidence
         run: |
-          test "$(git rev-parse HEAD)" = a1107fbefda226456bd643d7bb6eb2cfaa3ba4bc
+          test "$(git rev-parse HEAD)" = 671383ccbf054ebaeb7d41df6bc0348e83352e28
           mkdir -p "$RUNNER_TEMP/pr145895-evidence"
-          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' a1107fbefda226456bd643d7bb6eb2cfaa3ba4bc 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
+          printf '%s\n' 'Unchanged schema20 candidate d165:545tests/13files and7compatibility phases passed in https://github.com/Szqub/openclaw/actions/runs/36354847709 . The pristine fixture comes from that exact run.' > "$RUNNER_TEMP/pr145895-evidence/schema20-reference.txt"
+          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' 671383ccbf054ebaeb7d41df6bc0348e83352e28 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
       - name: Setup frozen candidate toolchain
         uses: ./.github/actions/setup-node-env
         with:
@@ -127,8 +53,10 @@ jobs:
           install-deps: "false"
           cache-mode: "off"
       - name: Install candidate dependencies
+        id: install
         run: pnpm install --frozen-lockfile
       - name: Run focused regression coverage
+        id: regressions
         run: |
           set -o pipefail
           node scripts/run-vitest.mjs run \
@@ -147,12 +75,15 @@ jobs:
             src/gateway/server-methods/chat-history-handler.cli-import.test.ts \
             2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/focused-tests.log"
       - name: Download schema-20 migration fixture
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name pr145895-schema20-upgrade-fixture --dir "$RUNNER_TEMP/schema20-fixture"
+        run: gh run download 36354847709 --repo "$GITHUB_REPOSITORY" --name pr145895-schema20-upgrade-fixture --dir "$RUNNER_TEMP/schema20-fixture"
       - name: Verify same-schema older-writer compatibility and migration
-        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate a1107fbefda226456bd643d7bb6eb2cfaa3ba4bc --parent 66898a633464e85e4aea8fd5a0fd2043c88025af --schema 23 --output "$RUNNER_TEMP/pr145895-evidence" --upgrade-fixture "$RUNNER_TEMP/schema20-fixture"
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate 671383ccbf054ebaeb7d41df6bc0348e83352e28 --parent 66898a633464e85e4aea8fd5a0fd2043c88025af --schema 23 --output "$RUNNER_TEMP/pr145895-evidence" --upgrade-fixture "$RUNNER_TEMP/schema20-fixture"
       - name: Verify skill-root regression detects the missing preparation overlay
+        if: ${{ !cancelled() && steps.regressions.outcome == 'success' }}
         run: |
           set -o pipefail
           cp src/agents/cli-runner/prepare.ts "$RUNNER_TEMP/prepare-fixed.ts"
@@ -166,25 +97,31 @@ jobs:
           rg -q 'AssertionError' "$RUNNER_TEMP/pr145895-evidence/skill-regression-negative.log"
           printf 'Pre-fix preparation failed the targeted behavioral assertion (exit %s). Fixed version passed in focused coverage.\n' "$result" > "$RUNNER_TEMP/pr145895-evidence/skill-regression-negative.txt"
       - name: Check integration formatting and lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -o pipefail
           git diff --check 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD
           git diff --name-only -z 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD -- src docs | xargs -0 pnpm exec oxfmt --check
           git diff --name-only -z 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
       - name: Check types and import cycles
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
           set -o pipefail
           pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
           pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-tests.log"
           pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/import-cycles.log"
       - name: Build current-main runtime
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        id: build
         run: pnpm build:docker
       - name: Install pinned official Claude Code
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           npm install --prefix "$RUNNER_TEMP/pr145895-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
           echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Run isolated current-main Gateway and native Claude proof
-        run: node tooling/scripts/pr145895-proof/runtime.mjs --candidate a1107fbefda226456bd643d7bb6eb2cfaa3ba4bc --scenario all --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node tooling/scripts/pr145895-proof/runtime.mjs --candidate 671383ccbf054ebaeb7d41df6bc0348e83352e28 --scenario all --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
       - name: Verify tracked source stayed unchanged
         if: always()
         run: git diff --exit-code HEAD
