@@ -346,11 +346,18 @@ async function runPreparedCliAgentOwned(
             },
           };
     diagnosticLifecycle?.setPhase("send");
-    const output = await executePreparedCliRun(
-      attemptContext,
-      cliSessionIdToUse,
-      diagnosticLifecycle ? { onPhase: diagnosticLifecycle.setPhase } : undefined,
-    );
+    let output: Awaited<ReturnType<typeof executePreparedCliRun>>;
+    try {
+      output = await executePreparedCliRun(
+        attemptContext,
+        cliSessionIdToUse,
+        diagnosticLifecycle ? { onPhase: diagnosticLifecycle.setPhase } : undefined,
+      );
+    } finally {
+      // The attempt may run on a copy; settlement and the flush probe read this context.
+      context.claudeTranscriptRoot =
+        attemptContext.claudeTranscriptRoot ?? context.claudeTranscriptRoot;
+    }
     // Test facades and non-instrumented executors may not signal the boundary.
     diagnosticLifecycle?.setPhase("resolve");
     const sourceReplyMirror = resolveCliSourceReplyMirror({

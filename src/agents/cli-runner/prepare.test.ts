@@ -6396,14 +6396,18 @@ describe("prepareCliRunContext", () => {
     setCliBackendForPrepareTest({
       prepareExecution: async () => ({ env: { CLAUDE_CONFIG_DIR: childConfigDir } }),
     });
-    const transcriptCheck = vi.fn(async () => true);
+    const staleProjectsRoot = path.join(dir, "previous-claude-profile", "projects");
+    // The transcript only exists under the profile the previous run wrote to.
+    const transcriptCheck = vi.fn(
+      async (probe: { projectsRoot?: string }) => probe.projectsRoot === staleProjectsRoot,
+    );
     const orphanCheck = vi.fn(async () => false);
     setCliRunnerPrepareTestDeps({
       claudeCliSessionTranscriptHasContent: transcriptCheck,
       claudeCliSessionTranscriptHasOrphanedToolUse: orphanCheck,
     });
 
-    await fixture.prepare({
+    const context = await fixture.prepare({
       sessionKey: "agent:main:telegram:direct:peer",
       prompt: "follow-up",
       provider: "claude-cli",
@@ -6412,18 +6416,22 @@ describe("prepareCliRunContext", () => {
       cliSessionBinding: {
         sessionId: "moved-claude-sid",
         cwdHash: hashCliSessionText(dir),
-        transcriptRoot: path.join(dir, "previous-claude-profile", "projects"),
+        transcriptRoot: staleProjectsRoot,
       },
       cliSessionId: "moved-claude-sid",
     });
 
-    const expectedArgs = {
+    expect(transcriptCheck).toHaveBeenCalledWith({
       sessionId: "moved-claude-sid",
       workspaceDir: dir,
       projectsRoot: path.join(childConfigDir, "projects"),
-    };
-    expect(transcriptCheck).toHaveBeenCalledWith(expectedArgs);
-    expect(orphanCheck).toHaveBeenCalledWith(expectedArgs);
+    });
+    // The stale profile's transcript cannot authorize a resume under the new one.
+    expect(context.reusableCliSession).toEqual({
+      mode: "invalidate",
+      invalidatedReason: "missing-transcript",
+    });
+    expect(orphanCheck).not.toHaveBeenCalled();
   });
 
   it.each(["prepared", "admitted"] as const)(
