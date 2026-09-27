@@ -47,6 +47,7 @@ import {
 } from "../../routing/session-key.js";
 import { annotateInterSessionPromptText } from "../../sessions/input-provenance.js";
 import { captureAsyncWorkTracker } from "../../shared/async-work-scope.js";
+import { resolveSkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
 import { resolveUserPath } from "../../utils.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import {
@@ -1656,6 +1657,10 @@ async function prepareCliRunContextWithinReadFence(
           provider: params.provider,
           backend: preparedBackendFinal.backend,
           preparedBackend: preparedBackendFinal,
+          skillEnv: resolveSkillEnvOverridesFromSnapshot({
+            snapshot: params.skillsSnapshot,
+            config: runConfig,
+          }),
           remote: Boolean(nodeClaudePlacement),
           cwd,
         })
