@@ -14,7 +14,7 @@ import { createServer } from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 
 const EXPECTED_HEAD = "d165b4954dcc0b5ad0fb3cf999a6ce28753420ea";
 const CLAUDE_VERSION = "2.1.269";
@@ -766,21 +766,28 @@ async function runStandaloneNativeFork(mock) {
       "Continue this adopted native session and acknowledge the new marker.",
     );
     await stopGateway();
-    const database = new DatabaseSync(
-      path.join(scenario.state, "agents/main/agent/openclaw-agent.sqlite"),
-      { readOnly: true },
+    const inspected = await run(
+      process.execPath,
+      [
+        "--import",
+        path.join(candidateRoot, "scripts/tsx.mjs"),
+        fileURLToPath(new URL("./binding-inspect.mts", import.meta.url)),
+        adopted.sessionKey,
+      ],
+      { env: scenarioEnv(scenario), timeoutMs: 120_000 },
     );
-    let binding;
-    try {
-      const stored = database
-        .prepare("SELECT entry_json FROM session_nodes WHERE session_key = ?")
-        .get(adopted.sessionKey);
-      binding = stored
-        ? JSON.parse(stored.entry_json).cliSessionBindings?.["claude-cli"]
-        : undefined;
-    } finally {
-      database.close();
-    }
+    if (inspected.code !== 0)
+      throw new Error(`canonical binding read failed: ${safeText(inspected.stderr.slice(-2000))}`);
+    const observed = extractJson(inspected.stdout);
+    const binding = observed?.binding;
+    const nativeFacts = await transcriptFacts(scenario.selectedRoot);
+    checks.push({
+      name: "persisted-binding-observation",
+      status: "observed",
+      sourceSessionId,
+      observed,
+      nativeSessionIds: nativeFacts.sessionIds,
+    });
     if (!binding?.sessionId || binding.sessionId === sourceSessionId)
       throw new Error("fork successor was not persisted");
     if (binding.transcriptRoot !== path.join(scenario.selectedRoot, "projects"))
@@ -887,42 +894,6 @@ async function runAbsoluteFull(scenario, mock) {
       marker: nativeMarker,
     });
 
-    const afterNative = await transcriptFacts(scenario.selectedRoot);
-    const catalogRow = await listClaudeCatalog(scenario, sourceSessionId);
-    const continued = await rpc(
-      scenario,
-      "sessions.catalog.continue",
-      {
-        catalogId: "claude",
-        hostId: "gateway:local",
-        threadId: catalogRow.threadId,
-        agentId: "main",
-      },
-      30_000,
-    );
-    if (typeof continued?.sessionKey !== "string")
-      throw new Error("catalog continuation returned no session key");
-    const forkScenario = { ...scenario, sessionKey: continued.sessionKey };
-    const forkMarker = `FORK-${createHash("sha256").update(nativeMarker).digest("hex").slice(0, 10)}`;
-    await sendTurn(
-      forkScenario,
-      forkMarker,
-      "Continue the adopted native thread and acknowledge this fork marker.",
-    );
-    const afterFork = await transcriptFacts(scenario.selectedRoot);
-    const forkSessionId = afterFork.sessionIds.find(
-      (sessionId) => !afterNative.sessionIds.includes(sessionId),
-    );
-    if (!afterFork.markers.includes(forkMarker) || !forkSessionId) {
-      throw new Error("catalog continuation did not produce a forked native transcript");
-    }
-    step.checks.push({
-      name: "native-catalog-fork",
-      status: "passed",
-      sourceSessionId,
-      forkSessionId,
-      forkMarker,
-    });
     step.status = "passed";
   } catch (error) {
     step.status = "failed";
@@ -1162,6 +1133,7 @@ async function main() {
     await runRootSmoke("default", mockServer, tempRoot);
     await runRootSmoke("relative", mockServer, tempRoot);
     await runProfileSwitch(mockServer, tempRoot);
+    await runStandaloneNativeFork(mockServer);
   }
 
   summary.mockModel.requestCount = mockServer.records.length;
