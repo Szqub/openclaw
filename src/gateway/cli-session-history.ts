@@ -54,6 +54,7 @@ export function resolveChatHistoryWithCliSessionImports(params: CliSessionHistor
       cliSessionId: binding.sessionId,
       homeDir: params.homeDir,
       cwd: binding.cwd ?? params.cwd,
+      projectsRoot: binding.transcriptRoot,
       localSessionId: params.entry?.sessionId,
       reseedReceipt: binding.reseedReceipt,
     });
@@ -83,6 +84,7 @@ export async function readChatHistoryCliSessionImportSnapshot(
         cliSessionId: binding.sessionId,
         homeDir: params.homeDir,
         cwd: binding.cwd ?? params.cwd,
+        projectsRoot: binding.transcriptRoot,
         localSessionId: params.entry?.sessionId,
         reseedReceipt: binding.reseedReceipt,
       })

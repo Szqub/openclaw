@@ -63,6 +63,7 @@ type HistoryParams = {
   cliSessionId: string;
   homeDir?: string;
   cwd?: string;
+  projectsRoot?: string;
   localSessionId?: string;
   reseedReceipt?: CliSessionReseedReceipt;
 };

@@ -515,6 +515,33 @@ describe("claudeCliSessionTranscriptHasContent", () => {
     }
   });
 
+  it("probes the retained child root instead of the Gateway root", async () => {
+    const workspaceDir = await fs.realpath(await makeWorkspace());
+    const projectKey = workspaceDir.replace(/[^a-zA-Z0-9]/g, "-");
+    const sessionId = "retained-session";
+    const childRoot = path.join(tmpDir, "child Claude", "projects");
+    const gatewayFile = path.join(
+      tmpDir,
+      "gateway Claude",
+      "projects",
+      projectKey,
+      `${sessionId}.jsonl`,
+    );
+    const childFile = path.join(childRoot, projectKey, `${sessionId}.jsonl`);
+    for (const [file, content] of [
+      [childFile, [{ type: "text", text: "child-root history" }]],
+      [gatewayFile, [{ type: "tool_use", id: "unanswered", name: "Read", input: {} }]],
+    ] as const) {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, `${JSON.stringify({ message: { role: "assistant", content } })}\n`);
+    }
+    vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tmpDir, "gateway Claude"));
+    const target = { sessionId, workspaceDir, homeDir: tmpDir, projectsRoot: childRoot };
+    expect(await claudeCliSessionTranscriptHasContent(target)).toBe(true);
+    // The Gateway-root decoy is the only transcript holding an unanswered tool_use.
+    expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(false);
+  });
+
   it("returns true when the Claude project transcript has an assistant message", async () => {
     const workspaceDir = await makeWorkspace();
     await writeClaudeProjectFile(

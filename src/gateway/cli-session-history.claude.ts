@@ -80,6 +80,7 @@ type ClaudeCliHistoryLookupParams = {
   cliSessionId: string;
   homeDir?: string;
   cwd?: string;
+  projectsRoot?: string;
 };
 
 function normalizeClaudeCliSessionId(value: string): string | undefined {

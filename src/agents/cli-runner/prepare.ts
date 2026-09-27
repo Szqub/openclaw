@@ -1941,6 +1941,7 @@ async function prepareCliRunContextWithinReadFence(
       !(await prepareDeps.claudeCliSessionTranscriptHasContent({
         sessionId: candidateClaudeCliSessionId,
         workspaceDir: cwd,
+        projectsRoot: params.cliSessionBinding?.transcriptRoot,
       }));
     const managedClaudeLiveSessionGeneration =
       claudeCliTranscriptMissing &&
@@ -1964,6 +1965,7 @@ async function prepareCliRunContextWithinReadFence(
       (await prepareDeps.claudeCliSessionTranscriptHasOrphanedToolUse({
         sessionId: candidateClaudeCliSessionId,
         workspaceDir: cwd,
+        projectsRoot: params.cliSessionBinding?.transcriptRoot,
       }));
     const claudeCliInvalidatedReason: "missing-transcript" | "orphaned-tool-use" | undefined =
       claudeCliTranscriptMissing && !hasManagedClaudeLiveSession
