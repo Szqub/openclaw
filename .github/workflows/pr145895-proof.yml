@@ -26,11 +26,18 @@ jobs:
       OPENCLAW_VITEST_MAX_WORKERS: "2"
       OPENCLAW_TEST_PROJECTS_PARALLEL: "1"
     steps:
+      - name: Require completed full proof on the identical production tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr145895-evidence"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/36356677685/jobs" --jq '{jobs: [.jobs[] | {name, conclusion, steps: [.steps[] | {name, conclusion}]}]}' > "$RUNNER_TEMP/pr145895-evidence/full-proof-steps.json"
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const jobs=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).jobs; const job=jobs.find(x=>x.name==="schema23"); for(const name of ["Run focused regression coverage","Verify same-schema older-writer compatibility and migration","Check types and import cycles","Build current-main runtime","Run isolated current-main Gateway and native Claude proof","Verify tracked source stayed unchanged"]) assert.equal(job?.steps.find(x=>x.name===name)?.conclusion,"success",name);' "$RUNNER_TEMP/pr145895-evidence/full-proof-steps.json"
       - name: Checkout exact schema-23 candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20
-          fetch-depth: 5
+          ref: 8579e6c335b03c2cc3f86cb8eda71501247608c7
+          fetch-depth: 8
           persist-credentials: false
       - name: Checkout proof tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -41,10 +48,10 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Verify candidate and prepare evidence
         run: |
-          test "$(git rev-parse HEAD)" = 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20
+          test "$(git rev-parse HEAD)" = 8579e6c335b03c2cc3f86cb8eda71501247608c7
           mkdir -p "$RUNNER_TEMP/pr145895-evidence"
           printf '%s\n' 'Unchanged schema20 candidate d165:545tests/13files and7compatibility phases passed in https://github.com/Szqub/openclaw/actions/runs/36354847709 . The pristine fixture comes from that exact run.' > "$RUNNER_TEMP/pr145895-evidence/schema20-reference.txt"
-          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
+          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' 8579e6c335b03c2cc3f86cb8eda71501247608c7 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
       - name: Setup frozen candidate toolchain
         uses: ./.github/actions/setup-node-env
         with:
@@ -56,39 +63,16 @@ jobs:
         id: install
         run: pnpm install --frozen-lockfile
       - name: Check the skill-root fixture and regression first
+        id: skill
         run: |
           set -o pipefail
           node scripts/run-vitest.mjs run src/agents/cli-runner/prepare.test.ts -t 'skill-selected child config dir' 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/skill-root-focused.log"
-      - name: Run focused regression coverage
-        id: regressions
+      - name: Verify unchanged production against full proof candidate
         run: |
-          set -o pipefail
-          node scripts/run-vitest.mjs run \
-            src/agents/cli-runner.claude-config-dir.test.ts \
-            src/agents/cli-runner/execute.claude-config-dir.test.ts \
-            src/agents/cli-runner/cli-run-settlement.test.ts \
-            src/agents/cli-runner/prepare.test.ts \
-            src/agents/command/attempt-execution.test.ts \
-            src/agents/command/attempt-execution.claude-config-dir.test.ts \
-            src/agents/command/attempt-execution.cli.test.ts \
-            src/agents/command/claude-cli-project-dir.test.ts \
-            src/agents/command/claude-cli-project-dir.windows.test.ts \
-            src/agents/cli-session.test.ts \
-            src/skills/loading/skills.test.ts \
-            src/commands/doctor-claude-cli.test.ts \
-            src/gateway/cli-session-history.claude-config-dir.test.ts \
-            src/gateway/server-methods/chat-history-handler.cli-import.test.ts \
-            2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/focused-tests.log"
-      - name: Download schema-20 migration fixture
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh run download 36354847709 --repo "$GITHUB_REPOSITORY" --name pr145895-schema20-upgrade-fixture --dir "$RUNNER_TEMP/schema20-fixture"
-      - name: Verify same-schema older-writer compatibility and migration
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 --parent 66898a633464e85e4aea8fd5a0fd2043c88025af --schema 23 --output "$RUNNER_TEMP/pr145895-evidence" --upgrade-fixture "$RUNNER_TEMP/schema20-fixture"
+          git diff --exit-code 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 HEAD -- . ':(exclude)src/agents/cli-runner/prepare.test.ts'
+          printf '%s\n' 'Only test cleanup braces changed since6677a20fbbc4. Full schema23 regressions, compatibility, upgrade, types and runtime are validated in run36356677685; this run checks final lint and the positive/negative regression.' > "$RUNNER_TEMP/pr145895-evidence/reused-proof.txt"
       - name: Verify skill-root regression detects the missing preparation overlay
-        if: ${{ !cancelled() && steps.regressions.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.skill.outcome == 'success' }}
         run: |
           set -o pipefail
           cp src/agents/cli-runner/prepare.ts "$RUNNER_TEMP/prepare-fixed.ts"
@@ -99,7 +83,7 @@ jobs:
           result=$?
           set -e
           test "$result" -ne 0
-          rg -q 'AssertionError' "$RUNNER_TEMP/pr145895-evidence/skill-regression-negative.log"
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync(process.argv[1],"utf8"); assert.match(log,/AssertionError/); assert.match(log,/missing-transcript/);' "$RUNNER_TEMP/pr145895-evidence/skill-regression-negative.log"
           printf 'Pre-fix preparation failed the targeted behavioral assertion (exit %s). Fixed version passed in focused coverage.\n' "$result" > "$RUNNER_TEMP/pr145895-evidence/skill-regression-negative.txt"
       - name: Check integration formatting and lint
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -116,25 +100,6 @@ jobs:
           path: ${{ runner.temp }}/pr145895-evidence/
           if-no-files-found: error
           retention-days: 30
-      - name: Check types and import cycles
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
-          pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-tests.log"
-          pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/import-cycles.log"
-      - name: Build current-main runtime
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        id: build
-        run: pnpm build:docker
-      - name: Install pinned official Claude Code
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          npm install --prefix "$RUNNER_TEMP/pr145895-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
-          echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Run isolated current-main Gateway and native Claude proof
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: node tooling/scripts/pr145895-proof/runtime.mjs --candidate 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 --scenario all --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
       - name: Verify tracked source stayed unchanged
         if: always()
         run: git diff --exit-code HEAD
