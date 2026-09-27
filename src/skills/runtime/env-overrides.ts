@@ -209,7 +209,7 @@ function applySkillConfigEnvOverrides(params: {
     if (!acquireActiveSkillEnvKey(envKey, envValue)) {
       continue;
     }
-    updates.push(envKey);
+    params.updates.push(envKey);
     process.env[envKey] = activeSkillEnvEntries.get(envKey)?.value ?? envValue;
   }
 }
