@@ -6309,6 +6309,64 @@ describe("prepareCliRunContext", () => {
     expect(orphanCheck).not.toHaveBeenCalled();
   });
 
+  it("checks the claude-cli transcript under a skill-selected child config dir", async () => {
+    const { dir } = fixture.session;
+    const taskDir = path.join(dir, "skill-task");
+    fs.mkdirSync(taskDir, { recursive: true });
+    const canonicalCwd = fs.realpathSync.native(taskDir);
+    const childConfigDir = path.join(dir, "skill-claude-profile");
+    const projectDir = path.join(
+      childConfigDir,
+      "projects",
+      canonicalCwd.replace(/[^a-zA-Z0-9]/g, "-"),
+    );
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, "skill-configured-sid.jsonl"),
+      `${JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "prior answer" }] },
+      })}\n`,
+    );
+    setCliBackendForPrepareTest({ liveSession: true });
+
+    const context = await fixture.prepare({
+      cwd: taskDir,
+      config: {
+        skills: {
+          entries: {
+            "skill-selected-profile": {
+              env: { CLAUDE_CONFIG_DIR: childConfigDir },
+            },
+          },
+        },
+      },
+      skillsSnapshot: {
+        prompt: "",
+        skills: [
+          {
+            name: "skill-selected-profile",
+            skillKey: "skill-selected-profile",
+          },
+        ],
+      },
+      provider: "claude-cli",
+      model: "opus",
+      cliSessionBinding: {
+        sessionId: "skill-configured-sid",
+        cwdHash: hashCliSessionText(taskDir),
+      },
+      cliSessionId: "skill-configured-sid",
+    });
+
+    expect(context.reusableCliSession).toEqual({
+      mode: "reuse",
+      sessionId: "skill-configured-sid",
+    });
+    expect(context.requiredClaudeLiveSessionGeneration).toBeUndefined();
+    expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
   it.each(["prepared", "admitted"] as const)(
     "stops CLI skill preparation before sandbox materialization when %s authority is revoked",
     async (phase) => {

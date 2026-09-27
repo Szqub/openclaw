@@ -22,6 +22,8 @@ type CliChildEnvParams = {
   preparedBackend: { env?: Record<string, string>; secretInput?: unknown };
   /** Late execution-only overlays; preparation composes the same child env without them. */
   overlays?: readonly (Record<string, string> | undefined)[];
+  /** Pure skill snapshot overlay used before execution applies its scoped process env. */
+  skillEnv?: Readonly<Record<string, string>>;
   remote: boolean;
   cwd: string;
 };
@@ -41,6 +43,16 @@ export async function buildCliChildEnv(params: CliChildEnvParams): Promise<CliCh
     ...preparedBackendEnv,
   };
   const env = sanitizeHostExecEnv({ baseEnv: process.env, blockPathOverrides: true });
+  if (params.skillEnv) {
+    Object.assign(
+      env,
+      sanitizeHostExecEnv({
+        baseEnv: {},
+        overrides: params.skillEnv,
+        blockPathOverrides: true,
+      }),
+    );
+  }
   const preservedEnv = parseCliBackendPreserveEnv(process.env[CLI_BACKEND_PRESERVE_ENV]);
   for (const key of params.backend.clearEnv ?? []) {
     if (!preservedEnv.has(key) || selectedClaudeClearEnv?.has(key)) {
