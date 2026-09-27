@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: d165b4954dcc0b5ad0fb3cf999a6ce28753420ea
-          fetch-depth: 0
+          fetch-depth: 5
           persist-credentials: false
       - name: Checkout proof tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
