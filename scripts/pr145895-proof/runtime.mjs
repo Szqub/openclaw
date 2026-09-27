@@ -30,6 +30,9 @@ const MARKER_RE = /(?:SEED|PROOF-REPLY|NATIVE-ONLY|FORK)-[A-Za-z0-9-]+|DECOY-WRO
 const outputDir = resolveOutputDir(process.argv.slice(2));
 const scenarioArg = process.argv.indexOf("--scenario");
 const requestedScenario = scenarioArg < 0 ? "all" : process.argv[scenarioArg + 1];
+const forkEntryArg = process.argv.indexOf("--fork-entry");
+const forkEntry = forkEntryArg < 0 ? "chat" : process.argv[forkEntryArg + 1];
+if (!["chat", "agent"].includes(forkEntry)) throw new Error("unsupported fork entry point");
 if (!["all", "absolute", "native-fork"].includes(requestedScenario))
   throw new Error("unsupported proof scenario");
 const candidateRoot = path.resolve(process.cwd());
@@ -47,6 +50,7 @@ const summary = {
   cleanup: { gatewayChildren: [], ownedClaudeProcessesBefore: [], ownedClaudeProcessesAfter: [] },
   status: "running",
   requestedScenario,
+  forkEntry,
 };
 
 let mockServer;
@@ -760,11 +764,34 @@ async function runStandaloneNativeFork(mock) {
     if (typeof adopted?.sessionKey !== "string")
       throw new Error("native adoption returned no session key");
     checks.push({ name: "catalog-adoption", status: "passed" });
-    await sendTurn(
-      { ...scenario, sessionKey: adopted.sessionKey },
-      forkMarker,
-      "Continue this adopted native session and acknowledge the new marker.",
-    );
+    if (forkEntry === "agent") {
+      const turn = await run(
+        process.execPath,
+        [
+          summary.cliEntry,
+          "agent",
+          "--session-key",
+          adopted.sessionKey,
+          "--message",
+          `Continue this adopted native session. Proof marker: ${forkMarker}`,
+          "--json",
+          "--timeout",
+          "240",
+        ],
+        { env: scenarioEnv(scenario), timeoutMs: TURN_TIMEOUT_MS + 30_000 },
+      );
+      if (turn.code !== 0 || !turn.stdout.includes("PROOF-REPLY-")) {
+        throw new Error(
+          `agent command failed (exit=${turn.code}): ${safeText(`${turn.stderr}\n${turn.stdout}`.slice(-2000))}`,
+        );
+      }
+    } else {
+      await sendTurn(
+        { ...scenario, sessionKey: adopted.sessionKey },
+        forkMarker,
+        "Continue this adopted native session and acknowledge the new marker.",
+      );
+    }
     await stopGateway();
     const inspected = await run(
       process.execPath,

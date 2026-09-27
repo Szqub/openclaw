@@ -86,7 +86,7 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/pr145895-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
           echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Run isolated Gateway and native Claude proof
-        run: node tooling/scripts/pr145895-proof/runtime.mjs --scenario native-fork --output "$RUNNER_TEMP/pr145895-evidence"
+        run: node tooling/scripts/pr145895-proof/runtime.mjs --scenario native-fork --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
       - name: Verify tracked candidate source stayed unchanged
         if: always()
         run: git diff --exit-code HEAD
