@@ -606,12 +606,12 @@ extension OnboardingView {
                     detail: self.cliExecutableReady
                         ? (self.cliInstallLocation ?? "Installed")
                         : "A private copy inside your user folder.",
-                    state: self.installStepStateForInstall,
+                    state: self.installStepStates.install,
                     monospacedDetail: self.cliExecutableReady && self.cliInstallLocation != nil)
                 self.installStepRow(
                     title: "Start the background service",
                     detail: "Runs quietly and starts again after a restart.",
-                    state: self.installStepStateForService)
+                    state: self.installStepStates.service)
                 self.installStepRow(
                     title: "Ready for the next step",
                     detail: "Once the service answers, you’ll connect your AI.",
@@ -647,22 +647,13 @@ extension OnboardingView {
 
     /// Exactly one spinner at a time: the install row finishes before the
     /// service row starts, mirroring the actual runCLIInstall phases.
-    private var installStepStateForInstall: InstallStepState {
+    private var installStepStates: (install: InstallStepState, service: InstallStepState) {
         Self.cliInstallStepStates(
             executableReady: self.cliExecutableReady,
             gatewayReady: self.cliInstalled,
             statusKnown: self.cliStatusKnown,
             installing: self.installingCLI,
-            phase: self.cliInstallPhase).install
-    }
-
-    private var installStepStateForService: InstallStepState {
-        Self.cliInstallStepStates(
-            executableReady: self.cliExecutableReady,
-            gatewayReady: self.cliInstalled,
-            statusKnown: self.cliStatusKnown,
-            installing: self.installingCLI,
-            phase: self.cliInstallPhase).service
+            phase: self.cliInstallPhase)
     }
 
     static func cliInstallStepStates(
@@ -770,7 +761,7 @@ extension OnboardingView {
                     systemImage: "link",
                     buttonTitle: "Open Dashboard → Settings → Channels")
                 {
-                    Task { await DashboardManager.shared.show(atPath: DashboardRouteMap.channelsSettingsPath) }
+                    AppNavigationActions.openPrimaryWebRoute(DashboardRouteMap.channelsSettingsPath)
                 }
                 self.featureRow(
                     title: "Try Voice Wake",
@@ -788,7 +779,7 @@ extension OnboardingView {
                     systemImage: "sparkles",
                     buttonTitle: "Open Dashboard → Skills")
                 {
-                    Task { await DashboardManager.shared.show(atPath: DashboardRouteMap.skillsPagePath) }
+                    AppNavigationActions.openPrimaryWebRoute(DashboardRouteMap.skillsPagePath)
                 }
                 if AppProfile.current.isActive {
                     LabeledContent("Launch at login", value: "Unavailable under profile")

@@ -19,10 +19,10 @@ import {
   projectChatDisplayMessages,
 } from "../chat-display-projection.js";
 import * as cliSessionHistory from "../cli-session-history.js";
-import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
+import { createHistoryReadContext } from "./chat-history.test-helpers.js";
 
 type HistoryPage = {
   messages: unknown[];
@@ -39,6 +39,30 @@ type HistoryRequest = {
   messageId?: string;
   offset?: number;
 };
+
+async function historyReader(
+  sessionKey: string,
+  method: "chat.history" | "chat.startup" = "chat.history",
+) {
+  const context = await createHistoryReadContext();
+  const handler = expectDefined(chatHistoryHandlers[method], "history handler");
+  return async (params: HistoryRequest): Promise<HistoryPage> => {
+    let result: HistoryPage | undefined;
+    await handler({
+      params: { sessionKey, ...params },
+      context,
+      req: { type: "req", id: randomUUID(), method },
+      client: null,
+      isWebchatConnect: () => false,
+      respond: (ok, payload, error) => {
+        expect(error).toBeUndefined();
+        expect(ok).toBe(true);
+        result = payload as HistoryPage;
+      },
+    });
+    return expectDefined(result, "history response");
+  };
+}
 
 async function withImportedHistory(
   method: "chat.history" | "chat.startup",
@@ -129,25 +153,7 @@ async function withImportedHistory(
         })
         .join("\n") + "\n",
     );
-    const context = createDirectChatContext();
-    const handler = expectDefined(chatHistoryHandlers[method], "history handler");
-    const read = async (params: HistoryRequest): Promise<HistoryPage> => {
-      let result: HistoryPage | undefined;
-      await handler({
-        params: { sessionKey: scope.sessionKey, ...params },
-        context,
-        req: { type: "req", id: "cli-history-anchor", method },
-        client: null,
-        isWebchatConnect: () => false,
-        respond: (ok, payload, error) => {
-          expect(error).toBeUndefined();
-          expect(ok).toBe(true);
-          result = payload as HistoryPage;
-        },
-      });
-      return expectDefined(result, "history response");
-    };
-    await run({ read, importedIds });
+    await run({ read: await historyReader(scope.sessionKey, method), importedIds });
   });
 }
 
@@ -179,7 +185,7 @@ async function withImportedSnapshot(
       .spyOn(cliSessionHistory, "readChatHistoryCliSessionImportSnapshot")
       .mockResolvedValue(messages);
     const handler = expectDefined(chatHistoryHandlers[method], "history handler");
-    const context = createDirectChatContext();
+    const context = await createHistoryReadContext();
     try {
       await run(async (params) => {
         let result: HistoryPage | undefined;
@@ -462,21 +468,12 @@ describe("CLI-imported history anchors", () => {
           message: { role: "assistant", content: "Deduplicated answer" },
         })}\n`,
       );
-      const handler = expectDefined(chatHistoryHandlers["chat.history"], "history handler");
-      let result: HistoryPage | undefined;
-      await handler({
-        params: { sessionKey: scope.sessionKey, messageId: local.messageId, limit: 2 },
-        context: createDirectChatContext(),
-        req: { type: "req", id: "metadata-anchor", method: "chat.history" },
-        client: null,
-        isWebchatConnect: () => false,
-        respond: (ok, payload, error) => {
-          expect(error).toBeUndefined();
-          expect(ok).toBe(true);
-          result = payload as HistoryPage;
-        },
+      const read = await historyReader(scope.sessionKey);
+      const result = await read({
+        messageId: local.messageId,
+        limit: 2,
       });
-      const anchored = expectDefined(result, "history response").messages.find(
+      const anchored = result.messages.find(
         (message) => readChatHistoryMessageId(message) === local.messageId,
       );
       expect(asOptionalRecord(asOptionalRecord(anchored)?.["__openclaw"])).toMatchObject({
@@ -529,24 +526,7 @@ describe("CLI-imported history anchors", () => {
         path.join(projectDir, `${cliSessionId}.jsonl`),
         `${importedRows.join("\n")}\n`,
       );
-      const context = createDirectChatContext();
-      const handler = expectDefined(chatHistoryHandlers["chat.history"], "history handler");
-      const read = async (params: HistoryRequest) => {
-        let result: HistoryPage | undefined;
-        await handler({
-          params: { sessionKey: scope.sessionKey, ...params },
-          context,
-          req: { type: "req", id: randomUUID(), method: "chat.history" },
-          client: null,
-          isWebchatConnect: () => false,
-          respond: (ok, payload, error) => {
-            expect(error).toBeUndefined();
-            expect(ok).toBe(true);
-            result = payload as HistoryPage;
-          },
-        });
-        return expectDefined(result, "history response");
-      };
+      const read = await historyReader(scope.sessionKey);
 
       const newest = await read({ limit: 2, offset: 0 });
       expect(newest.messages.map(readChatHistoryMessageId)).toEqual(localIds.slice(-2));
@@ -609,22 +589,8 @@ describe("CLI-imported history anchors", () => {
           message: { role: "user", content: "Question" },
         })}\n`,
       );
-      const handler = expectDefined(chatHistoryHandlers["chat.history"], "history handler");
-      let result: HistoryPage | undefined;
-      await handler({
-        params: { sessionKey: scope.sessionKey, limit: 1, offset: 1 },
-        context: createDirectChatContext(),
-        req: { type: "req", id: "metadata-recovery", method: "chat.history" },
-        client: null,
-        isWebchatConnect: () => false,
-        respond: (ok, payload, error) => {
-          expect(error).toBeUndefined();
-          expect(ok).toBe(true);
-          result = payload as HistoryPage;
-        },
-      });
-
-      const messages = expectDefined(result, "history response").messages;
+      const read = await historyReader(scope.sessionKey);
+      const { messages } = await read({ limit: 1, offset: 1 });
       expect(messages.map(readChatHistoryMessageId)).toEqual([localUser.messageId]);
       expect(asOptionalRecord(asOptionalRecord(messages[0])?.["__openclaw"])).toMatchObject({
         importedFrom: "claude-cli",
@@ -710,21 +676,9 @@ describe("CLI-imported history anchors", () => {
       await appendTranscriptMessage(scope, {
         message: { role: "assistant", content: "Visible answer" },
       });
-      const handler = expectDefined(chatHistoryHandlers["chat.history"], "history handler");
-      let result: unknown;
-      await handler({
-        params: { sessionKey: scope.sessionKey, messageId: hidden.messageId, limit: 2 },
-        context: createDirectChatContext(),
-        req: { type: "req", id: "filtered-anchor", method: "chat.history" },
-        client: null,
-        isWebchatConnect: () => false,
-        respond: (ok, payload, error) => {
-          expect(error).toBeUndefined();
-          expect(ok).toBe(true);
-          result = payload;
-        },
-      });
-      expect(asOptionalRecord(result)?.messages).toEqual([]);
+      const read = await historyReader(scope.sessionKey);
+      const page = await read({ messageId: hidden.messageId, limit: 2 });
+      expect(page.messages).toEqual([]);
     });
   });
 });

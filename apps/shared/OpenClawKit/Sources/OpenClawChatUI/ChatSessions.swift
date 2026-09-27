@@ -164,6 +164,7 @@ public struct OpenClawChatModelChoice: Identifiable, Codable, Sendable, Hashable
     public let name: String
     public let provider: String
     public let available: Bool?
+    public let manualSelectionAllowed: Bool?
     public let unavailableReason: String?
     public let unavailableUntil: Int?
     public let contextWindow: Int?
@@ -180,6 +181,7 @@ public struct OpenClawChatModelChoice: Identifiable, Codable, Sendable, Hashable
         name: String,
         provider: String,
         available: Bool? = nil,
+        manualSelectionAllowed: Bool? = nil,
         unavailableReason: String? = nil,
         unavailableUntil: Int? = nil,
         contextWindow: Int?,
@@ -195,6 +197,7 @@ public struct OpenClawChatModelChoice: Identifiable, Codable, Sendable, Hashable
         self.name = name
         self.provider = provider
         self.available = available
+        self.manualSelectionAllowed = manualSelectionAllowed
         self.unavailableReason = unavailableReason
         self.unavailableUntil = unavailableUntil
         self.contextWindow = contextWindow
@@ -557,42 +560,6 @@ public struct OpenClawChatSessionGroupsMutationResponse: Codable, Sendable, Equa
     public let ok: Bool
     public let groups: [OpenClawChatSessionGroup]
     public let updatedSessions: Int?
-}
-
-public struct OpenClawChatAgentChoice: Codable, Identifiable, Sendable, Hashable {
-    public let id: String
-    public let name: String?
-    public let emoji: String?
-    public let workspaceGit: Bool?
-
-    public init(id: String, name: String? = nil, emoji: String? = nil, workspaceGit: Bool? = nil) {
-        self.id = id
-        self.name = name
-        self.emoji = emoji
-        self.workspaceGit = workspaceGit
-    }
-
-    public var displayName: String {
-        let normalized = self.name?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let normalized, !normalized.isEmpty else { return self.id }
-        return normalized
-    }
-}
-
-public struct OpenClawChatAgentsListResponse: Codable, Sendable, Equatable {
-    public let defaultId: String
-    public let agents: [OpenClawChatAgentChoice]
-    public let sessionRoutingContract: String?
-
-    public init(
-        defaultId: String,
-        agents: [OpenClawChatAgentChoice],
-        sessionRoutingContract: String? = nil)
-    {
-        self.defaultId = defaultId
-        self.agents = agents
-        self.sessionRoutingContract = sessionRoutingContract
-    }
 }
 
 public struct OpenClawChatSessionEntry: Codable, Identifiable, Sendable, Hashable {

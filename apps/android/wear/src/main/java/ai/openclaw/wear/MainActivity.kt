@@ -27,11 +27,13 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -72,13 +74,15 @@ internal data class WearLaunchState(
   val navigationRequest: WearNavigationRequest? = null,
   val nextRequestId: Int = 0,
 ) {
-  fun next(intent: Intent?): WearLaunchState {
+  fun next(intent: Intent?): WearLaunchState = navigate(consumeWearLaunchTarget(intent))
+
+  fun navigate(target: WearLaunchTarget): WearLaunchState {
     val requestId = nextRequestId + 1
     return copy(
       navigationRequest =
         WearNavigationRequest(
           id = requestId,
-          target = consumeWearLaunchTarget(intent),
+          target = target,
         ),
       nextRequestId = requestId,
     )
@@ -118,6 +122,7 @@ class MainActivity : ComponentActivity() {
     get() = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    installSplashScreen()
     super.onCreate(savedInstanceState)
     if (screenshotModeEnabled) {
       screenshotScene = parseWearScreenshotModeIntent(intent)
@@ -133,6 +138,7 @@ class MainActivity : ComponentActivity() {
             speaker = remember { WearReplySpeaker(applicationContext) },
             initialPage = initialPage,
             navigationRequest = navigationRequest,
+            onMessageSubmitted = { launchState = launchState.navigate(WearLaunchTarget.Chat) },
             onNavigationRequestHandled = { requestId ->
               launchState = launchState.handled(requestId)
             },
@@ -177,6 +183,7 @@ internal fun OpenClawWearApp(
   initialPage: WearHomePage = WearHomePage.Chat,
   navigationRequest: WearNavigationRequest? = null,
   onNavigationRequestHandled: (Int) -> Unit = {},
+  onMessageSubmitted: () -> Unit = {},
 ) {
   val state by viewModel.state.collectAsState()
   val snapshot = state.toConversationSnapshot()
@@ -203,6 +210,7 @@ internal fun OpenClawWearApp(
   var microphoneSettingsRequired by remember { mutableStateOf(false) }
   var expectedAssistantKey by remember { mutableStateOf<String?>(null) }
   var awaitingReplySessionId by remember { mutableStateOf<String?>(null) }
+  var awaitingReplyRunId by remember { mutableStateOf<String?>(null) }
   var awaitingReply by remember { mutableStateOf(false) }
   var previousRealtimeSnapshot by remember { mutableStateOf(snapshot) }
   var realtimeThinkingTurnId by remember { mutableStateOf<String?>(null) }
@@ -221,7 +229,7 @@ internal fun OpenClawWearApp(
       interaction = WearInteractionState.READY
       return
     }
-    if (state.sending || !state.streamText.isNullOrBlank()) {
+    if (!state.canSubmitReply) {
       interaction = WearInteractionState.READY
       view.performHapticFeedback(HapticFeedbackConstants.REJECT)
       return
@@ -231,12 +239,17 @@ internal fun OpenClawWearApp(
       view.performHapticFeedback(HapticFeedbackConstants.REJECT)
       return
     }
+    if (!viewModel.sendReply(message) { awaitingReplyRunId = it }) {
+      interaction = WearInteractionState.READY
+      view.performHapticFeedback(HapticFeedbackConstants.REJECT)
+      return
+    }
     expectedAssistantKey = snapshot.latestAssistantMessage()?.stableKey()
     awaitingReplySessionId = sessionId
     awaitingReply = true
     interaction = WearInteractionState.SENDING
     speaker.stop()
-    viewModel.sendReply(message)
+    onMessageSubmitted()
   }
 
   val speechLauncher =
@@ -252,53 +265,18 @@ internal fun OpenClawWearApp(
       }
     }
   val textLauncher =
-    rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-      val text =
-        result.data
-          ?.let(RemoteInput::getResultsFromIntent)
-          ?.getCharSequence(REMOTE_INPUT_KEY)
-          ?.toString()
-      if (result.resultCode == Activity.RESULT_OK && !text.isNullOrBlank()) {
-        submitMessage(text)
-      } else {
-        interaction = WearInteractionState.READY
-      }
-    }
-  val sessionSearchLauncher =
-    rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-      val query =
-        result.data
-          ?.let(RemoteInput::getResultsFromIntent)
-          ?.getCharSequence(REMOTE_INPUT_KEY)
-          ?.toString()
-      if (result.resultCode == Activity.RESULT_OK && !query.isNullOrBlank()) {
-        viewModel.searchSessions(query)
-      }
-    }
-  val modelSearchLauncher =
-    rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-      val query =
-        result.data
-          ?.let(RemoteInput::getResultsFromIntent)
-          ?.getCharSequence(REMOTE_INPUT_KEY)
-          ?.toString()
-      if (result.resultCode == Activity.RESULT_OK && !query.isNullOrBlank()) {
-        viewModel.searchModels(query)
-      }
-    }
+    rememberTextInputLauncher(
+      onText = ::submitMessage,
+      onCanceled = { interaction = WearInteractionState.READY },
+    )
+  val sessionSearchLauncher = rememberTextInputLauncher(onText = viewModel::searchSessions)
+  val modelSearchLauncher = rememberTextInputLauncher(onText = viewModel::searchModels)
 
   fun launchSearchInput(
     title: String,
     launcher: ActivityResultLauncher<Intent>,
   ) {
-    val remoteInput = RemoteInput.Builder(REMOTE_INPUT_KEY).setLabel(searchLabel).build()
-    val intent =
-      RemoteInputIntentHelper.createActionRemoteInputIntent().also { inputIntent ->
-        RemoteInputIntentHelper.putRemoteInputsExtra(inputIntent, listOf(remoteInput))
-        RemoteInputIntentHelper.putTitleExtra(inputIntent, title)
-        RemoteInputIntentHelper.putConfirmLabelExtra(inputIntent, searchLabel)
-      }
-    launcher.launch(intent)
+    launcher.launch(wearTextInputIntent(searchLabel, title, searchLabel))
   }
 
   fun startRealtimeTalk() {
@@ -316,6 +294,7 @@ internal fun OpenClawWearApp(
   fun leaveConversationContext() {
     awaitingReply = false
     awaitingReplySessionId = null
+    awaitingReplyRunId = null
     expectedAssistantKey = null
     interaction = WearInteractionState.READY
     speaker.stop()
@@ -387,40 +366,19 @@ internal fun OpenClawWearApp(
     speaker.stop()
   }
 
-  LaunchedEffect(
-    snapshot?.activeSessionId,
-    state.messages,
-    state.activeRunId,
-    state.sending,
-    state.failure,
-    awaitingReply,
-  ) {
-    if (!awaitingReply) return@LaunchedEffect
-    val activeSnapshot = snapshot
-    if (
-      state.failure != null ||
-      activeSnapshot == null ||
-      activeSnapshot.activeSessionId != awaitingReplySessionId
-    ) {
-      awaitingReply = false
-      awaitingReplySessionId = null
-      expectedAssistantKey = null
-      interaction = WearInteractionState.READY
-      return@LaunchedEffect
-    }
-    if (state.sending || state.activeRunId != null) return@LaunchedEffect
-    val reply =
-      newAssistantReplyForSession(
-        awaitingSessionId = awaitingReplySessionId,
-        activeSessionId = activeSnapshot.activeSessionId,
-        expectedAssistantKey = expectedAssistantKey,
-        latestAssistantMessage = activeSnapshot.latestAssistantMessage(),
-      )
+  WearReplyCompletionEffect(
+    state = state,
+    snapshot = snapshot,
+    awaitingReply = awaitingReply,
+    awaitingReplySessionId = awaitingReplySessionId,
+    awaitingReplyRunId = awaitingReplyRunId,
+    expectedAssistantKey = expectedAssistantKey,
+  ) { reply ->
+    awaitingReply = false
+    awaitingReplySessionId = null
+    expectedAssistantKey = null
+    interaction = WearInteractionState.READY
     if (reply != null) {
-      awaitingReply = false
-      awaitingReplySessionId = null
-      expectedAssistantKey = null
-      interaction = WearInteractionState.READY
       view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
       if (autoSpeak && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) speaker.speak(reply.text)
     }
@@ -449,15 +407,15 @@ internal fun OpenClawWearApp(
   }
 
   val failure =
-    state.failure
+    state.conversationFailure
       ?: WearConversationFailure.PHONE_UNAVAILABLE.takeIf {
         state.phoneNodeId == null && !state.loading
       }
   val resolvedInteraction =
     when {
-      state.failure != null || speechFailed -> WearInteractionState.ERROR
+      state.conversationFailure != null || speechFailed -> WearInteractionState.ERROR
       state.sending -> WearInteractionState.SENDING
-      state.activeRunId != null -> WearInteractionState.AGENT_WORKING
+      state.hasActiveStream || state.pendingReply?.retryable == false -> WearInteractionState.AGENT_WORKING
       else -> interaction
     }
 
@@ -465,6 +423,7 @@ internal fun OpenClawWearApp(
     AppScaffold {
       OpenClawWearScreens(
         snapshot = snapshot,
+        readReply = viewModel::readReply,
         failure = failure,
         loading = state.loading,
         interaction = resolvedInteraction,
@@ -488,15 +447,10 @@ internal fun OpenClawWearApp(
         actionBusy =
           state.loading ||
             state.sending ||
-            state.talkBusy ||
-            state.controlBusy ||
-            state.activeRunId != null ||
-            !state.streamText.isNullOrBlank() ||
-            state.realtimeTalk.active ||
-            state.realtimeCapturing ||
-            state.realtimePlaying,
-        inputEnabled = state.connected && snapshot?.activeSessionId != null,
-        canAbort = state.activeRunId != null || !state.streamText.isNullOrBlank(),
+            state.contextChangeBusy ||
+            state.hasActiveStream,
+        inputEnabled = state.connected && snapshot?.activeSessionId != null && state.canSubmitReply,
+        canAbort = state.hasActiveStream || state.pendingReply != null,
         themeMode = themeMode,
         autoSpeak = autoSpeak,
         notificationsGranted = notificationsGranted,
@@ -521,27 +475,10 @@ internal fun OpenClawWearApp(
         onType = {
           if (!state.connected || snapshot?.activeSessionId == null) return@OpenClawWearScreens
           interaction = WearInteractionState.TYPING
-          val remoteInput =
-            RemoteInput
-              .Builder(REMOTE_INPUT_KEY)
-              .setLabel(messageLabel)
-              .build()
-          val intent =
-            RemoteInputIntentHelper
-              .createActionRemoteInputIntent()
-              .also { inputIntent ->
-                RemoteInputIntentHelper.putRemoteInputsExtra(inputIntent, listOf(remoteInput))
-                RemoteInputIntentHelper.putTitleExtra(inputIntent, messageTitle)
-                RemoteInputIntentHelper.putConfirmLabelExtra(inputIntent, sendLabel)
-              }
-          textLauncher.launch(intent)
+          textLauncher.launch(wearTextInputIntent(messageLabel, messageTitle, sendLabel))
         },
         onRealtimeTalk = ::toggleRealtimeTalk,
         onAbort = {
-          awaitingReply = false
-          awaitingReplySessionId = null
-          expectedAssistantKey = null
-          interaction = WearInteractionState.READY
           speaker.stop()
           viewModel.abort()
         },
@@ -616,6 +553,115 @@ internal fun OpenClawWearApp(
   }
 }
 
+@Composable
+private fun rememberTextInputLauncher(
+  onText: (String) -> Unit,
+  onCanceled: () -> Unit = {},
+): ActivityResultLauncher<Intent> =
+  rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+    val text =
+      result.data
+        ?.let(RemoteInput::getResultsFromIntent)
+        ?.getCharSequence(REPLY_RESULT_KEY)
+        ?.toString()
+    if (result.resultCode == Activity.RESULT_OK && !text.isNullOrBlank()) {
+      onText(text)
+    } else {
+      onCanceled()
+    }
+  }
+
+private fun wearTextInputIntent(
+  label: String,
+  title: String,
+  confirmLabel: String,
+): Intent =
+  RemoteInputIntentHelper.createActionRemoteInputIntent().also { intent ->
+    val remoteInput = RemoteInput.Builder(REPLY_RESULT_KEY).setLabel(label).build()
+    RemoteInputIntentHelper.putRemoteInputsExtra(intent, listOf(remoteInput))
+    RemoteInputIntentHelper.putTitleExtra(intent, title)
+    RemoteInputIntentHelper.putConfirmLabelExtra(intent, confirmLabel)
+  }
+
+@Composable
+internal fun WearReplyCompletionEffect(
+  state: WearUiState,
+  snapshot: WearConversationSnapshot?,
+  awaitingReply: Boolean,
+  awaitingReplySessionId: String?,
+  expectedAssistantKey: String?,
+  awaitingReplyRunId: String? = null,
+  onCompleted: (WearChatMessage?) -> Unit,
+) {
+  val complete by rememberUpdatedState(onCompleted)
+  LaunchedEffect(
+    snapshot?.activeSessionId,
+    state.messages,
+    state.activeRunId,
+    state.streamText,
+    state.sending,
+    state.failure,
+    state.pendingReply,
+    state.replyTerminal,
+    state.replyCompletion,
+    state.pendingAbortRunId,
+    awaitingReply,
+    awaitingReplySessionId,
+    expectedAssistantKey,
+    awaitingReplyRunId,
+  ) {
+    if (!awaitingReply) return@LaunchedEffect
+    if (snapshot == null || snapshot.activeSessionId != awaitingReplySessionId) {
+      complete(null)
+      return@LaunchedEffect
+    }
+    // Gateway can emit the terminal before replying to the matching Abort RPC.
+    // Wait for that recorded operation result, without discarding reply ownership.
+    if (awaitingReplyRunId != null && state.pendingAbortRunId == awaitingReplyRunId) return@LaunchedEffect
+    val terminal = state.replyCompletion ?: state.replyTerminal
+    val ownsPending = awaitingReplyRunId != null && state.pendingReply?.runId == awaitingReplyRunId
+    val ownsTerminal = awaitingReplyRunId != null && terminal?.runId == awaitingReplyRunId
+    if (ownsTerminal && terminal.outcome == WearReplyOutcome.Canceled) {
+      complete(null)
+      return@LaunchedEffect
+    }
+    // An Abort/history/control failure does not end the still-owned logical send.
+    if (state.failure != null && !ownsPending && !ownsTerminal) {
+      complete(null)
+      return@LaunchedEffect
+    }
+    if (state.sending || state.hasActiveStream || state.pendingReply != null) return@LaunchedEffect
+    // Preserved foreign finals are not evidence for this reply. The terminal
+    // history must reconcile the transcript before choosing text to confirm or speak.
+    if (terminal != null && terminal.history == null) return@LaunchedEffect
+    if (awaitingReplyRunId != null && terminal?.runId != null && terminal.runId != awaitingReplyRunId) {
+      complete(null)
+      return@LaunchedEffect
+    }
+    val confirmationRunId = awaitingReplyRunId ?: terminal?.runId
+    val terminalMessage = terminal?.message?.takeIf { it.role == "assistant" }
+    val ownedMessage =
+      if (terminal == null && confirmationRunId == null) {
+        snapshot.latestAssistantMessage()
+      } else {
+        confirmationRunId?.let { runId ->
+          snapshot.messages.lastOrNull { it.replyOutcomeForRun(runId) != null }
+        } ?: terminalMessage?.id?.let { id ->
+          // An ID-correlated canonical record may have replaced the terminal payload.
+          snapshot.messages.lastOrNull { it.role == "assistant" && it.id == id }
+        } ?: terminalMessage
+      }
+    val reply =
+      newAssistantReplyForSession(
+        awaitingSessionId = awaitingReplySessionId,
+        activeSessionId = snapshot.activeSessionId,
+        expectedAssistantKey = expectedAssistantKey,
+        latestAssistantMessage = ownedMessage,
+      )
+    if (reply != null || terminal?.history != null) complete(reply)
+  }
+}
+
 private fun WearConversationSnapshot?.latestAssistantMessage(): WearChatMessage? =
   this
     ?.messages
@@ -666,5 +712,4 @@ internal fun newlyCompletedRealtimeUserTurnId(
 }
 
 internal const val REPLY_RESULT_KEY = "openclaw_watch_message"
-private const val REMOTE_INPUT_KEY = REPLY_RESULT_KEY
 private const val MINIMUM_REALTIME_THINKING_VISIBLE_MILLIS = 900L

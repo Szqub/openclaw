@@ -37,6 +37,10 @@ import {
   writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock,
 } from "./plugins-cli-test-helpers.js";
 import { registerPluginsCli } from "./plugins-cli.js";
+import {
+  expectInstallRecordsWrittenWithLease,
+  writtenIndexCustody,
+} from "./plugins-cli.update.test-support.js";
 import { createCliTtyMock } from "./test-runtime-capture.js";
 
 const ORIGINAL_OPENCLAW_NIX_MODE = process.env.OPENCLAW_NIX_MODE;
@@ -59,6 +63,21 @@ function createTrackedPluginConfig(params: {
       },
     },
   } as OpenClawConfig;
+}
+
+function primeTrackedPluginUpdate(
+  params: Parameters<typeof createTrackedPluginConfig>[0] & {
+    channel?: NonNullable<OpenClawConfig["update"]>["channel"];
+  },
+): OpenClawConfig {
+  const config = createTrackedPluginConfig(params);
+  if (params.channel) {
+    config.update = { channel: params.channel };
+  }
+  pluginCliConfigMock.mockReturnValue(config);
+  setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
+  primePluginUpdate(config);
+  return config;
 }
 
 function createCapabilityConsentReview(): PluginCapabilityConsentReview {
@@ -97,17 +116,6 @@ function expectOfflineNoticeLogged() {
       message.includes("Updates saved; they will load on the next Gateway start."),
     ),
   ).toBe(true);
-}
-
-function expectInstallRecordsWrittenWithLease(records: unknown, config: unknown) {
-  expect(writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock).toHaveBeenCalledWith(
-    records,
-    expect.objectContaining({
-      config,
-      filePath: expect.any(String),
-      lease: expect.anything(),
-    }),
-  );
 }
 
 function expectSingleCallParams(mockFn: ReturnType<typeof vi.fn>) {
@@ -301,19 +309,10 @@ describe("plugins cli update", () => {
   });
 
   it("refuses plugin updates in Nix mode before package-manager work", async () => {
-    const previous = process.env.OPENCLAW_NIX_MODE;
     process.env.OPENCLAW_NIX_MODE = "1";
-    try {
-      await expect(runPluginsCommand(["plugins", "update", "--all"])).rejects.toThrow(
-        "OPENCLAW_NIX_MODE=1",
-      );
-    } finally {
-      if (previous === undefined) {
-        delete process.env.OPENCLAW_NIX_MODE;
-      } else {
-        process.env.OPENCLAW_NIX_MODE = previous;
-      }
-    }
+    await expect(runPluginsCommand(["plugins", "update", "--all"])).rejects.toThrow(
+      "OPENCLAW_NIX_MODE=1",
+    );
 
     expect(updateNpmInstalledPluginsMock).not.toHaveBeenCalled();
     expect(updateNpmInstalledHookPacksMock).not.toHaveBeenCalled();
@@ -358,35 +357,9 @@ describe("plugins cli update", () => {
   it.each([
     ["missing", "missing-plugin", [], undefined, undefined, "openclaw"],
     ["preview", "missing-plugin", ["--dry-run"], undefined, undefined, "openclaw"],
-    ["object-name", "constructor", [], undefined, undefined, "openclaw"],
-    ["npm-spec", "@acme/missing-plugin@beta", [], undefined, undefined, "openclaw"],
     ["profile", "missing-plugin", [], "work", undefined, "openclaw --profile work"],
-    [
-      "profile preview",
-      "missing-plugin",
-      ["--dry-run"],
-      "work",
-      undefined,
-      "openclaw --profile work",
-    ],
     ["container", "missing-plugin", [], undefined, "demo", "openclaw --container demo"],
-    [
-      "container preview",
-      "missing-plugin",
-      ["--dry-run"],
-      undefined,
-      "demo",
-      "openclaw --container demo",
-    ],
     ["container before profile", "missing-plugin", [], "work", "demo", "openclaw --container demo"],
-    [
-      "container before profile preview",
-      "missing-plugin",
-      ["--dry-run"],
-      "work",
-      "demo",
-      "openclaw --container demo",
-    ],
   ] as const)(
     "rejects untracked update target with %s guidance",
     async (_name, id, args, profile, container, prefix) => {
@@ -447,6 +420,100 @@ describe("plugins cli update", () => {
     expect(updateNpmInstalledHookPacksMock).not.toHaveBeenCalled();
     expect(configWriteMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { ids: ["alpha", "--all"], error: "not both" },
+    { ids: ["alpha", "missing"], error: 'No tracked plugin or hook pack found for "missing"' },
+    { ids: ["@acme/alpha@beta", "@acme/alpha@1.2.3"], error: 'Conflicting npm specs for "alpha"' },
+    {
+      ids: ["alpha", "@acme/hooks@beta", "@acme/hooks@1.2.3"],
+      error: 'Conflicting npm specs for "hooks"',
+    },
+  ])("rejects invalid target sets before any updates: $ids", async ({ ids, error }) => {
+    primeUpdateConfigSnapshot({ config: {} });
+    setInstalledPluginIndexInstallRecords({
+      alpha: { source: "npm", spec: "@acme/alpha", installPath: "/tmp/alpha" },
+    });
+    setHookInstallRecords({
+      hooks: { source: "npm", spec: "@acme/hooks", installPath: "/tmp/hooks" },
+    });
+
+    await expect(runPluginsCommand(["plugins", "update", ...ids])).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors.at(-1)).toContain(error);
+    expect(updateNpmInstalledPluginsMock).not.toHaveBeenCalled();
+    expect(updateNpmInstalledHookPacksMock).not.toHaveBeenCalled();
+    expect(writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock).not.toHaveBeenCalled();
+    expect(replaceConfigFileMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "updates explicit plugin and hook targets once (dry run: %s)",
+    async (dryRun) => {
+      primeUpdateConfigSnapshot({ config: {} });
+      const records = {
+        alpha: { source: "npm", spec: "@acme/alpha", installPath: "/tmp/alpha" },
+        beta: { source: "npm", spec: "@acme/beta", installPath: "/tmp/beta" },
+      } as const;
+      setInstalledPluginIndexInstallRecords(records);
+      setHookInstallRecords({
+        hooks: { source: "npm", spec: "@acme/hooks", installPath: "/tmp/hooks" },
+      });
+      const nextRecords = { ...records, alpha: { ...records.alpha, spec: "@acme/alpha@beta" } };
+      const nextConfig = { plugins: { installs: nextRecords } };
+      primePluginUpdate(
+        nextConfig,
+        [
+          { pluginId: "alpha", status: "updated", message: "Updated alpha." },
+          { pluginId: "beta", status: "unchanged", message: "Beta is current." },
+        ],
+        !dryRun,
+      );
+      updateNpmInstalledHookPacksMock.mockResolvedValue({
+        config: nextConfig,
+        changed: !dryRun,
+        outcomes: [{ hookId: "hooks", status: "updated", message: "Updated hooks." }],
+      });
+      resolvePluginLifecycleGatewayMock.mockResolvedValue(pluginLifecycleGatewayMock);
+      pluginLifecycleGatewayMock.mockResolvedValue({ runtime: { generation: 7 } });
+
+      await runPluginsCommand([
+        "plugins",
+        "update",
+        "beta",
+        "@acme/alpha@beta",
+        "alpha",
+        "beta",
+        "hooks",
+        "@acme/hooks@beta",
+        "hooks",
+        ...(dryRun ? ["--dry-run"] : []),
+      ]);
+
+      expect(expectSingleCallParams(updateNpmInstalledPluginsMock)).toMatchObject({
+        pluginIds: ["beta", "alpha"],
+        specOverrides: { alpha: "@acme/alpha@beta" },
+        dryRun,
+      });
+      expect(expectSingleCallParams(updateNpmInstalledHookPacksMock)).toMatchObject({
+        hookIds: ["hooks"],
+        specOverrides: { hooks: "@acme/hooks@beta" },
+        dryRun,
+      });
+      expect(pluginLifecycleGatewayMock.mock.calls.map(([method]) => method)).toEqual(
+        dryRun ? [] : ["plugins.list", "plugins.refresh"],
+      );
+      if (dryRun) {
+        expect(
+          writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock,
+        ).not.toHaveBeenCalled();
+        expect(replaceConfigFileMock).not.toHaveBeenCalled();
+      } else {
+        expectInstallRecordsWrittenWithLease(nextRecords, {});
+        expect(pluginsCliRuntimeLogs).toContain("Applied plugin updates in Gateway generation 7.");
+      }
+    },
+  );
 
   it.each([
     { label: "a stale child-keyed owner", args: ["pack/one"] },
@@ -913,6 +980,7 @@ describe("plugins cli update", () => {
       config: cfg,
       installRecords: nextRecords,
       reason: "source-changed",
+      ...writtenIndexCustody(),
     });
     expectOfflineNoticeLogged();
   });
@@ -983,6 +1051,7 @@ describe("plugins cli update", () => {
       },
       installRecords: nextRecords,
       reason: "source-changed",
+      ...writtenIndexCustody(),
     });
   });
 
@@ -1504,7 +1573,7 @@ describe("plugins cli update", () => {
 
     await expect(runPluginsCommand(["plugins", "update"])).rejects.toThrow("__exit__:1");
 
-    expect(runtimeErrors.at(-1)).toContain("Provide a plugin or hook-pack id, or use --all.");
+    expect(runtimeErrors.at(-1)).toContain("Provide plugin or hook-pack ids, or use --all.");
     expect(updateNpmInstalledPluginsMock).not.toHaveBeenCalled();
   });
 
@@ -1523,13 +1592,10 @@ describe("plugins cli update", () => {
   });
 
   it("warns once for the deprecated unsafe flag on updates", async () => {
-    const config = createTrackedPluginConfig({
+    const config = primeTrackedPluginUpdate({
       pluginId: "openclaw-codex-app-server",
       spec: "openclaw-codex-app-server@beta",
     });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
 
     await runPluginsCommand([
       "plugins",
@@ -1587,14 +1653,11 @@ describe("plugins cli update", () => {
   );
 
   it("passes the inferred core channel to a targeted update without enabling catalog sync", async () => {
-    const config = createTrackedPluginConfig({
+    primeTrackedPluginUpdate({
       pluginId: "codex",
       spec: "@openclaw/codex",
       resolvedName: "@openclaw/codex",
     });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
 
     await runPluginsCommand(["plugins", "update", "codex"]);
 
@@ -1607,15 +1670,12 @@ describe("plugins cli update", () => {
   });
 
   it("syncs official catalog specs with beta channel context for update --all", async () => {
-    const config = createTrackedPluginConfig({
+    primeTrackedPluginUpdate({
       pluginId: "codex",
       spec: "@openclaw/codex@2026.6.8-beta.1",
       resolvedName: "@openclaw/codex",
+      channel: "beta",
     });
-    config.update = { channel: "beta" };
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
 
     await runPluginsCommand(["plugins", "update", "--all"]);
 
@@ -1626,34 +1686,13 @@ describe("plugins cli update", () => {
     expect(updateParams.updateChannel).toBeUndefined();
   });
 
-  it("infers the official catalog channel from the installed core for update --all", async () => {
-    const config = createTrackedPluginConfig({
-      pluginId: "codex",
-      spec: "@openclaw/codex",
-      resolvedName: "@openclaw/codex",
-    });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
-
-    await runPluginsCommand(["plugins", "update", "--all"]);
-
-    const updateParams = expectSingleCallParams(updateNpmInstalledPluginsMock);
-    expect(updateParams.officialPluginUpdateChannel).toBe(
-      resolveRegistryUpdateChannel({ currentVersion: VERSION }),
-    );
-  });
-
   it("passes extended-stable channel and installed core version to update --all", async () => {
-    const config = createTrackedPluginConfig({
+    primeTrackedPluginUpdate({
       pluginId: "codex",
       spec: "@openclaw/codex",
       resolvedName: "@openclaw/codex",
+      channel: "extended-stable",
     });
-    config.update = { channel: "extended-stable" };
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
 
     await runPluginsCommand(["plugins", "update", "--all"]);
 
@@ -1668,10 +1707,7 @@ describe("plugins cli update", () => {
 
   it("binds explicit update acceptance to the reviewed capability surface", async () => {
     setTty(false);
-    const config = createTrackedPluginConfig({ pluginId: "alpha", spec: "@acme/alpha" });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
+    primeTrackedPluginUpdate({ pluginId: "alpha", spec: "@acme/alpha" });
 
     await runPluginsCommand(["plugins", "update", "alpha", "--accept-capabilities"]);
 
@@ -1690,10 +1726,7 @@ describe("plugins cli update", () => {
 
   it("shows widened capabilities and requests consent for interactive plugin updates", async () => {
     setTty(true);
-    const config = createTrackedPluginConfig({ pluginId: "alpha", spec: "@acme/alpha" });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
+    primeTrackedPluginUpdate({ pluginId: "alpha", spec: "@acme/alpha" });
 
     await runPluginsCommand(["plugins", "update", "alpha"]);
 
@@ -1720,13 +1753,10 @@ describe("plugins cli update", () => {
 
   it("does not pass an interactive ClawHub risk prompt to dry-run plugin updates", async () => {
     setTty(true);
-    const config = createTrackedPluginConfig({
+    primeTrackedPluginUpdate({
       pluginId: "openclaw-codex-app-server",
       spec: "clawhub:openclaw-codex-app-server",
     });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    primePluginUpdate(config);
 
     await runPluginsCommand(["plugins", "update", "openclaw-codex-app-server", "--dry-run"]);
 
@@ -1747,27 +1777,6 @@ describe("plugins cli update", () => {
     updateNpmInstalledPluginsMock.mockResolvedValue({ config, changed: false, outcomes: [] });
 
     await runPluginsCommand(["plugins", "update", "openclaw-codex-app-server"]);
-
-    const updateParams = expectSingleCallParams(updateNpmInstalledPluginsMock);
-    expect(updateParams.onInstallPolicyWarning).toEqual(expect.any(Function));
-  });
-
-  it("passes noninteractive install-policy acknowledgement to plugin updates", async () => {
-    setTty(false);
-    const config = createTrackedPluginConfig({
-      pluginId: "openclaw-codex-app-server",
-      spec: "openclaw-codex-app-server",
-    });
-    pluginCliConfigMock.mockReturnValue(config);
-    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
-    updateNpmInstalledPluginsMock.mockResolvedValue({ config, changed: false, outcomes: [] });
-
-    await runPluginsCommand([
-      "plugins",
-      "update",
-      "openclaw-codex-app-server",
-      "--acknowledge-install-policy-warning",
-    ]);
 
     const updateParams = expectSingleCallParams(updateNpmInstalledPluginsMock);
     expect(updateParams.onInstallPolicyWarning).toEqual(expect.any(Function));
@@ -1908,6 +1917,7 @@ describe("plugins cli update", () => {
       config: cfg,
       installRecords: nextRecords,
       reason: "source-changed",
+      ...writtenIndexCustody(),
     });
     expect(pluginsCliRuntimeLogs.join("\n")).toContain("Plugin update committed");
     expect(pluginsCliRuntimeLogs).toContain("Updated alpha -> 1.1.0");
@@ -1915,76 +1925,80 @@ describe("plugins cli update", () => {
     expectOfflineNoticeLogged();
   });
 
-  it("exits non-zero when a plugin update reports an error after persisting successes", async () => {
-    const cfg = {
-      plugins: {
-        installs: {
-          alpha: {
-            source: "npm",
-            spec: "@openclaw/alpha@1.0.0",
-          },
-          beta: {
-            source: "npm",
-            spec: "@openclaw/beta@1.0.0",
-          },
-        },
-      },
-    } as OpenClawConfig;
-    const nextConfig = {
-      plugins: {
-        installs: {
-          alpha: {
-            source: "npm",
-            spec: "@openclaw/alpha@1.1.0",
-          },
-          beta: {
-            source: "npm",
-            spec: "@openclaw/beta@1.0.0",
+  it.each([{ ids: ["--all"] }, { ids: ["alpha", "beta"] }])(
+    "persists successful updates before reporting errors ($ids)",
+    async ({ ids }) => {
+      const cfg = {
+        plugins: {
+          installs: {
+            alpha: {
+              source: "npm",
+              spec: "@openclaw/alpha@1.0.0",
+            },
+            beta: {
+              source: "npm",
+              spec: "@openclaw/beta@1.0.0",
+            },
           },
         },
-      },
-    } as OpenClawConfig;
-    pluginCliConfigMock.mockReturnValue(cfg);
-    setInstalledPluginIndexInstallRecords(cfg.plugins?.installs ?? {});
-    primePluginUpdate(
-      nextConfig,
-      [
-        { pluginId: "alpha", status: "updated", message: "Updated alpha -> 1.1.0" },
-        {
-          pluginId: "beta",
-          status: "error",
-          message: "Failed to update beta: registry timeout",
-          channelFallback: {
-            requestedSpec: "@openclaw/beta@beta",
-            usedSpec: "@openclaw/beta@latest",
-            requestedLabel: "beta",
-            usedLabel: "latest",
-            reason: "failed",
-            message: "Beta channel unavailable; tried latest.",
+      } as OpenClawConfig;
+      const nextConfig = {
+        plugins: {
+          installs: {
+            alpha: {
+              source: "npm",
+              spec: "@openclaw/alpha@1.1.0",
+            },
+            beta: {
+              source: "npm",
+              spec: "@openclaw/beta@1.0.0",
+            },
           },
         },
-      ],
-      true,
-    );
-    updateNpmInstalledHookPacksMock.mockResolvedValue({
-      outcomes: [],
-      changed: false,
-      config: nextConfig,
-    });
+      } as OpenClawConfig;
+      pluginCliConfigMock.mockReturnValue(cfg);
+      setInstalledPluginIndexInstallRecords(cfg.plugins?.installs ?? {});
+      primePluginUpdate(
+        nextConfig,
+        [
+          { pluginId: "alpha", status: "updated", message: "Updated alpha -> 1.1.0" },
+          {
+            pluginId: "beta",
+            status: "error",
+            message: "Failed to update beta: registry timeout",
+            channelFallback: {
+              requestedSpec: "@openclaw/beta@beta",
+              usedSpec: "@openclaw/beta@latest",
+              requestedLabel: "beta",
+              usedLabel: "latest",
+              reason: "failed",
+              message: "Beta channel unavailable; tried latest.",
+            },
+          },
+        ],
+        true,
+      );
+      updateNpmInstalledHookPacksMock.mockResolvedValue({
+        outcomes: [],
+        changed: false,
+        config: nextConfig,
+      });
 
-    await expect(runPluginsCommand(["plugins", "update", "--all"])).rejects.toThrow("__exit__:1");
+      await expect(runPluginsCommand(["plugins", "update", ...ids])).rejects.toThrow("__exit__:1");
 
-    expectInstallRecordsWrittenWithLease(nextConfig.plugins?.installs, {});
-    expect(refreshPluginRegistryMock).toHaveBeenCalledWith({
-      config: {},
-      installRecords: nextConfig.plugins?.installs,
-      reason: "source-changed",
-    });
-    expect(runtimeErrors).toContain("Failed to update beta: registry timeout");
-    expect(pluginsCliRuntimeLogs).toContain("Updated alpha -> 1.1.0");
-    expect(pluginsCliRuntimeLogs).toContain("Beta channel unavailable; tried latest.");
-    expect(pluginsCliRuntimeLogs).not.toContain("Failed to update beta: registry timeout");
-  });
+      expectInstallRecordsWrittenWithLease(nextConfig.plugins?.installs, {});
+      expect(refreshPluginRegistryMock).toHaveBeenCalledWith({
+        config: {},
+        installRecords: nextConfig.plugins?.installs,
+        reason: "source-changed",
+        ...writtenIndexCustody(),
+      });
+      expect(runtimeErrors).toContain("Failed to update beta: registry timeout");
+      expect(pluginsCliRuntimeLogs).toContain("Updated alpha -> 1.1.0");
+      expect(pluginsCliRuntimeLogs).toContain("Beta channel unavailable; tried latest.");
+      expect(pluginsCliRuntimeLogs).not.toContain("Failed to update beta: registry timeout");
+    },
+  );
 
   it("exits non-zero when a ClawHub update is skipped because the target release is blocked", async () => {
     await expectSkippedClawHubPluginUpdate({

@@ -44,10 +44,28 @@ export function resolveRuntimeWorkerUrl(params: {
   return new URL(`./${params.sourceWorkerName}${extension}`, params.currentModuleUrl);
 }
 
+function isBunWorkerRuntime(execPath: string): boolean {
+  // Current runtime metadata also identifies renamed binaries; foreign paths keep their own selection.
+  return execPath === process.execPath ? Boolean(process.versions.bun) : isBunRuntime(execPath);
+}
+
 export function resolveRuntimeWorkerArgv(url: URL, execPath = process.execPath): string[] {
   const entry = fileURLToPath(url);
   // Resolve the preload here: Node resolves bare imports from the child cwd.
-  return /\.[cm]?ts$/.test(entry) && !isBunRuntime(execPath)
+  return /\.[cm]?ts$/.test(entry) && !isBunWorkerRuntime(execPath)
     ? ["--import", import.meta.resolve("tsx"), entry]
     : [entry];
+}
+
+/** Select the source Worker preload without feeding Node's TypeScript loader to Bun. */
+export function resolveRuntimeWorkerThreadExecArgv(
+  url: URL,
+  execPath = process.execPath,
+): string[] {
+  if (url.protocol !== "file:") {
+    return [];
+  }
+  return /\.[cm]?ts$/.test(fileURLToPath(url)) && !isBunWorkerRuntime(execPath)
+    ? ["--import", import.meta.resolve("tsx/esm")]
+    : [];
 }
