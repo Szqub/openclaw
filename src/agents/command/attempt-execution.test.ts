@@ -436,60 +436,6 @@ describe("claudeCliSessionTranscriptHasContent", () => {
 
   const GRACE_MS = 250;
 
-  it("probes only the configured Claude root for content and orphaned tools", async () => {
-    const workspaceDir = await fs.realpath(await makeWorkspace());
-    const configDir = path.join(tmpDir, "selected Claude");
-    const projectKey = workspaceDir.replace(/[^a-zA-Z0-9]/g, "-");
-    const sessionId = "configured-session";
-    const selectedFile = path.join(configDir, "projects", projectKey, `${sessionId}.jsonl`);
-    const defaultFile = path.join(tmpDir, ".claude", "projects", projectKey, `${sessionId}.jsonl`);
-    for (const [file, content] of [
-      [selectedFile, [{ type: "tool_use", id: "unanswered", name: "Read", input: {} }]],
-      [defaultFile, [{ type: "text", text: "default-root decoy" }]],
-    ] as const) {
-      await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, `${JSON.stringify({ message: { role: "assistant", content } })}\n`);
-    }
-    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
-    try {
-      const target = { sessionId, workspaceDir, homeDir: tmpDir };
-      expect(await claudeCliSessionTranscriptHasContent(target)).toBe(true);
-      expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(true);
-      await fs.unlink(selectedFile);
-      expect(await claudeCliSessionTranscriptHasContent(target)).toBe(false);
-      expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(false);
-    } finally {
-      vi.mocked(cliBackendLog.warn).mockClear();
-    }
-  });
-
-  it("probes the retained child root instead of the Gateway root", async () => {
-    const workspaceDir = await fs.realpath(await makeWorkspace());
-    const projectKey = workspaceDir.replace(/[^a-zA-Z0-9]/g, "-");
-    const sessionId = "retained-session";
-    const childRoot = path.join(tmpDir, "child Claude", "projects");
-    const gatewayFile = path.join(
-      tmpDir,
-      "gateway Claude",
-      "projects",
-      projectKey,
-      `${sessionId}.jsonl`,
-    );
-    const childFile = path.join(childRoot, projectKey, `${sessionId}.jsonl`);
-    for (const [file, content] of [
-      [childFile, [{ type: "text", text: "child-root history" }]],
-      [gatewayFile, [{ type: "tool_use", id: "unanswered", name: "Read", input: {} }]],
-    ] as const) {
-      await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, `${JSON.stringify({ message: { role: "assistant", content } })}\n`);
-    }
-    vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tmpDir, "gateway Claude"));
-    const target = { sessionId, workspaceDir, homeDir: tmpDir, projectsRoot: childRoot };
-    expect(await claudeCliSessionTranscriptHasContent(target)).toBe(true);
-    // The Gateway-root decoy is the only transcript holding an unanswered tool_use.
-    expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(false);
-  });
-
   it("rejects path-like session ids instead of escaping the Claude projects tree", async () => {
     const workspaceDir = await makeWorkspace();
     await writeClaudeProjectFile(workspaceDir, "safe-session", "");

@@ -1661,7 +1661,7 @@ async function prepareCliRunContextWithinReadFence(
             snapshot: params.skillsSnapshot,
             config: runConfig,
           }),
-          remote: Boolean(nodeClaudePlacement),
+          remote: false,
           cwd,
         })
       : undefined;
