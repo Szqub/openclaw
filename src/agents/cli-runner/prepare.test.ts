@@ -6371,8 +6371,11 @@ describe("prepareCliRunContext", () => {
       expect(context.requiredClaudeLiveSessionGeneration).toBeUndefined();
       expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
     } finally {
-      if (previousConfig) setRuntimeConfigSnapshot(previousConfig);
-      else clearRuntimeConfigSnapshot();
+      if (previousConfig) {
+        setRuntimeConfigSnapshot(previousConfig);
+      } else {
+        clearRuntimeConfigSnapshot();
+      }
     }
   });
 
