@@ -150,6 +150,7 @@ import {
 } from "../workspace.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
 import { prepareCliBundleMcpConfig } from "./bundle-mcp.js";
+import { resolveClaudeChildTranscriptRoot } from "./child-env.js";
 import { prepareClaudeCliSkillsPlugin } from "./claude-skills-plugin.js";
 import { runCliCleanup } from "./cleanup.js";
 import {
@@ -1936,12 +1937,23 @@ async function prepareCliRunContextWithinReadFence(
       !nodeClaudePlacement &&
       candidateClaudeCliSessionId !== undefined &&
       isClaudeCliBackendId(params.provider);
+    // Reuse must be judged under the root the upcoming child selects, not the root a
+    // previous run wrote under: a config-dir change makes the stored transcript foreign.
+    const claudeCliTranscriptRoot = hasClaudeCliCandidate
+      ? await resolveClaudeChildTranscriptRoot({
+          provider: params.provider,
+          backend: preparedBackendFinal.backend,
+          preparedBackend: preparedBackendFinal,
+          remote: Boolean(nodeClaudePlacement),
+          cwd,
+        })
+      : undefined;
     const claudeCliTranscriptMissing =
       hasClaudeCliCandidate &&
       !(await prepareDeps.claudeCliSessionTranscriptHasContent({
         sessionId: candidateClaudeCliSessionId,
         workspaceDir: cwd,
-        projectsRoot: params.cliSessionBinding?.transcriptRoot,
+        projectsRoot: claudeCliTranscriptRoot,
       }));
     const managedClaudeLiveSessionGeneration =
       claudeCliTranscriptMissing &&
@@ -1965,7 +1977,7 @@ async function prepareCliRunContextWithinReadFence(
       (await prepareDeps.claudeCliSessionTranscriptHasOrphanedToolUse({
         sessionId: candidateClaudeCliSessionId,
         workspaceDir: cwd,
-        projectsRoot: params.cliSessionBinding?.transcriptRoot,
+        projectsRoot: claudeCliTranscriptRoot,
       }));
     const claudeCliInvalidatedReason: "missing-transcript" | "orphaned-tool-use" | undefined =
       claudeCliTranscriptMissing && !hasManagedClaudeLiveSession
