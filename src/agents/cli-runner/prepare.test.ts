@@ -18,7 +18,11 @@ import {
 } from "../../auto-reply/reply/reply-run-registry.js";
 import { prepareReplyToolAuthority } from "../../auto-reply/reply/reply-tool-authority.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
-import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import {
+  clearRuntimeConfigSnapshot,
+  getRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
 import { runWithCliHistoryWriter } from "../../config/sessions/cli-history-boundary.js";
 import {
   loadSessionEntryReadOnly,
@@ -6330,41 +6334,46 @@ describe("prepareCliRunContext", () => {
     );
     setCliBackendForPrepareTest({ liveSession: true });
 
-    const context = await fixture.prepare({
-      cwd: taskDir,
-      config: {
-        skills: {
-          entries: {
-            "skill-selected-profile": {
-              env: { CLAUDE_CONFIG_DIR: childConfigDir },
+    const config: OpenClawConfig = {
+      skills: {
+        entries: { "skill-selected-profile": { env: { CLAUDE_CONFIG_DIR: childConfigDir } } },
+      },
+    };
+    // Skill env application reads the active runtime snapshot, just as execution does.
+    const previousConfig = getRuntimeConfigSnapshot();
+    setRuntimeConfigSnapshot(config);
+    try {
+      const context = await fixture.prepare({
+        cwd: taskDir,
+        config,
+        skillsSnapshot: {
+          prompt: "",
+          skills: [
+            {
+              name: "skill-selected-profile",
+              skillKey: "skill-selected-profile",
             },
-          },
+          ],
         },
-      },
-      skillsSnapshot: {
-        prompt: "",
-        skills: [
-          {
-            name: "skill-selected-profile",
-            skillKey: "skill-selected-profile",
-          },
-        ],
-      },
-      provider: "claude-cli",
-      model: "opus",
-      cliSessionBinding: {
-        sessionId: "skill-configured-sid",
-        cwdHash: hashCliSessionText(taskDir),
-      },
-      cliSessionId: "skill-configured-sid",
-    });
+        provider: "claude-cli",
+        model: "opus",
+        cliSessionBinding: {
+          sessionId: "skill-configured-sid",
+          cwdHash: hashCliSessionText(taskDir),
+        },
+        cliSessionId: "skill-configured-sid",
+      });
 
-    expect(context.reusableCliSession).toEqual({
-      mode: "reuse",
-      sessionId: "skill-configured-sid",
-    });
-    expect(context.requiredClaudeLiveSessionGeneration).toBeUndefined();
-    expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+      expect(context.reusableCliSession).toEqual({
+        mode: "reuse",
+        sessionId: "skill-configured-sid",
+      });
+      expect(context.requiredClaudeLiveSessionGeneration).toBeUndefined();
+      expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    } finally {
+      if (previousConfig) setRuntimeConfigSnapshot(previousConfig);
+      else clearRuntimeConfigSnapshot();
+    }
   });
 
   it.each(["prepared", "admitted"] as const)(
