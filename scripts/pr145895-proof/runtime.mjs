@@ -14,6 +14,7 @@ import { createServer } from "node:http";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
+import { DatabaseSync } from "node:sqlite";
 
 const EXPECTED_HEAD = "d165b4954dcc0b5ad0fb3cf999a6ce28753420ea";
 const CLAUDE_VERSION = "2.1.269";
@@ -29,7 +30,8 @@ const MARKER_RE = /(?:SEED|PROOF-REPLY|NATIVE-ONLY|FORK)-[A-Za-z0-9-]+|DECOY-WRO
 const outputDir = resolveOutputDir(process.argv.slice(2));
 const scenarioArg = process.argv.indexOf("--scenario");
 const requestedScenario = scenarioArg < 0 ? "all" : process.argv[scenarioArg + 1];
-if (!["all", "absolute"].includes(requestedScenario)) throw new Error("unsupported proof scenario");
+if (!["all", "absolute", "native-fork"].includes(requestedScenario))
+  throw new Error("unsupported proof scenario");
 const candidateRoot = path.resolve(process.cwd());
 const tempRoot = path.join(
   process.env.RUNNER_TEMP?.trim() || "/tmp",
@@ -65,6 +67,10 @@ function safeText(value) {
     .replaceAll(DUMMY_API_KEY, "<dummy-api-key>")
     .replaceAll(GATEWAY_TOKEN, "<gateway-token>")
     .replaceAll(tempRoot, "<proof-temp>")
+    .replaceAll(
+      /("[^"\n]*(?:token|secret|password|authorization|apiKey)[^"\n]*"\s*:\s*")[^"]*"/giu,
+      '$1<redacted>"',
+    )
     .replaceAll(/sk-ant-[A-Za-z0-9._-]+/gu, "<redacted-api-key>")
     .replaceAll(/Bearer\s+\S+/giu, "Bearer <redacted>");
 }
@@ -396,15 +402,21 @@ function configFor(scenario) {
       port: scenario.gatewayPort,
       auth: { mode: "token", token: GATEWAY_TOKEN },
     },
+    plugins: {
+      entries: { anthropic: { enabled: true, config: { sessionCatalog: { enabled: true } } } },
+    },
     agents: {
       defaults: {
         workspace: scenario.workspace,
         cwd: scenario.workspace,
         model: MODEL,
+        models: {
+          "anthropic/claude-sonnet-4-6": { agentRuntime: { id: "claude-cli" } },
+        },
         skipBootstrap: true,
       },
     },
-    logging: { level: "silent", consoleLevel: "silent" },
+    logging: { level: "info", consoleLevel: "warn" },
   };
 }
 
@@ -489,7 +501,7 @@ async function rpc(scenario, method, params = {}, timeoutMs = RPC_TIMEOUT_MS) {
   const parsed = extractJson(result.stdout);
   if (result.code !== 0 || !parsed) {
     throw new Error(
-      `${method} command failed (exit=${result.code ?? "null"}): ${safeText(result.stderr.slice(-1500))}`,
+      `${method} command failed (exit=${result.code ?? "null"}): ${safeText(`${result.stderr}\n${result.stdout}`.slice(-2000))}`,
     );
   }
   return unwrapRpc(parsed, method);
@@ -698,6 +710,100 @@ async function listClaudeCatalog(scenario, sourceSessionId) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw last ?? new Error("claude catalog list timed out");
+}
+
+async function runStandaloneNativeFork(mock) {
+  const scenario = await prepareScenario(
+    "absolute",
+    path.join(tempRoot, "native-fork"),
+    mock.baseUrl,
+    "native-fork",
+  );
+  const sourceSessionId = randomUUID();
+  const sourceMarker = `SEED-native-fork-${randomUUID()}`;
+  const forkMarker = `FORK-${randomUUID()}`;
+  const checks = [];
+  try {
+    // Bound OpenClaw sessions are linked, not adopted. Seed an independent native session.
+    const created = await run(
+      summary.claude.executable,
+      [
+        "-p",
+        "--output-format",
+        "text",
+        "--setting-sources",
+        "user",
+        "--model",
+        "claude-sonnet-4-6",
+        "--session-id",
+        sourceSessionId,
+        `Remember this marker: ${sourceMarker}. Acknowledge briefly.`,
+      ],
+      { cwd: scenario.workspace, env: scenarioEnv(scenario), timeoutMs: TURN_TIMEOUT_MS },
+    );
+    if (created.code !== 0 || !created.stdout.includes("PROOF-REPLY-")) {
+      throw new Error(`native-only seed failed: ${safeText(created.stderr.slice(-1500))}`);
+    }
+    const seeded = await transcriptFacts(scenario.selectedRoot);
+    if (!seeded.sessionIds.includes(sourceSessionId) || !seeded.markers.includes(sourceMarker)) {
+      throw new Error("native-only seed transcript missing");
+    }
+    checks.push({ name: "unbound-native-source", status: "passed" });
+    await startGateway(scenario, "native-fork");
+    const row = await listClaudeCatalog(scenario, sourceSessionId);
+    const adopted = await rpc(scenario, "sessions.catalog.continue", {
+      catalogId: "claude",
+      hostId: "gateway:local",
+      threadId: row.threadId,
+      agentId: "main",
+    });
+    if (typeof adopted?.sessionKey !== "string")
+      throw new Error("native adoption returned no session key");
+    checks.push({ name: "catalog-adoption", status: "passed" });
+    await sendTurn(
+      { ...scenario, sessionKey: adopted.sessionKey },
+      forkMarker,
+      "Continue this adopted native session and acknowledge the new marker.",
+    );
+    await stopGateway();
+    const database = new DatabaseSync(
+      path.join(scenario.state, "agents/main/agent/openclaw-agent.sqlite"),
+      { readOnly: true },
+    );
+    let binding;
+    try {
+      const stored = database
+        .prepare("SELECT entry_json FROM session_nodes WHERE session_key = ?")
+        .get(adopted.sessionKey);
+      binding = stored
+        ? JSON.parse(stored.entry_json).cliSessionBindings?.["claude-cli"]
+        : undefined;
+    } finally {
+      database.close();
+    }
+    if (!binding?.sessionId || binding.sessionId === sourceSessionId)
+      throw new Error("fork successor was not persisted");
+    if (binding.transcriptRoot !== path.join(scenario.selectedRoot, "projects"))
+      throw new Error("fork successor lost the selected transcript root");
+    const files = await scanTranscripts(scenario.selectedRoot);
+    const successorFile = files.find(
+      (file) => path.basename(file) === `${binding.sessionId}.jsonl`,
+    );
+    if (!successorFile || !(await readFile(successorFile, "utf8")).includes(forkMarker))
+      throw new Error("successor native transcript lacks the fork turn");
+    checks.push({
+      name: "native-fork-and-persisted-root",
+      status: "passed",
+      sourceSessionId,
+      successorSessionId: binding.sessionId,
+      persistedRootMatches: true,
+    });
+    phase("standalone-native-fork", "passed", { checks });
+  } catch (error) {
+    fail("standalone-native-fork", error, { checks });
+  } finally {
+    await stopGateway();
+  }
 }
 
 async function runAbsoluteFull(scenario, mock) {
@@ -1044,10 +1150,14 @@ async function main() {
   summary.mockModel.loopbackUrl = mockServer.baseUrl.replace(/:\d+$/u, ":<ephemeral-port>");
   phase("mock-model", "passed", { loopback: true });
 
-  const absoluteRun = path.join(tempRoot, "absolute");
-  await mkdir(absoluteRun, { recursive: true });
-  const absolute = await prepareScenario("absolute", absoluteRun, mockServer.baseUrl);
-  await runAbsoluteFull(absolute, mockServer);
+  if (requestedScenario === "native-fork") {
+    await runStandaloneNativeFork(mockServer);
+  } else {
+    const absoluteRun = path.join(tempRoot, "absolute");
+    await mkdir(absoluteRun, { recursive: true });
+    const absolute = await prepareScenario("absolute", absoluteRun, mockServer.baseUrl);
+    await runAbsoluteFull(absolute, mockServer);
+  }
   if (requestedScenario === "all") {
     await runRootSmoke("default", mockServer, tempRoot);
     await runRootSmoke("relative", mockServer, tempRoot);
