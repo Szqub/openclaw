@@ -1,0 +1,88 @@
+name: Claude transcript root proof
+
+on:
+  push:
+    branches: [proof/claude-transcript-root-20260927]
+    paths:
+      - .github/workflows/pr145895-proof.yml
+      - scripts/pr145895-proof/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr145895-isolated-proof
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    if: github.repository == 'Szqub/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: "1"
+      OPENCLAW_VITEST_MAX_WORKERS: "2"
+      OPENCLAW_TEST_PROJECTS_PARALLEL: "1"
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: d165b4954dcc0b5ad0fb3cf999a6ce28753420ea
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout proof tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: tooling
+          sparse-checkout: scripts/pr145895-proof
+          sparse-checkout-cone-mode: false
+      - name: Verify candidate and prepare evidence directory
+        run: |
+          test "$(git rev-parse HEAD)" = d165b4954dcc0b5ad0fb3cf999a6ce28753420ea
+          mkdir -p "$RUNNER_TEMP/pr145895-evidence"
+          printf '%s\n' d165b4954dcc0b5ad0fb3cf999a6ce28753420ea > "$RUNNER_TEMP/pr145895-evidence/candidate.txt"
+          printf 'tooling_sha=%s\nrun_id=%s\nrun_attempt=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/pr145895-evidence/workflow.txt"
+      - name: Setup frozen candidate toolchain
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "26.x"
+          install-bun: "false"
+          install-deps: "false"
+          cache-mode: "off"
+      - name: Install candidate dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run focused regression coverage
+        run: |
+          set -o pipefail
+          node scripts/run-vitest.mjs run \
+            src/agents/cli-runner.claude-config-dir.test.ts \
+            src/agents/cli-runner/execute.claude-config-dir.test.ts \
+            src/agents/cli-runner/cli-run-settlement.test.ts \
+            src/agents/cli-runner/prepare.test.ts \
+            src/agents/command/attempt-execution.test.ts \
+            src/agents/cli-session.test.ts \
+            src/gateway/cli-session-history.claude-config-dir.test.ts \
+            2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/focused-tests.log"
+      - name: Verify older-writer compatibility
+        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --output "$RUNNER_TEMP/pr145895-evidence"
+      - name: Build candidate runtime
+        run: pnpm build
+      - name: Install pinned official Claude Code
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pr145895-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
+          echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Run isolated Gateway and native Claude proof
+        run: node tooling/scripts/pr145895-proof/runtime.mjs --output "$RUNNER_TEMP/pr145895-evidence"
+      - name: Verify tracked candidate source stayed unchanged
+        if: always()
+        run: git diff --exit-code HEAD
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr145895-d165b4954dcc-proof
+          path: ${{ runner.temp }}/pr145895-evidence/
+          if-no-files-found: error
+          retention-days: 30
