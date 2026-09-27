@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { isPreparedClawHubTrustedPublisher } from "./clawhub-prepared-artifact.mjs";
 import { canonicalizeJsonValue, compareAscii } from "./lib/canonical-json.mjs";
+import corePackages from "./lib/npm-core-release-packages.json" with { type: "json" };
+import { resolveNpmPublishPlan } from "./lib/npm-publish-plan.mjs";
 import { classifyReleaseTrain, parseReleaseVersion } from "./lib/release-version.mjs";
 
 export const FULL_RELEASE_SOURCE_ADMISSION_CONTRACT = "1";
+export const FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT = "1";
 const purposes = ["publish", "diagnostic", "main-qualification", "postpublish-confidence"];
 const maximumBytes = 128 * 1024;
 const sha = /^[a-f0-9]{40}$/u;
@@ -22,6 +26,7 @@ const coverageInputs = {
   npm_telegram_provider_mode: "npmTelegramProviderMode",
   npm_telegram_scenario: "npmTelegramScenario",
   plugin_prerelease_node_exclude_patterns_json: "pluginPrereleaseNodeExcludePatternsJson",
+  extension_test_exclude_patterns_json: "extensionTestExcludePatternsJson",
   skip_package_telegram_e2e: "skipPackageTelegramE2e",
   telegram_waiver: "telegramWaiver",
   allow_unreleased_changelog: "allowUnreleasedChangelog",
@@ -211,16 +216,36 @@ export function publicationIntentInputs(intent) {
   };
 }
 
+export function normalizePublicationLaneInputs(value) {
+  object(value, ["extension_test_exclude_patterns_json"], "source-admission lane inputs");
+  return Object.fromEntries(
+    Object.entries(value).map(([key, raw]) => {
+      if (typeof raw !== "string" || raw.length > 4096) {
+        throw new Error(`invalid ${key}`);
+      }
+      const entries = JSON.parse(raw);
+      if (!Array.isArray(entries) || entries.some((entry) => typeof entry !== "string")) {
+        throw new Error(`${key} must be a JSON array of strings`);
+      }
+      return [key, JSON.stringify(entries)];
+    }),
+  );
+}
+
 export function decodePublicationDispatchEnvelope(raw) {
   if (typeof raw !== "string" || !raw || Buffer.byteLength(raw) > maximumBytes) {
     throw new Error("trusted_workflow_json requires a bounded source-admission envelope");
   }
   const value = object(
     JSON.parse(raw),
-    ["trustedWorkflow", "validationPurpose", "publicationSelection"],
+    ["trustedWorkflow", "validationPurpose", "publicationSelection", "laneInputs"],
     "source-admission envelope",
   );
-  if (Object.keys(value).length !== 3) {
+  if (
+    ["trustedWorkflow", "validationPurpose", "publicationSelection"].some(
+      (key) => !Object.hasOwn(value, key),
+    )
+  ) {
     throw new Error("source-admission envelope requires identity, purpose and selection");
   }
   const trustedWorkflow = value.trustedWorkflow;
@@ -239,8 +264,11 @@ export function decodePublicationDispatchEnvelope(raw) {
       throw new Error("invalid source-admission tooling identity");
     }
   }
+  const laneInputs =
+    value.laneInputs === undefined ? undefined : normalizePublicationLaneInputs(value.laneInputs);
   return {
     trustedWorkflow,
+    ...(laneInputs === undefined ? {} : { laneInputs }),
     ...normalizePublicationIntent(
       value.validationPurpose,
       value.publicationSelection === null ? "" : publicationSourceJson(value.publicationSelection),
@@ -248,16 +276,19 @@ export function decodePublicationDispatchEnvelope(raw) {
   };
 }
 
-export function publicationDispatchEnvelope(trustedWorkflow, intent) {
+export function publicationDispatchEnvelope(trustedWorkflow, intent, laneInputs) {
   return publicationSourceJson(
-    decodePublicationDispatchEnvelope(publicationSourceJson({ trustedWorkflow, ...intent })),
+    decodePublicationDispatchEnvelope(
+      publicationSourceJson({ trustedWorkflow, ...intent, ...(laneInputs ? { laneInputs } : {}) }),
+    ),
   );
 }
 
 function dispatchEnvelopeFromInputs(inputs) {
   if (
     Object.hasOwn(inputs, "validation_purpose") ||
-    Object.hasOwn(inputs, "publication_selection_json")
+    Object.hasOwn(inputs, "publication_selection_json") ||
+    Object.hasOwn(inputs, "extension_test_exclude_patterns_json")
   ) {
     throw new Error("source intent must use only the trusted_workflow_json envelope");
   }
@@ -266,7 +297,8 @@ function dispatchEnvelopeFromInputs(inputs) {
 
 export function publicationSourceRequest(env) {
   const inputs = JSON.parse(env.PUBLICATION_INPUTS_JSON);
-  const { trustedWorkflow, ...intent } = dispatchEnvelopeFromInputs(inputs);
+  const { trustedWorkflow, laneInputs, ...intent } = dispatchEnvelopeFromInputs(inputs);
+  const coverageSource = { ...inputs, extension_test_exclude_patterns_json: "[]", ...laneInputs };
   const tooling = JSON.parse(env.PUBLICATION_TOOLING_JSON);
   if (
     trustedWorkflow &&
@@ -283,7 +315,7 @@ export function publicationSourceRequest(env) {
     "fail_fast",
     "dispatch_release_evidence",
   ]) {
-    coverage[key] = text(String(inputs[key] ?? ""), key);
+    coverage[key] = text(String(coverageSource[key] ?? ""), key);
   }
   coverage.live_suite_filter = env.PUBLICATION_LIVE_FILTER ?? coverage.live_suite_filter;
   coverage.cross_os_suite_filter =
@@ -385,8 +417,20 @@ function validatePublicationSourceFact(value, expected = {}) {
     "run_release_soak",
     "coverage_policy",
   ];
-  object(value.coverage, coverageKeys, "source admission coverage");
-  if (coverageKeys.some((key) => !Object.hasOwn(value.coverage, key))) {
+  // Published admissions bind this retired empty field into their digest.
+  object(value.coverage, [...coverageKeys, "known_flaky_jobs_json"], "source admission coverage");
+  if (
+    Object.hasOwn(value.coverage, "known_flaky_jobs_json") &&
+    value.coverage.known_flaky_jobs_json !== "[]"
+  ) {
+    throw new Error("source admission known_flaky_jobs_json must be empty");
+  }
+  if (
+    coverageKeys.some(
+      (key) =>
+        key !== "extension_test_exclude_patterns_json" && !Object.hasOwn(value.coverage, key),
+    )
+  ) {
     throw new Error("source admission coverage is incomplete");
   }
   for (const entry of Object.values(value.coverage)) {
@@ -551,7 +595,11 @@ export function validatePublicationSourceBinding(record, expected = {}) {
       }
     }
     for (const [input, key] of Object.entries(coverageInputs)) {
-      if (String(record.validationInputs[key] ?? "") !== fact.coverage[input]) {
+      const historicalDefault = input === "extension_test_exclude_patterns_json" ? "[]" : "";
+      if (
+        String(record.validationInputs[key] ?? historicalDefault) !==
+        (fact.coverage[input] ?? historicalDefault)
+      ) {
         throw new Error(`source admission coverage ${key} differs from manifest`);
       }
     }
@@ -575,6 +623,505 @@ export function publicationSourceReuseIdentity(fact) {
   };
 }
 
+export function publicationAdmissionContract(workflowSource) {
+  if (typeof workflowSource !== "string" || Buffer.byteLength(workflowSource) > 1024 * 1024) {
+    throw new Error("missing or oversized publication-admission workflow contract");
+  }
+  const matches = [
+    ...workflowSource.matchAll(/^ {2}FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT: *([^\r\n]+)$/gmu),
+  ];
+  if (!matches.length && !workflowSource.includes("FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT")) {
+    return undefined;
+  }
+  if (matches.length !== 1 || !/^(?:"1"|'1'|1)$/u.test(matches[0][1])) {
+    throw new Error("unsupported publication-admission workflow contract");
+  }
+  return FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT;
+}
+
+function closedObject(value, keys, label) {
+  object(value, keys, label);
+  if (keys.some((key) => !Object.hasOwn(value, key))) {
+    throw new Error(`incomplete ${label}`);
+  }
+  return value;
+}
+
+function observationTime(value) {
+  const time = typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(time) || new Date(time).toISOString() !== value) {
+    throw new Error("invalid publication observation time");
+  }
+  return time;
+}
+
+// These exact canonical bytes are uploaded once; their digest is not the ZIP digest.
+export function publicationObservationJson(value) {
+  return `${JSON.stringify(canonicalizeJsonValue(value))}\n`;
+}
+
+function observationDigest(observations) {
+  return `sha256:${createHash("sha256").update(publicationObservationJson(observations)).digest("hex")}`;
+}
+
+function observationNames(rows, label, maximum = 1024) {
+  if (
+    !Array.isArray(rows) ||
+    rows.length > maximum ||
+    rows.some(
+      (row, index) =>
+        !row ||
+        typeof row.name !== "string" ||
+        !/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u.test(row.name) ||
+        row.name.length > 256 ||
+        (index > 0 && compareAscii(rows[index - 1].name, row.name) >= 0),
+    )
+  ) {
+    throw new Error(`invalid publication ${label} roster`);
+  }
+}
+
+function validateObservationPlan(plan, registry, required, observations) {
+  const groups =
+    registry === "npm"
+      ? ["candidates", "skippedPublished"]
+      : ["candidates", "skippedPublished", "bootstrapCandidates", "missingTrustedPublisher"];
+  closedObject(plan, ["all", ...groups, "warnings"], "publication planning summary");
+  observationNames(plan.all, "planning", 512);
+  for (const entry of plan.all) {
+    closedObject(entry, ["name", "version", "alreadyPublished"], "publication planning entry");
+    if (
+      !required.some((row) => row.name === entry.name && row.version === entry.version) ||
+      typeof entry.alreadyPublished !== "boolean"
+    ) {
+      throw new Error("publication planning entry differs from selected registry roster");
+    }
+  }
+  if (registry === "clawhub" && plan.all.length !== required.length) {
+    throw new Error("publication ClawHub planning roster is incomplete");
+  }
+  for (const group of groups) {
+    if (
+      !Array.isArray(plan[group]) ||
+      new Set(plan[group]).size !== plan[group].length ||
+      plan[group].some((name) => !plan.all.some((entry) => entry.name === name))
+    ) {
+      throw new Error("invalid publication planning group");
+    }
+  }
+  for (const entry of plan.all) {
+    const observed = observations.find((row) => row.name === entry.name)?.state;
+    const published =
+      registry === "npm" ? observed?.selectedVersionExists : observed?.alreadyPublished;
+    const candidate =
+      !published &&
+      (registry === "npm" || (observed?.packageExists && observed?.hasTrustedPublisher));
+    if (
+      entry.alreadyPublished !== published ||
+      plan.skippedPublished.includes(entry.name) !== entry.alreadyPublished ||
+      plan.candidates.includes(entry.name) !== candidate ||
+      (registry === "clawhub" &&
+        (plan.bootstrapCandidates.includes(entry.name) !== !observed.packageExists ||
+          plan.missingTrustedPublisher.includes(entry.name) !==
+            (observed.packageExists && !observed.hasTrustedPublisher)))
+    ) {
+      throw new Error("publication planning outcome mismatch");
+    }
+  }
+  if (!Array.isArray(plan.warnings) || plan.warnings.length > 4096) {
+    throw new Error("invalid publication advisory warnings");
+  }
+  for (const warning of plan.warnings) {
+    text(warning, "publication advisory warning");
+  }
+}
+
+// The worker and retained-receipt reader use the same state-to-authority decision.
+// Package membership/version is the authenticated A projection, not caller input.
+export function publicationPendingAuthority(source, registry, row) {
+  const selected = source.projection?.packages.find(
+    (entry) =>
+      entry.name === row.name && entry.version === row.version && entry.targets.includes(registry),
+  );
+  if (!selected || !source.publicationSelection) {
+    throw new Error("publication authority requires a selected source package");
+  }
+  const selection = source.publicationSelection;
+  let action;
+  if (registry === "npm") {
+    if (row.state.packageExists) {
+      if (!row.state.hasVersionHistory) {
+        throw new Error(`${row.name}: npm HTTP 200 has empty version history.`);
+      }
+      return null;
+    }
+    const parsed = parseReleaseVersion(selected.version);
+    const plugin =
+      packageName.test(selected.name) && !corePackages.some((entry) => entry.name === selected.name)
+        ? resolveNpmPublishPlan(
+            selected.version,
+            undefined,
+            selection.route === "extended-stable" ? "extended-stable" : undefined,
+          )
+        : null;
+    const supported =
+      (plugin?.channel === "beta" && plugin.publishTag === "beta") ||
+      (plugin?.channel === "stable" &&
+        plugin.publishTag === "latest" &&
+        selection.npmDistTag === "latest" &&
+        parsed &&
+        classifyReleaseTrain(parsed) === "stable");
+    if (!["normal", "prepared"].includes(selection.route) || !supported) {
+      throw new Error(`${row.name}: npm bootstrap is unsupported for this publication route.`);
+    }
+    action = "owner-preparation-and-access";
+  } else if (registry === "clawhub") {
+    if (
+      selection.route === "prepared" &&
+      (!row.state.packageExists ||
+        !row.state.hasTrustedPublisher ||
+        !isPreparedClawHubTrustedPublisher(row.state.trustedPublisher))
+    ) {
+      throw new Error("publication ClawHub prepared-trust-required");
+    }
+    if (row.state.packageExists && row.state.hasTrustedPublisher) {
+      return null;
+    }
+    action = !row.state.packageExists
+      ? "bootstrap-and-owner-access"
+      : row.state.alreadyPublished
+        ? "configure-only"
+        : "publisher-repair";
+  } else {
+    throw new Error("invalid publication authority registry");
+  }
+  return { registry, name: row.name, action, status: "unresolved" };
+}
+
+function validatePublicationObservations(source, value) {
+  validatePublicationSourceFact(source);
+  if (source.validationPurpose !== "publish") {
+    throw new Error("publication observations require a publish source");
+  }
+  closedObject(
+    value,
+    [
+      "kind",
+      "contract",
+      "sourceDigest",
+      "prerequisitesCompletedAt",
+      "collectionStartedAt",
+      "collectionCompletedAt",
+      "npm",
+      "clawhub",
+      "pendingAuthority",
+      "plans",
+    ],
+    "publication observations",
+  );
+  if (
+    value.kind !== "openclaw.full-release-publication-observations/v1" ||
+    value.contract !== FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT ||
+    value.sourceDigest !== source.digest
+  ) {
+    throw new Error("publication observations source binding mismatch");
+  }
+  const prerequisites = observationTime(value.prerequisitesCompletedAt);
+  const start = observationTime(value.collectionStartedAt);
+  const end = observationTime(value.collectionCompletedAt);
+  if (prerequisites > start || start > end || end - prerequisites > 300_000) {
+    throw new Error("publication observation time ordering is invalid");
+  }
+  const required = (registry) =>
+    source.projection.packages.filter((entry) => entry.targets.includes(registry));
+  for (const registry of ["npm", "clawhub"]) {
+    observationNames(value[registry], registry);
+    const selected = required(registry);
+    const actual = registry === "npm" ? value.npm.filter((entry) => entry.required) : value.clawhub;
+    if (
+      actual.length !== selected.length ||
+      actual.some(
+        (row) =>
+          !selected.some((entry) => row.name === entry.name && row.version === entry.version),
+      )
+    ) {
+      throw new Error("publication required observation roster differs from selected source");
+    }
+    for (const row of value[registry]) {
+      const observed = observationTime(row.observedAt);
+      if (observed < start || observed > end) {
+        throw new Error("publication observation time is outside collection");
+      }
+      if (registry === "npm") {
+        const observedOutcome = row.outcome === "observed";
+        closedObject(
+          row,
+          [
+            "name",
+            "version",
+            "required",
+            "observedAt",
+            "outcome",
+            observedOutcome ? "state" : "error",
+          ],
+          "publication npm observation",
+        );
+        if (
+          typeof row.required !== "boolean" ||
+          (row.required ? typeof row.version !== "string" : row.version !== null) ||
+          (!row.required && selected.some((entry) => entry.name === row.name))
+        ) {
+          throw new Error("invalid publication npm observation role");
+        }
+        if (!observedOutcome) {
+          if (
+            row.required ||
+            row.outcome !== "unavailable" ||
+            !/^(?:http-[1-5][0-9]{2}|response-too-large|invalid-response|cancelled-or-timeout|read-failed)$/u.test(
+              row.error,
+            )
+          ) {
+            throw new Error("required publication npm observation is unavailable");
+          }
+          continue;
+        }
+        closedObject(
+          row.state,
+          ["packageExists", "hasVersionHistory", "selectedVersionExists", "latestVersion"],
+          "publication npm state",
+        );
+        if (
+          ["packageExists", "hasVersionHistory", "selectedVersionExists"].some(
+            (key) => typeof row.state[key] !== "boolean",
+          ) ||
+          (!row.state.packageExists &&
+            (row.state.hasVersionHistory ||
+              row.state.selectedVersionExists ||
+              row.state.latestVersion !== null)) ||
+          (row.required && row.state.packageExists && !row.state.hasVersionHistory) ||
+          (row.state.latestVersion !== null &&
+            !text(row.state.latestVersion, "publication latest version", 128))
+        ) {
+          throw new Error("invalid publication npm history");
+        }
+      } else {
+        closedObject(
+          row,
+          ["name", "version", "observedAt", "state"],
+          "publication ClawHub observation",
+        );
+        closedObject(
+          row.state,
+          ["packageExists", "alreadyPublished", "hasTrustedPublisher", "trustedPublisher"],
+          "publication ClawHub state",
+        );
+        if (
+          ["packageExists", "alreadyPublished", "hasTrustedPublisher"].some(
+            (key) => typeof row.state[key] !== "boolean",
+          ) ||
+          (!row.state.packageExists &&
+            (row.state.alreadyPublished ||
+              row.state.hasTrustedPublisher ||
+              row.state.trustedPublisher !== null))
+        ) {
+          throw new Error("invalid publication ClawHub state");
+        }
+        if (row.state.trustedPublisher !== null) {
+          closedObject(
+            row.state.trustedPublisher,
+            ["provider", "repository", "workflowFilename", "environment"],
+            "publication trusted publisher",
+          );
+          for (const field of Object.values(row.state.trustedPublisher)) {
+            if (field !== null) {
+              text(field, "publication trusted publisher field", 256);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!Array.isArray(value.pendingAuthority) || value.pendingAuthority.length > 1024) {
+    throw new Error("invalid publication pending authority");
+  }
+  const pendingKeys = new Set();
+  for (const pending of value.pendingAuthority) {
+    closedObject(
+      pending,
+      ["registry", "name", "action", "status"],
+      "publication pending authority",
+    );
+    const key = `${pending.registry}/${pending.name}`;
+    if (
+      pendingKeys.has(key) ||
+      pending.status !== "unresolved" ||
+      !["npm", "clawhub"].includes(pending.registry) ||
+      !required(pending.registry).some((entry) => entry.name === pending.name) ||
+      !(
+        pending.registry === "npm"
+          ? ["owner-preparation-and-access"]
+          : ["bootstrap-and-owner-access", "configure-only", "publisher-repair"]
+      ).includes(pending.action)
+    ) {
+      throw new Error("invalid publication pending authority classification");
+    }
+    pendingKeys.add(key);
+  }
+  const requiredPending = [
+    ...value.npm
+      .filter((entry) => entry.required)
+      .map((row) => publicationPendingAuthority(source, "npm", row)),
+    ...value.clawhub.map((row) => publicationPendingAuthority(source, "clawhub", row)),
+  ]
+    .filter(Boolean)
+    .toSorted((a, b) => compareAscii(`${a.registry}/${a.name}`, `${b.registry}/${b.name}`));
+  if (
+    publicationObservationJson(value.pendingAuthority) !==
+    publicationObservationJson(requiredPending)
+  ) {
+    throw new Error("publication pending authority differs from required observation states");
+  }
+  closedObject(value.plans, ["npm", "clawhub"], "publication plans");
+  for (const registry of ["npm", "clawhub"]) {
+    validateObservationPlan(value.plans[registry], registry, required(registry), value[registry]);
+  }
+  return value;
+}
+
+export function createPublicationObservations(source, observations) {
+  return validatePublicationObservations(source, {
+    kind: "openclaw.full-release-publication-observations/v1",
+    contract: FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT,
+    ...observations,
+  });
+}
+
+export function createPublicationAdmission(source, observations, artifact, admittedAt) {
+  const admission = {
+    observations,
+    binding: {
+      kind: "openclaw.full-release-publication-admission/v1",
+      contract: FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT,
+      repository: source.repository,
+      parentRunId: source.runId,
+      parentRunAttempt: source.runAttempt,
+      workflow: {
+        path: ".github/workflows/full-release-validation.yml",
+        event: "workflow_dispatch",
+        ...source.workflow,
+      },
+      sourceDigest: source.digest,
+      observationsDigest: observationDigest(observations),
+      artifact,
+      admittedAt,
+      status: "admitted-for-validation",
+    },
+  };
+  return validatePublicationAdmissionBinding({
+    sourceAdmissionContract: FULL_RELEASE_SOURCE_ADMISSION_CONTRACT,
+    sourceAdmission: source,
+    publicationAdmissionContract: FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT,
+    publicationAdmission: admission,
+  });
+}
+
+export function validatePublicationAdmissionBinding(record, expected = {}) {
+  const contract = record.publicationAdmissionContract;
+  if (
+    expected.publicationAdmissionContract !== undefined &&
+    contract !== expected.publicationAdmissionContract
+  ) {
+    throw new Error("publication admission contract missing or mismatched");
+  }
+  if (contract === undefined) {
+    if (record.publicationAdmission !== undefined) {
+      throw new Error("publication admission omitted its workflow contract");
+    }
+    return undefined;
+  }
+  if (contract !== FULL_RELEASE_PUBLICATION_ADMISSION_CONTRACT) {
+    throw new Error("unsupported publication admission contract");
+  }
+  const source = validatePublicationSourceBinding(record, {
+    ...expected,
+    sourceAdmissionContract: FULL_RELEASE_SOURCE_ADMISSION_CONTRACT,
+  });
+  if (source.validationPurpose !== "publish") {
+    if (record.publicationAdmission !== null) {
+      throw new Error("nonpublish purpose cannot retain publication admission");
+    }
+    return null;
+  }
+  const admission = closedObject(
+    record.publicationAdmission,
+    ["observations", "binding"],
+    "publication admission",
+  );
+  const observations = validatePublicationObservations(source, admission.observations);
+  const binding = closedObject(
+    admission.binding,
+    [
+      "kind",
+      "contract",
+      "repository",
+      "parentRunId",
+      "parentRunAttempt",
+      "workflow",
+      "sourceDigest",
+      "observationsDigest",
+      "artifact",
+      "admittedAt",
+      "status",
+    ],
+    "publication admission binding",
+  );
+  closedObject(binding.workflow, ["path", "event", "ref", "sha"], "publication workflow");
+  if (
+    binding.kind !== "openclaw.full-release-publication-admission/v1" ||
+    binding.contract !== contract ||
+    binding.status !== "admitted-for-validation" ||
+    binding.repository !== source.repository ||
+    binding.parentRunId !== source.runId ||
+    binding.parentRunAttempt !== source.runAttempt ||
+    binding.workflow.path !== ".github/workflows/full-release-validation.yml" ||
+    binding.workflow.event !== "workflow_dispatch" ||
+    binding.workflow.ref !== source.workflow.ref ||
+    binding.workflow.sha !== source.workflow.sha ||
+    binding.sourceDigest !== source.digest ||
+    binding.observationsDigest !== observationDigest(observations)
+  ) {
+    throw new Error("publication admission identity or observation digest mismatch");
+  }
+  const artifact = closedObject(
+    binding.artifact,
+    ["id", "name", "digest", "sizeInBytes"],
+    "publication observation artifact",
+  );
+  if (
+    typeof artifact.id !== "string" ||
+    !/^[1-9][0-9]{0,19}$/u.test(artifact.id) ||
+    artifact.name !==
+      `full-release-publication-observations-${source.runId}-${source.runAttempt}` ||
+    !/^sha256:[a-f0-9]{64}$/u.test(artifact.digest) ||
+    !Number.isSafeInteger(artifact.sizeInBytes) ||
+    artifact.sizeInBytes < 1 ||
+    artifact.sizeInBytes > 1024 * 1024 + 8 * 1024
+  ) {
+    throw new Error("invalid publication observation artifact descriptor");
+  }
+  const admitted = observationTime(binding.admittedAt);
+  if (
+    admitted < observationTime(observations.collectionCompletedAt) ||
+    admitted - observationTime(observations.prerequisitesCompletedAt) > 300_000 ||
+    [...observations.npm.filter((row) => row.required), ...observations.clawhub].some(
+      (row) => admitted - observationTime(row.observedAt) > 300_000,
+    )
+  ) {
+    throw new Error("publication admission freshness window exceeded");
+  }
+  return admission;
+}
+
 let invokedAsMain = false;
 if (process.argv[1]) {
   try {
@@ -590,6 +1137,10 @@ if (invokedAsMain) {
       const identity =
         envelope.trustedWorkflow === null ? "" : publicationSourceJson(envelope.trustedWorkflow);
       appendFileSync(process.env.GITHUB_OUTPUT, `trusted_workflow_json=${identity}\n`);
+      appendFileSync(
+        process.env.GITHUB_OUTPUT,
+        `extension_test_exclude_patterns_json=${envelope.laneInputs?.extension_test_exclude_patterns_json ?? "[]"}\n`,
+      );
     } else if (process.argv[2] === "--request") {
       const request = publicationSourceRequest(process.env);
       const normalized = publicationIntentInputs(request);

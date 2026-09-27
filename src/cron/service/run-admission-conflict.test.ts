@@ -8,6 +8,10 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
+import {
+  findCronRunForTests,
+  readCronRunHistoryPageForTests,
+} from "../run-history.test-support.js";
 import { loadCronStore, saveCronJobsStore, saveCronStore } from "../store.js";
 import { cronStoreKey } from "../store/key.js";
 import {
@@ -17,6 +21,7 @@ import {
   prepareCronRunReceiptClaim,
   releaseLocalCronRunReceiptOwnership,
 } from "../store/run-receipt-store.js";
+import { prepareCronRunReceiptWriteSchema } from "../store/run-receipt-write-admission.js";
 import { start, stop } from "./ops-lifecycle.js";
 import { list } from "./ops-read.js";
 import {
@@ -24,6 +29,7 @@ import {
   persistQueuedCronRunReservations,
   reserveQueuedCronRun,
 } from "./run-admission.js";
+import { createCronRunHandle } from "./run-history.js";
 import { onTimer } from "./timer.test-support.js";
 
 const fixtures = setupCronRegressionFixtures({ prefix: "cron-admission-conflict-" });
@@ -38,6 +44,7 @@ function claimReceipt(storePath: string, job: ReturnType<typeof createDueIsolate
   return runOpenClawStateWriteTransaction(({ db }) =>
     claimCronRunReceiptInDatabase({
       database: db,
+      receiptSchema: prepareCronRunReceiptWriteSchema(db),
       prepared,
       resolveAgentId: (current) => current.agentId ?? "main",
     }),
@@ -92,10 +99,18 @@ it("recovers a dead running owner on timer refresh without an admission conflict
   const receipt = claimReceipt(store.storePath, job, now);
   releaseLocalCronRunReceiptOwnership(receipt);
   const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
+  const onEvent = vi.fn();
   const sibling = createCronRegressionState({
     storePath: store.storePath,
     nowMs: () => now + 1,
     runIsolatedAgentJob,
+    onEvent,
+  });
+  const taskRun = createCronRunHandle({
+    state: sibling,
+    job,
+    startedAt: now,
+    runReceipt: receipt,
   });
 
   await onTimer(sibling);
@@ -109,6 +124,22 @@ it("recovers a dead running owner on timer refresh without an admission conflict
   expect(reclaimed?.state.runningAtMs).toBeUndefined();
   expect(reclaimed?.state.nextRunAtMs).toBeUndefined();
   expect(reclaimed?.state.startupCatchupAtMs).toBeUndefined();
+  expect(findCronRunForTests(taskRun.runId)).toMatchObject({
+    status: "failed",
+    error: "cron: job interrupted by gateway restart",
+  });
+  const readHistory = () =>
+    readCronRunHistoryPageForTests({ storeKey: cronStoreKey(store.storePath), jobId: job.id })
+      .entries;
+  expect(readHistory()).toMatchObject([
+    {
+      jobId: job.id,
+      status: "error",
+      completionStatus: "failed",
+      error: "cron: job interrupted by gateway restart",
+      runAtMs: now,
+    },
+  ]);
   // Reclamation must consume the occurrence, not defer a duplicate until the
   // next timer tick or turn it into startup catch-up on a later restart.
   await onTimer(sibling);
@@ -116,6 +147,8 @@ it("recovers a dead running owner on timer refresh without an admission conflict
   await start(sibling);
   await onTimer(sibling);
   expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+  expect(readHistory()).toHaveLength(1);
+  expect(onEvent.mock.calls.filter(([event]) => event.action === "finished")).toHaveLength(1);
   const receiptRows = runOpenClawStateWriteTransaction(({ db }) =>
     db
       .prepare(
@@ -164,9 +197,10 @@ it("preserves foreign state while retrying an unrelated reservation", async () =
     { version: 1, jobs: [foreignRunning, pendingJob] },
     {
       transactionHooks: {
-        beforeWrite: (database) => {
+        beforeWrite: (database, receiptSchema) => {
           receipt = claimCronRunReceiptInDatabase({
             database,
+            receiptSchema,
             prepared,
             resolveAgentId: (job) => job.agentId ?? "main",
           });

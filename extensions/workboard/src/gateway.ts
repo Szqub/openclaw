@@ -1,4 +1,3 @@
-// Workboard plugin module implements gateway behavior.
 import type { WorkboardCard } from "@openclaw/workboard-contract";
 import type { OpenClawPluginApi } from "../api.js";
 import { redactClaimToken } from "./card-redaction.js";
@@ -7,8 +6,10 @@ import {
   createWorkboardDispatchHandler,
   listWorkboardCards,
   readId,
+  readExpectedUpdatedAt,
   registerWorkboardResultMethods,
   respondError,
+  type GatewayMethodContext,
 } from "./gateway-helpers.js";
 import {
   registerWorkboardWorkspaceBoardMethod,
@@ -35,6 +36,17 @@ function redactDiagnosticsRows(result: Awaited<ReturnType<WorkboardStore["diagno
 
 async function redactCardResult(card: Promise<WorkboardCard>) {
   return { card: redactClaimToken(await card) };
+}
+
+function cardMutation(
+  method: string,
+  mutate: (id: string, input: Record<string, unknown>) => Promise<WorkboardCard>,
+) {
+  return [
+    `workboard.cards.${method}`,
+    WRITE_SCOPE,
+    ({ params }: GatewayMethodContext) => redactCardResult(mutate(readId(params), params)),
+  ] as const;
 }
 
 export function registerWorkboardGatewayMethods(params: {
@@ -92,26 +104,27 @@ export function registerWorkboardGatewayMethods(params: {
       WRITE_SCOPE,
       ({ params: requestParams }) =>
         redactCardResult(
-          store.move(readId(requestParams), requestParams.status, requestParams.position),
+          store.move(
+            readId(requestParams),
+            requestParams.status,
+            requestParams.position,
+            undefined,
+            {
+              expectedUpdatedAt: readExpectedUpdatedAt(requestParams),
+            },
+          ),
         ),
     ],
     [
       "workboard.cards.delete",
       WRITE_SCOPE,
-      ({ params: requestParams }) => store.delete(readId(requestParams)),
-    ],
-    [
-      "workboard.cards.comment",
-      WRITE_SCOPE,
       ({ params: requestParams }) =>
-        redactCardResult(store.addComment(readId(requestParams), requestParams)),
+        store.delete(readId(requestParams), {
+          expectedUpdatedAt: readExpectedUpdatedAt(requestParams),
+        }),
     ],
-    [
-      "workboard.cards.link",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.addLink(readId(requestParams), requestParams)),
-    ],
+    cardMutation("comment", (id, input) => store.addComment(id, input)),
+    cardMutation("link", (id, input) => store.addLink(id, input)),
     [
       "workboard.cards.linkDependency",
       WRITE_SCOPE,
@@ -124,18 +137,8 @@ export function registerWorkboardGatewayMethods(params: {
         return redactCardResult(store.linkCards(parentId, childId));
       },
     ],
-    [
-      "workboard.cards.proof",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.addProof(readId(requestParams), requestParams)),
-    ],
-    [
-      "workboard.cards.artifact",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.addArtifact(readId(requestParams), requestParams)),
-    ],
+    cardMutation("proof", (id, input) => store.addProof(id, input)),
+    cardMutation("artifact", (id, input) => store.addArtifact(id, input)),
     [
       "workboard.cards.claim",
       WRITE_SCOPE,
@@ -144,53 +147,14 @@ export function registerWorkboardGatewayMethods(params: {
         return { ...claimed, card: redactClaimToken(claimed.card) };
       },
     ],
-    [
-      "workboard.cards.heartbeat",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.heartbeat(readId(requestParams), requestParams)),
-    ],
-    [
-      "workboard.cards.release",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.releaseClaim(readId(requestParams), requestParams)),
-    ],
-    [
-      "workboard.cards.promote",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.promote(readId(requestParams), requestParams, null)),
-    ],
-    [
-      "workboard.cards.reassign",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.reassign(readId(requestParams), requestParams, null)),
-    ],
-    [
-      "workboard.cards.reclaim",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.reclaim(readId(requestParams), requestParams, null)),
-    ],
-    [
-      "workboard.cards.complete",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.complete(readId(requestParams), requestParams, null)),
-    ],
-    [
-      "workboard.cards.block",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.block(readId(requestParams), requestParams, null)),
-    ],
-    [
-      "workboard.cards.unblock",
-      WRITE_SCOPE,
-      ({ params: requestParams }) => redactCardResult(store.unblock(readId(requestParams))),
-    ],
+    cardMutation("heartbeat", (id, input) => store.heartbeat(id, input)),
+    cardMutation("release", (id, input) => store.releaseClaim(id, input)),
+    cardMutation("promote", (id, input) => store.promote(id, input, null)),
+    cardMutation("reassign", (id, input) => store.reassign(id, input, null)),
+    cardMutation("reclaim", (id, input) => store.reclaim(id, input, null)),
+    cardMutation("complete", (id, input) => store.complete(id, input, null)),
+    cardMutation("block", (id, input) => store.block(id, input, null)),
+    cardMutation("unblock", (id) => store.unblock(id)),
   ]);
 
   registerWorkboardWorkspaceBulkMethod({ api, store, redactCard: redactClaimToken });
@@ -306,12 +270,7 @@ export function registerWorkboardGatewayMethods(params: {
         return attachment;
       },
     ],
-    [
-      "workboard.cards.attachments.add",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.addAttachment(readId(requestParams), requestParams)),
-    ],
+    cardMutation("attachments.add", (id, input) => store.addAttachment(id, input)),
     [
       "workboard.cards.attachments.delete",
       WRITE_SCOPE,
@@ -323,23 +282,17 @@ export function registerWorkboardGatewayMethods(params: {
         return redactCardResult(store.deleteAttachment(readId(requestParams), attachmentId.trim()));
       },
     ],
-    [
-      "workboard.cards.workerLog",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.addWorkerLog(readId(requestParams), requestParams)),
-    ],
-    [
-      "workboard.cards.protocolViolation",
-      WRITE_SCOPE,
-      ({ params: requestParams }) =>
-        redactCardResult(store.recordProtocolViolation(readId(requestParams), requestParams)),
-    ],
+    cardMutation("workerLog", (id, input) => store.addWorkerLog(id, input)),
+    cardMutation("protocolViolation", (id, input) => store.recordProtocolViolation(id, input)),
     [
       "workboard.cards.archive",
       WRITE_SCOPE,
       ({ params: requestParams }) =>
-        redactCardResult(store.archive(readId(requestParams), requestParams.archived)),
+        redactCardResult(
+          store.archive(readId(requestParams), requestParams.archived, {
+            expectedUpdatedAt: readExpectedUpdatedAt(requestParams),
+          }),
+        ),
     ],
     [
       "workboard.cards.export",

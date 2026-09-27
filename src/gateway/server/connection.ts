@@ -6,6 +6,7 @@ import { GATEWAY_SERVER_CAPS } from "../../../packages/gateway-protocol/src/serv
 import { GATEWAY_STARTUP_PENDING_CLOSE_CAUSE } from "../../../packages/gateway-protocol/src/startup-unavailable.js";
 import { getRuntimeConfig } from "../../config/io.js";
 import { recordPairedNodeDisconnection } from "../../infra/device-pairing-node.js";
+import { formatErrorMessage as formatError } from "../../infra/errors.js";
 import { upsertPresence } from "../../infra/system-presence.js";
 import { logRejectedLargePayload } from "../../logging/diagnostic-payload.js";
 import type { createSubsystemLogger } from "../../logging/subsystem.js";
@@ -25,23 +26,18 @@ import {
   type PluginNodeCapabilitySurface,
 } from "../plugin-node-capability.js";
 import type { GatewayConnectionWork } from "../server-connection-work.js";
-import {
-  WEBSOCKET_CLOSE_GRACE_MS,
-  MAX_BUFFERED_BYTES,
-  WEBSOCKET_OPEN_READY_STATE,
-} from "../server-constants.js";
+import { MAX_BUFFERED_BYTES, WEBSOCKET_OPEN_READY_STATE } from "../server-constants.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "../server-methods/types.js";
-import { formatError } from "../server-utils.js";
-import { cleanupTalkConnection } from "../talk-session-registry.js";
+import { cleanupTalkConnection } from "../talk/session-registry.js";
 import type { WebSocketHeartbeatDiagnostics } from "../websocket-keepalive.js";
 import { formatForLog, logWs } from "../ws-log.js";
 import { refreshClientPresence } from "./client-presence.js";
+import type { GatewayClientRegistry } from "./client-registry.js";
+import { closeGatewayTransportWithGrace } from "./connection-transport-close.js";
 import type {
   GatewayConnectionTransport,
   PrepareGatewayAuthenticatedReceive,
 } from "./connection-transport.js";
-import { getHealthVersion, incrementPresenceVersion } from "./health-state.js";
-import { broadcastPresenceSnapshot } from "./presence-events.js";
 import { sanitizeWsLogValue, stringMetaValue } from "./ws-connection-diagnostics.js";
 import {
   buildHandshakeAuthLogKey,
@@ -64,7 +60,7 @@ type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 const unauthorizedCloseBeforeConnectLogLimiter = new HandshakeAuthLogLimiter();
 export type GatewayConnectionOptions = {
   bootId: string;
-  clients: Set<GatewayWsClient>;
+  clients: GatewayClientRegistry;
   connectionWork: GatewayConnectionWork;
   getPluginNodeCapabilities?: () => PluginNodeCapabilitySurface[];
   // Read per connection so reloads cannot leave a stale auth snapshot.
@@ -166,7 +162,6 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
     logWsControl,
     extraHandlers,
     getMethodRegistry,
-    broadcast,
     buildRequestContext,
   } = params;
   if (connectionWork.isClosing) {
@@ -260,7 +255,7 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
     }
   }, handshakeTimeoutMs);
 
-  const retireTransport = (code = 1000, reason?: string) => {
+  const retireTransport = () => {
     if (closed) {
       return;
     }
@@ -271,27 +266,27 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
     cleanupTransport?.();
     cleanupTransport = undefined;
     releasePreauthBudget();
-    try {
-      socket.close(code, reason);
-    } catch {
-      /* ignore */
-    }
   };
 
-  const close = (code = 1000, reason?: string) => {
+  const retireConnection = () => {
     retainClientUntilNodeDrain ||=
       !closed && client?.connect.role === "node" && nodeLifecycleDispatch.hasActive();
-    retireTransport(code, reason);
+    retireTransport();
     if (client && !retainClientUntilNodeDrain) {
       clients.delete(client);
     }
   };
+  const closeWithGrace = (code = 1000, reason?: string) => {
+    if (closed) {
+      return;
+    }
+    retireConnection();
+    closeGatewayTransportWithGrace(socket, code, reason ?? "");
+  };
+  const close = closeWithGrace;
 
-  let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
   const releaseConnection = connectionWork.registerConnection(() => {
-    shutdownTimer = setTimeout(() => socket.terminate(), WEBSOCKET_CLOSE_GRACE_MS);
-    shutdownTimer.unref?.();
-    close(1012, connectionKind === "worker" ? "gateway-shutdown" : "service restart");
+    closeWithGrace(1012, connectionKind === "worker" ? "gateway-shutdown" : "service restart");
   });
 
   const send = (obj: unknown) => {
@@ -313,8 +308,7 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
         bytes: socket.bufferedAmount,
         limitBytes: MAX_BUFFERED_BYTES,
       });
-      close(1008, connectionKind === "worker" ? "slow-consumer" : "slow consumer");
-      socket.terminate();
+      closeWithGrace(1008, connectionKind === "worker" ? "slow-consumer" : "slow consumer");
       return { kind: "unavailable" } as const;
     }
     let encoded: string;
@@ -328,7 +322,7 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
       return { kind: "sent" } as const;
     } catch {
       socket.terminate();
-      close();
+      retireConnection();
       return { kind: "unavailable" } as const;
     }
   };
@@ -488,7 +482,7 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
           reason: "disconnect",
           watchedSessions: undefined,
         });
-        broadcastPresenceSnapshot({ broadcast, incrementPresenceVersion, getHealthVersion });
+        buildRequestContext().publishPresence();
       }
       if (currentDisconnectedNodeId) {
         removeRemoteNodeInfo(currentDisconnectedNodeId);
@@ -517,19 +511,18 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
       lastFrameId,
       endpoint,
     });
-    close();
+    retireConnection();
   };
   socket.once("close", (code, reason) => {
     // Delivery subscriptions end before asynchronous node drain or history cleanup.
     connectionController.abort();
-    clearTimeout(shutdownTimer);
     // ws removes its client synchronously; the Gateway retains this connection
     // until asynchronous node history and other close cleanup have settled.
     void connectionWork
       .trackCleanup(() => handleSocketClose(code, reason))
       .catch((error: unknown) => {
         logGateway.error(`websocket close cleanup failed conn=${connId}: ${formatError(error)}`);
-        close();
+        retireConnection();
       })
       .finally(releaseConnection);
   });
@@ -619,6 +612,7 @@ export function attachGatewayConnection(params: AttachGatewayConnectionParams) {
   }
 
   attachGatewayWsMessageHandlerOnDemand({
+    clients,
     ...connectionLifecycle,
     socket,
     prepareAuthenticatedReceive: params.prepareAuthenticatedReceive,

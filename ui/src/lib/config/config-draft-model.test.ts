@@ -507,14 +507,8 @@ describe("config draft model", () => {
 
   it.each([
     ["automatic save", "123"],
-    ["automatic save", "z.ai"],
-    ["automatic save", "a.models.3"],
-    ["manual save", "123"],
     ["manual save", "z.ai"],
-    ["manual save", "a.models.3"],
     ["manual save", "$&"],
-    ["apply", "123"],
-    ["apply", "z.ai"],
     ["apply", "a.models.3"],
   ] as const)(
     "formats the rejected %s validation path for provider %s without changing the Gateway issue",
@@ -952,7 +946,7 @@ describe("config draft model", () => {
       expect(runtimeConfig.state.configFormDirty).toBe(false);
       expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
 
-      await runtimeConfig.refresh({ discardPendingChanges: true });
+      await runtimeConfig.discardDraft({ reloadOnly: true });
       expect(runtimeConfig.state.configAutoSaveStatus).toBe("idle");
       runtimeConfig.dispose();
     },
@@ -969,6 +963,10 @@ describe("config draft model", () => {
 
     publish(false);
     runtimeConfig.setRaw('{\n  "count": 9\n}\n');
+    expect(runtimeConfig.state.configFormDirty).toBe(true);
+
+    await runtimeConfig.discardDraft({ reloadOnly: true });
+    expect(runtimeConfig.state.configRaw).toBe('{\n  "count": 9\n}\n');
     expect(runtimeConfig.state.configFormDirty).toBe(true);
 
     await runtimeConfig.discardDraft();

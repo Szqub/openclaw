@@ -117,7 +117,7 @@ export function renderSettingsPageHeader(props: SettingsPageHeaderProps): Templa
   return html`
     <section class="content-header content-header--settings">
       <div>
-        <div class="page-title">${props.title}</div>
+        <h1 class="page-title">${props.title}</h1>
         ${props.subtitle ? html`<div class="page-subtitle">${props.subtitle}</div>` : nothing}
       </div>
       ${
@@ -176,17 +176,9 @@ export function renderSettingsSection(props: SettingsSectionProps, rows: unknown
           </div>
         `
       : nothing;
-  const groupClass = [
-    "settings-group",
-    props.danger ? "settings-group--danger" : "",
-    props.carapace ? "oc-settings-group" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
   return html`
     <section class="settings-section ${props.carapace ? "oc-settings-section" : ""}">
-      ${header} ${props.notice ?? nothing}
-      <div class=${groupClass}>${rows}</div>
+      ${header} ${props.notice ?? nothing} ${renderSettingsGroup(rows, props)}
     </section>
   `;
 }
@@ -217,7 +209,9 @@ export function renderSettingsGroup(
   return html`<div class=${groupClass}>${rows}</div>`;
 }
 
-export function renderSettingsRow(props: SettingsRowProps): TemplateResult {
+export function renderSettingsRow(
+  props: SettingsRowProps & { role?: "alert" | "status" },
+): TemplateResult {
   const className = [
     "settings-row",
     props.stacked ? "settings-row--stacked" : "",
@@ -227,7 +221,7 @@ export function renderSettingsRow(props: SettingsRowProps): TemplateResult {
     .filter(Boolean)
     .join(" ");
   return html`
-    <div class=${className}>
+    <div class=${className} role=${props.role ?? nothing}>
       <div class="settings-row__text ${props.carapace ? "oc-settings-row-content" : ""}">
         <span class="settings-row__title ${props.carapace ? "oc-settings-row-title" : ""}"
           >${props.title}</span
@@ -374,8 +368,9 @@ export function renderSettingsToggleRow(props: {
   `;
 }
 
+// Controls already show inherited values; reserve default references for overrides.
 export function renderSettingsDefaultDescription(value: string, overridden: boolean) {
-  return html`${t(overridden ? "configForm.defaultValue" : "configForm.usingDefault", { value })}`;
+  return overridden ? html`${t("configForm.defaultValue", { value })}` : undefined;
 }
 
 export function renderSettingsSegmented<T extends string>(
@@ -392,6 +387,7 @@ export function renderSettingsSegmented<T extends string>(
     }>;
     disabled?: boolean;
     ariaLabel?: string;
+    descriptionId?: string;
     className?: string;
     carapace?: boolean;
   } & (
@@ -448,9 +444,10 @@ export function renderSettingsSegmented<T extends string>(
     <wa-radio-group
       class="settings-segmented ${props.carapace ? "oc-segmented" : ""} ${props.className ?? ""}"
       size="s"
+      aria-describedby=${props.descriptionId ?? nothing}
       orientation="horizontal"
       .value=${live(props.value)}
-      ?disabled=${props.disabled ?? false}
+      ?disabled=${live(props.disabled ?? false)}
       @change=${(event: Event) => {
         const group = event.currentTarget as HTMLElement & { value?: string };
         const value = group.value;
@@ -478,7 +475,7 @@ export function renderSettingsSegmented<T extends string>(
             appearance="button"
             value=${option.value}
             .checked=${live(option.value === props.value)}
-            ?disabled=${option.disabled ?? false}
+            ?disabled=${live(option.disabled ?? false)}
             title=${option.title ?? nothing}
             data-test-id=${option.testId ?? nothing}
             @click=${(event: Event) => {

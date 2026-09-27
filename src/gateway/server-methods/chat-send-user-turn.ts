@@ -1,7 +1,8 @@
-import path from "node:path";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { RuntimeMsgContext as MsgContext } from "../../auto-reply/templating.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { readPersistedMediaFacts, type MediaFact } from "../../media/media-facts.js";
+import { isProgressCardRefreshInputProvenance } from "../../sessions/input-provenance.js";
 import { prepareSessionParticipantInput } from "../../sessions/session-participant-input.js";
 import type { UserTurnInput } from "../../sessions/user-turn-transcript.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
@@ -12,23 +13,19 @@ import {
   discardPreparedInboundMedia,
   persistInboundImagesForTranscript,
 } from "../chat-attachments.js";
+import { transferGatewayLocalUserIngress } from "../local-user-ingress.js";
 import { resolveCreatorSandbox } from "../operator-role-policy.js";
 import { resolveGatewayInputParticipant } from "../session-input-participant.js";
 import { prepareSkillLibrarySessionCreation } from "../skill-library-session.js";
+import { captureGatewayUiCommandTarget } from "../ui-command-target.js";
 import { isAcpBridgeClient } from "./chat-origin-routing.js";
 import type { AdmittedChatSend } from "./chat-send-admission.js";
-import type { prepareChatSendAttachments } from "./chat-send-attachments.js";
+import type { PreparedChatSendAttachments } from "./chat-send-attachments.js";
 import type { NormalizedChatSendRequest } from "./chat-send-request.js";
 import type { PreparedChatSendSession } from "./chat-send-session.js";
-import { normalizeOptionalChatText } from "./chat-text-normalization.js";
 import { resolveChatSendCallerContext } from "./gateway-client-identity.js";
 import { resolveOperatorSessionCreation } from "./session-creation-provenance.js";
 import type { GatewayRequestContext, GatewayRequestHandlerOptions } from "./types.js";
-
-type PreparedChatSendAttachments = Extract<
-  Awaited<ReturnType<typeof prepareChatSendAttachments>>,
-  { ok: true }
->["value"];
 
 type ChatSendUserTurnInputController = {
   baseInput: UserTurnInput;
@@ -66,6 +63,7 @@ function resolveChatSendManagedMedia(
   return entries.map((entry) => ({
     path: entry.path,
     contentType: entry.fact.contentType ?? "application/octet-stream",
+    ...(entry.fact.fileName ? { fileName: entry.fact.fileName } : {}),
     ...(suppressInlineHydration && entry.imageKind === "inline"
       ? { hydrationSuppressed: true }
       : {}),
@@ -171,11 +169,26 @@ export function prepareChatSendUserTurn(params: {
     !request.suppressCommandInterpretation && commandBody.trim().startsWith("/")
       ? "text"
       : undefined;
-  const messageForAgent = request.systemProvenanceReceipt
-    ? [request.systemProvenanceReceipt, attachments.parsedMessage].filter(Boolean).join("\n\n")
-    : attachments.parsedMessage;
-  const queuedFollowupOwnerDeviceId = normalizeOptionalChatText(client?.connect?.device?.id);
-  const queuedFollowupOwnerConnId = normalizeOptionalChatText(client?.connId);
+  const buildTextContext = (text: string) => {
+    // The attachment parser appends managed-media hints after the original input.
+    const parsedMessage =
+      text === request.inboundMessage
+        ? attachments.parsedMessage
+        : `${text}${attachments.parsedMessage.slice(request.inboundMessage.length)}`;
+    const body = request.systemProvenanceReceipt
+      ? [request.systemProvenanceReceipt, parsedMessage].filter(Boolean).join("\n\n")
+      : parsedMessage;
+    return {
+      Body: body,
+      BodyForAgent: body,
+      BodyForCommands: text,
+      RawBody: parsedMessage,
+      CommandBody: text,
+    };
+  };
+  const queuedFollowupOwnerDeviceId = normalizeOptionalString(client?.connect?.device?.id);
+  const queuedFollowupOwnerConnId = normalizeOptionalString(client?.connId);
+  const gatewayUiCommandTarget = captureGatewayUiCommandTarget(client);
   const queuedFollowupOwnerKey = queuedFollowupOwnerDeviceId
     ? `device:${queuedFollowupOwnerDeviceId}`
     : queuedFollowupOwnerConnId
@@ -194,12 +207,11 @@ export function prepareChatSendUserTurn(params: {
   // Current and historical turns must reach the single LLM timestamp boundary
   // with identical bare text. Stamping this live turn would bust the prompt cache.
   const ctx: MsgContext = {
-    Body: messageForAgent,
-    BodyForAgent: messageForAgent,
-    BodyForCommands: commandBody,
-    RawBody: attachments.parsedMessage,
-    CommandBody: commandBody,
+    ...buildTextContext(commandBody),
     InputProvenance: request.systemInputProvenance,
+    ...(isProgressCardRefreshInputProvenance(request.systemInputProvenance)
+      ? { InternalTurnSource: "progress-card-refresh" as const }
+      : {}),
     SessionKey: session.sessionKey,
     AgentId: session.agentId,
     OriginatingTo: originatingTo,
@@ -226,24 +238,33 @@ export function prepareChatSendUserTurn(params: {
     SessionCreation: { ...creation, ...(sandbox ? { sandbox } : {}) },
     ...resolveChatSendCallerContext(client, request.clientInfo, originatingChannel),
     GatewayRunToolBindings: request.toolBindings,
+    GatewayUiCommandTarget: gatewayUiCommandTarget,
   };
-  if (attachments.mediaPathOffloadPaths.length > 0) {
+  if (client) {
+    transferGatewayLocalUserIngress(client, ctx);
+  }
+  if (attachments.mediaPathOffloads.length > 0) {
     // Pre-staged offloads must use structured facts and marker text so the
     // dispatch path renders their prompt note without staging them a second time.
-    ctx.media = attachments.mediaPathOffloadPaths.map((pathValue, index) => ({
-      path: pathValue,
-      contentType: attachments.mediaPathOffloadTypes[index],
-      workspaceDir: attachments.mediaPathOffloadWorkspaceDir ?? path.dirname(pathValue),
-    }));
+    ctx.media = attachments.mediaPathOffloads;
   }
-  const mediaPathOffloadsIncludeImages = attachments.mediaPathOffloadTypes.some((type) =>
-    type.startsWith("image/"),
+  const mediaPathOffloadsIncludeImages = attachments.mediaPathOffloads.some((fact) =>
+    fact.contentType?.startsWith("image/"),
   );
   const participant = resolveGatewayInputParticipant(client, request.systemInputProvenance);
   if (participant) {
     prepareSessionParticipantInput(ctx, participant, userTurn.baseInput.timestamp);
   }
   return {
+    applyApprovedText: (text: string) => {
+      if (text === request.inboundMessage.trim()) {
+        return;
+      }
+      Object.assign(ctx, buildTextContext(text));
+      if (ctx.CommandTurn) {
+        ctx.CommandTurn = { ...ctx.CommandTurn, body: text };
+      }
+    },
     discardUnreferencedMedia: async (approved: PersistedUserTurnMessage | undefined) => {
       if (!approved) {
         return;

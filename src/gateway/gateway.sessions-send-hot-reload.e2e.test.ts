@@ -8,6 +8,7 @@ import { writeOpenAiResponsesSse } from "../../test/helpers/openai-responses-sse
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../config/config.js";
 import { resetConfigOverrides } from "../config/runtime-overrides.js";
+import { readSessionStoreSummaryReadOnly } from "../config/sessions/session-accessor.sqlite-summary.js";
 import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
 import type { ModelDefinitionConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -167,7 +168,11 @@ async function startProvider() {
         return;
       }
       const raw = await readBody(request);
-      const rawModel = (JSON.parse(raw) as { model?: unknown }).model;
+      const body = JSON.parse(raw) as {
+        model?: unknown;
+        tools?: Array<{ type?: string; name?: string }>;
+      };
+      const rawModel = body.model;
       const modelId = typeof rawModel === "string" ? rawModel : "";
       if (raw.includes("Agent-to-agent announce step:")) {
         calls.push({ kind: "announce", model: modelId, raw });
@@ -187,6 +192,11 @@ async function startProvider() {
         textResponse(response, TARGET_REPLY);
       } else if (raw.includes(INITIAL_PROMPT)) {
         calls.push({ kind: "dispatch", model: modelId, raw });
+        expect(body.tools).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ type: "function", name: "sessions_send" }),
+          ]),
+        );
         toolResponse(response);
       } else {
         throw new Error(`unexpected model request: ${raw.slice(0, 500)}`);
@@ -234,7 +244,7 @@ function modelDefinition(id: string): ModelDefinitionConfig {
 
 describe("sessions_send across prepared runtime reload", () => {
   it(
-    "finishes admitted model-A work and re-admits the detached reply on model B",
+    "finishes model-A work and re-admits the detached reply and announcement on model B",
     { timeout: 90_000 },
     async () => {
       const provider = await startProvider();
@@ -315,6 +325,9 @@ describe("sessions_send across prepared runtime reload", () => {
         plugins: { slots: { memory: "none" } },
         tools: {
           profile: "full",
+          // This synthetic provider exercises reload, not Tool Search or Code Mode.
+          codeMode: false,
+          toolSearch: false,
           sessions: { visibility: "all" },
           agentToAgent: { enabled: true, allow: ["*"] },
         },
@@ -414,12 +427,19 @@ describe("sessions_send across prepared runtime reload", () => {
         )
         .toBe(0);
 
+      const target = readSessionStoreSummaryReadOnly(
+        { agentId: "target", env: process.env },
+        { recentLimit: 10, agentIds: ["target"] },
+      ).recent.find(({ sessionKey }) => sessionKey === "agent:target:main");
+      expect(target?.entry.status, target?.entry.lastRunError).toBe("done");
+      expect(target?.entry.lastRunError).toBeUndefined();
       expect(provider.calls).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ kind: "dispatch", model: "model-a" }),
           expect.objectContaining({ kind: "target", model: "model-a" }),
           expect.objectContaining({ kind: "dispatch-complete", model: "model-a" }),
           expect.objectContaining({ kind: "reply", model: "model-b" }),
+          expect.objectContaining({ kind: "announce", model: "model-b" }),
         ]),
       );
       const dispatchComplete = provider.calls.find((call) => call.kind === "dispatch-complete");
@@ -429,6 +449,7 @@ describe("sessions_send across prepared runtime reload", () => {
       });
       expect(provider.calls.filter((call) => call.kind === "reply")).toHaveLength(1);
       expect(provider.calls.filter((call) => call.kind === "target")).toHaveLength(1);
+      expect(provider.calls.filter((call) => call.kind === "announce")).toHaveLength(1);
     },
   );
 });

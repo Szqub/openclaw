@@ -7,7 +7,7 @@ import {
   renderSessionIdleState,
 } from "./session-attention-presentation.ts";
 import { renderSessionGlyph, renderSessionUnreadBadge } from "./session-glyph.ts";
-import { resolveSessionIconGlyph } from "./session-icon-glyph-registry.ts";
+import { resolveSessionIconGraphic } from "./session-icon-glyph-registry.ts";
 import { renderSessionOwnerChip, type SessionCreatedActor } from "./session-owner-chip.ts";
 
 type SessionAvatarAuth = {
@@ -24,9 +24,9 @@ function ensureChannelAvatarElement(): void {
 }
 
 function renderPersistentSessionIcon(icon: string) {
-  const glyph = resolveSessionIconGlyph(icon);
-  return glyph
-    ? html`<span class="session-glyph__icon" aria-hidden="true">${glyph}</span>`
+  const graphic = resolveSessionIconGraphic(icon);
+  return graphic
+    ? html`<span class="session-glyph__icon" aria-hidden="true">${graphic}</span>`
     : html`<span class="session-glyph__emoji" aria-hidden="true">${icon}</span>`;
 }
 
@@ -59,7 +59,7 @@ export function renderSessionLeadingState(
   const running = session.hasActiveRun || subagentsWorking;
   const ownRunQueued = session.hasActiveRun && session.status === "queued";
   const runState = {
-    running: running && !trailingState,
+    running: running && !trailingState && session.attention.kind !== "question",
     queued: ownRunQueued && !subagentsWorking,
     runningLabel:
       subagentsWorking && (!session.hasActiveRun || ownRunQueued)
@@ -67,27 +67,23 @@ export function renderSessionLeadingState(
         : undefined,
   };
   // Transient attention always outranks the persistent decorative icon.
+  const iconContent =
+    session.attention.kind !== "none" && !trailingState
+      ? renderSessionAttentionIcon(session.attention, true)
+      : session.icon
+        ? renderPersistentSessionIcon(session.icon)
+        : nothing;
+  if (iconContent !== nothing) {
+    return {
+      running,
+      leadingIndicator: renderSessionGlyph({
+        content: iconContent,
+        ...runState,
+        badge: session.unread && !running && !trailingState ? renderSessionUnreadBadge() : nothing,
+      }),
+    };
+  }
   if (session.isChild && !trailingState) {
-    if (session.attention.kind !== "none") {
-      return {
-        running,
-        leadingIndicator: renderSessionGlyph({
-          content: renderSessionAttentionIcon(session.attention, true),
-          ...runState,
-          badge: session.unread && !running ? renderSessionUnreadBadge() : nothing,
-        }),
-      };
-    }
-    if (session.icon) {
-      return {
-        running,
-        leadingIndicator: renderSessionGlyph({
-          content: renderPersistentSessionIcon(session.icon),
-          ...runState,
-          badge: session.unread && !running ? renderSessionUnreadBadge() : nothing,
-        }),
-      };
-    }
     if (session.channelAvatarUrl) {
       ensureChannelAvatarElement();
       return {
@@ -112,26 +108,6 @@ export function renderSessionLeadingState(
     };
   }
 
-  if (session.attention.kind !== "none" && !trailingState) {
-    return {
-      running,
-      leadingIndicator: renderSessionGlyph({
-        content: renderSessionAttentionIcon(session.attention, true),
-        ...runState,
-        badge: session.unread && !running && !trailingState ? renderSessionUnreadBadge() : nothing,
-      }),
-    };
-  }
-  if (session.icon) {
-    return {
-      running,
-      leadingIndicator: renderSessionGlyph({
-        content: renderPersistentSessionIcon(session.icon),
-        ...runState,
-        badge: session.unread && !running && !trailingState ? renderSessionUnreadBadge() : nothing,
-      }),
-    };
-  }
   const ownerChip = ownerActor?.id?.trim()
     ? renderSessionOwnerChip(
         ownerActor,

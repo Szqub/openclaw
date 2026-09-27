@@ -70,14 +70,7 @@ type BrowserHatchHandoffDeps = {
   waitForDocument?: typeof waitForControlUiDocument;
   issueBrowserHandoff?: typeof issueControlUiBrowserHandoff;
   verifyLoopbackAlias?: typeof hasVerifiedControlUiLoopbackAlias;
-  pollForClient?: (params: {
-    target: BrowserHatchTarget;
-    baselineClientKeys: ReadonlySet<string>;
-    timeoutMs: number;
-    probe: (target: BrowserHatchTarget, timeoutMs: number) => Promise<DashboardPresenceProbeResult>;
-    now?: () => number;
-    sleep?: (ms: number) => Promise<void>;
-  }) => Promise<DashboardWaitResult>;
+  pollForClient?: typeof waitForDashboardClient;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 };
@@ -136,6 +129,7 @@ function retargetBrowserHandoffUrl(
   const visible = new URL(links.httpUrl);
   const fragment = new URLSearchParams(issued.hash.slice(1));
   fragment.set("gatewayUrl", links.wsUrl);
+  visible.pathname = issued.pathname;
   visible.search = issued.search;
   visible.hash = fragment.toString();
   return visible.toString();
@@ -277,7 +271,20 @@ export async function runBrowserHatchHandoff(
       target.links,
     );
     const url = new URL(browserHandoff.browserUrl);
-    if (params.agentId) {
+    const [{ resolveConfiguredSetupModelForAgent }, { resolveSystemAgentOnboardingTarget }] =
+      await Promise.all([
+        import("../agents/utility-model.js"),
+        import("./onboard-agent-target.js"),
+      ]);
+    const setupOnly =
+      resolveConfiguredSetupModelForAgent({
+        cfg: params.config,
+        agentId: params.agentId ?? resolveSystemAgentOnboardingTarget(params.config).agentId,
+      })?.modelTarget === "utility";
+    if (setupOnly) {
+      url.pathname = `${url.pathname.replace(/\/$/, "")}/custodian`;
+      url.searchParams.set("onboarding", "1");
+    } else if (params.agentId) {
       url.searchParams.set("session", `agent:${params.agentId}:main`);
     }
     browserUrl = url.toString();

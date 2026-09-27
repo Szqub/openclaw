@@ -15,7 +15,7 @@ const {
   buildProviderSummaryMetadataIndexMock,
   listProvidersForAgentMock,
   listAgentProvenanceMock,
-  readAgentProvenanceMock,
+  readAgentProvenanceForDisplayMock,
   providerSummaryMetadataMock,
   requireValidConfigMock,
   summarizeBindingsMock,
@@ -24,7 +24,7 @@ const {
   buildProviderSummaryMetadataIndexMock: vi.fn(),
   listProvidersForAgentMock: vi.fn(),
   listAgentProvenanceMock: vi.fn(),
-  readAgentProvenanceMock: vi.fn(),
+  readAgentProvenanceForDisplayMock: vi.fn(),
   providerSummaryMetadataMock: new Map([
     [
       "telegram",
@@ -52,7 +52,7 @@ vi.mock("./agents.providers.js", () => ({
 
 vi.mock("../state/agent-provenance.js", () => ({
   listAgentProvenance: listAgentProvenanceMock,
-  readAgentProvenance: readAgentProvenanceMock,
+  readAgentProvenanceForDisplay: readAgentProvenanceForDisplayMock,
 }));
 
 const { agentsListCommand } = await import("./agents.commands.list.js");
@@ -81,8 +81,8 @@ describe("agentsListCommand", () => {
     buildProviderStatusIndexMock.mockResolvedValue(new Map());
     buildProviderSummaryMetadataIndexMock.mockReturnValue(providerSummaryMetadataMock);
     listProvidersForAgentMock.mockReturnValue(["Telegram default: configured"]);
-    listAgentProvenanceMock.mockReturnValue([]);
-    readAgentProvenanceMock.mockReturnValue(undefined);
+    listAgentProvenanceMock.mockResolvedValue([]);
+    readAgentProvenanceForDisplayMock.mockResolvedValue([]);
     summarizeBindingsMock.mockReturnValue(["Telegram default"]);
   });
 
@@ -138,12 +138,15 @@ describe("agentsListCommand", () => {
 
   it("adds durable provenance to JSON without loading provider details", async () => {
     const runtime = createRuntime();
-    readAgentProvenanceMock.mockReturnValue({
-      agentId: "main",
-      createdVia: "operator",
-      creatorAgentId: null,
-      createdAtMs: 42,
-    });
+    listAgentProvenanceMock.mockRejectedValue(new Error("unrelated stored provenance is invalid"));
+    readAgentProvenanceForDisplayMock.mockResolvedValue([
+      {
+        agentId: "main",
+        createdVia: "operator",
+        creatorAgentId: null,
+        createdAtMs: 42,
+      },
+    ]);
 
     await agentsListCommand({ json: true }, runtime);
 
@@ -158,6 +161,10 @@ describe("agentsListCommand", () => {
     });
     expect(summary).not.toHaveProperty("routes");
     expect(summary).not.toHaveProperty("providers");
+
+    await expect(agentsListCommand({ json: true, tree: true }, createRuntime())).rejects.toThrow(
+      "unrelated stored provenance is invalid",
+    );
   });
 
   it("renders roots, children, missing rows, and dangling creators as a tree", async () => {
@@ -171,7 +178,7 @@ describe("agentsListCommand", () => {
         },
       },
     } satisfies OpenClawConfig);
-    listAgentProvenanceMock.mockReturnValue([
+    listAgentProvenanceMock.mockResolvedValue([
       { agentId: "main", createdVia: "operator", creatorAgentId: null, createdAtMs: 1 },
       { agentId: "child", createdVia: "agent", creatorAgentId: "main", createdAtMs: 2 },
       { agentId: "orphan", createdVia: "agent", creatorAgentId: "deleted", createdAtMs: 3 },
@@ -309,6 +316,46 @@ describe("agentsListCommand", () => {
         `Identity: ${expected.identityEmoji} ${expected.identityName} (${source})`,
       );
       expect(fs.readFileSync(identityPath, "utf8")).toBe(identityFile);
+    });
+  });
+
+  it("keeps JSON identity fields when local avatar preparation fails", async () => {
+    await withTestDir({ prefix: "openclaw-agent-identity-list-" }, async (workspace) => {
+      const avatarRuntime = await import("../agents/identity-avatar-file-runtime.js");
+      const prepareAvatar = vi
+        .spyOn(avatarRuntime, "prepareLocalAgentAvatar")
+        .mockRejectedValue(new Error("avatar worker unavailable"));
+      try {
+        requireValidConfigMock.mockResolvedValueOnce({
+          agents: {
+            entries: {
+              proof: {
+                workspace,
+                identity: { name: "Chosen Identity", emoji: "🦉", avatar: "avatar.png" },
+              },
+            },
+          },
+        } satisfies OpenClawConfig);
+        const runtime = createRuntime();
+
+        await agentsListCommand({ json: true }, runtime);
+
+        expect(prepareAvatar).toHaveBeenCalledOnce();
+        const output = runtime.writeJson.mock.calls[0]?.[0];
+        expect(output).toEqual([
+          expect.objectContaining({
+            id: "proof",
+            identityName: "Chosen Identity",
+            identityEmoji: "🦉",
+            identitySource: "config",
+          }),
+        ]);
+        expect((output as Array<Record<string, unknown>>)[0]).not.toHaveProperty(
+          "identityAvatarUrl",
+        );
+      } finally {
+        prepareAvatar.mockRestore();
+      }
     });
   });
 

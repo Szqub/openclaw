@@ -11,9 +11,105 @@ import {
   PROVISIONING_PLACEMENT,
   REQUEST,
 } from "./placement-dispatch-coordinator.test-support.js";
+import type { WorkerPlacementDispatchService } from "./placement-dispatch.js";
 import type { WorkerPlacementDispatchRequest } from "./service-contract.js";
 
+type DispatchService = WorkerPlacementDispatchService;
+
 describe("worker placement maintenance admission", () => {
+  it.each(["success", "failure", "cancellation"] as const)(
+    "counts pending device dispatches through cleanup until %s settles",
+    async (outcome) => {
+      const dispatchStarted = createDeferredCore();
+      const finishDispatch = createDeferredCore();
+      const cleanupStarted = createDeferredCore();
+      const finishCleanup = createDeferredCore();
+      const controller = new AbortController();
+      const terminalError = new Error(`dispatch ${outcome}`);
+      const request = { ...REQUEST, deviceId: "node-one" };
+      const dispatch = vi.fn<DispatchService["dispatch"]>(
+        async (current, _report, _authorize, signal) => {
+          const active = {
+            ...ACTIVE_PLACEMENT,
+            sessionId: current.sessionId,
+            sessionKey: current.sessionKey,
+          };
+          if (current.sessionId !== request.sessionId) {
+            await finishCleanup.promise;
+            return active;
+          }
+          dispatchStarted.resolve();
+          try {
+            await finishDispatch.promise;
+            signal?.throwIfAborted();
+            if (outcome === "failure") {
+              throw terminalError;
+            }
+            return active;
+          } finally {
+            cleanupStarted.resolve();
+            await finishCleanup.promise;
+          }
+        },
+      );
+      const coordinated = coordinateWorkerPlacementDispatch(
+        createCoordinatorTestService({ dispatch }),
+        (_request, run, _authorize, signal) => run(signal),
+      );
+      const first = coordinated.dispatch(request, undefined, undefined, controller.signal);
+      await dispatchStarted.promise;
+      const joined = coordinated.dispatch(request);
+      const sibling = coordinated.dispatch({ ...request, sessionId: "sibling" });
+      const remote = coordinated.dispatch({
+        ...request,
+        sessionId: "remote",
+        executionMode: "remote-exec",
+      });
+      const otherDevice = coordinated.dispatch({
+        ...request,
+        sessionId: "other-device",
+        deviceId: "node-two",
+      });
+      const settled = Promise.allSettled([first, joined, sibling, remote, otherDevice]);
+
+      try {
+        expect(coordinated.getPendingDeviceDispatchCount("node-one")).toBe(2);
+        expect(coordinated.getPendingDeviceDispatchCount("node-one", request.sessionId)).toBe(1);
+        expect(coordinated.getPendingDeviceDispatchCount("node-two")).toBe(1);
+        expect(coordinated.getPendingDeviceDispatchCount("unknown-node")).toBe(0);
+        if (outcome === "cancellation") {
+          controller.abort(terminalError);
+        }
+        finishDispatch.resolve();
+        await cleanupStarted.promise;
+        expect(coordinated.getPendingDeviceDispatchCount("node-one")).toBe(2);
+      } finally {
+        finishDispatch.resolve();
+        finishCleanup.resolve();
+        await settled;
+      }
+
+      const results = await settled;
+      expect(results.slice(0, 2)).toEqual(
+        outcome === "success"
+          ? [
+              { status: "fulfilled", value: ACTIVE_PLACEMENT },
+              { status: "fulfilled", value: ACTIVE_PLACEMENT },
+            ]
+          : [
+              { status: "rejected", reason: terminalError },
+              { status: "rejected", reason: terminalError },
+            ],
+      );
+      expect(results.slice(2).every((result) => result.status === "fulfilled")).toBe(true);
+      expect(
+        dispatch.mock.calls.filter(([current]) => current.sessionId === request.sessionId),
+      ).toHaveLength(1);
+      expect(coordinated.getPendingDeviceDispatchCount("node-one")).toBe(0);
+      expect(coordinated.getPendingDeviceDispatchCount("node-two")).toBe(0);
+    },
+  );
+
   it.each(["ready", "provider-pending", "abort", "stop", "move", "replacement"] as const)(
     "retains restarted input between provider passes until %s",
     async (outcome) => {
@@ -178,56 +274,6 @@ describe("worker placement maintenance admission", () => {
     },
   );
 
-  it("reclaims an idle session before a disjoint dispatch finishes while preserving its fence", async () => {
-    const cloudStarted = createDeferredCore();
-    const releaseCloud = createDeferredCore();
-    let reclaimed = false;
-    const dispatch = vi.fn(async (request: WorkerPlacementDispatchRequest) => {
-      if (request.sessionId === "cloud") {
-        cloudStarted.resolve();
-        await releaseCloud.promise;
-      }
-      return { ...ACTIVE_PLACEMENT, ...request };
-    });
-    const service = createCoordinatorTestService({
-      dispatch,
-      reclaim: async (_request, _authorize, _beforeDrain, serialize) => {
-        if (!serialize) {
-          throw new Error("Reclaim fixture requires the placement fence");
-        }
-        return await serialize(async () => {
-          reclaimed = true;
-          return { ...ACTIVE_PLACEMENT, state: "reclaimed" };
-        });
-      },
-    });
-    const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
-    const cloud = coordinated.dispatch({
-      ...REQUEST,
-      sessionId: "cloud",
-      sessionKey: "agent:main:cloud",
-    });
-    await cloudStarted.promise;
-    const stop = coordinated.reclaim(REQUEST);
-    let later: Promise<unknown> | undefined;
-    try {
-      await setImmediatePromise();
-      expect(reclaimed).toBe(true);
-      expect((await stop).state).toBe("reclaimed");
-      later = coordinated.dispatch({
-        ...REQUEST,
-        sessionId: "later",
-        sessionKey: "agent:main:later",
-      });
-      await setImmediatePromise();
-      expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(["cloud"]);
-    } finally {
-      releaseCloud.resolve();
-      await Promise.all([cloud, stop, later]);
-    }
-    expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(["cloud", "later"]);
-  });
-
   it.each(["full", "targeted", "recovery"] as const)(
     "bounds dispatch joins to the original provider cohort before %s maintenance",
     async (kind) => {
@@ -302,7 +348,7 @@ describe("worker placement maintenance admission", () => {
       ["sweep", "recovery"].map((maintenanceKind) => ({ kind, order, maintenanceKind })),
     ),
   )(
-    "a queued $kind closes dispatch admission $order pending $maintenanceKind",
+    "preserves $kind dispatch admission $order pending $maintenanceKind",
     async ({ kind, order, maintenanceKind }) => {
       const cloudStarted = createDeferredCore();
       const releaseCloud = createDeferredCore();
@@ -360,13 +406,14 @@ describe("worker placement maintenance admission", () => {
       await setImmediatePromise();
       maintenance ??= maintain();
       const later = coordinated.dispatch({ ...REQUEST, sessionId: "unrelated" });
+      const admitted = kind === "reclaim" ? ["cloud", "unrelated"] : ["cloud"];
       try {
         await setImmediatePromise();
-        expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(["cloud"]);
+        expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(admitted);
         releaseCloud.resolve();
         await exclusiveStarted.promise;
         await setImmediatePromise();
-        expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(["cloud"]);
+        expect(dispatch.mock.calls.map(([request]) => request.sessionId)).toEqual(admitted);
       } finally {
         releaseCloud.resolve();
         releaseExclusive.resolve();

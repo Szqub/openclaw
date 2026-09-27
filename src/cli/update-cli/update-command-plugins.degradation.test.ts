@@ -5,12 +5,10 @@ import * as convergence from "../../commands/doctor/shared/post-core-plugin-conv
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../config/types.plugins.js";
 import { withServer } from "../../plugin-sdk/test-helpers/http-test-server.js";
-import {
-  writePersistedInstalledPluginIndexInstallRecords,
-  readPersistedInstalledPluginIndexInstallRecords,
-} from "../../plugins/installed-plugin-index-records.js";
+import { readPersistedInstalledPluginIndexInstallRecords } from "../../plugins/installed-plugin-index-records.js";
 import { loadInstalledPluginIndex } from "../../plugins/installed-plugin-index.js";
 import { createPluginCache, withPluginCache } from "../../plugins/plugin-cache.js";
+import { seedInstalledPluginIndex } from "../../plugins/test-helpers/installed-plugin-index.js";
 import * as cohort from "../../plugins/update-cohort.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
@@ -63,7 +61,7 @@ describe("post-core plugin payload degradation", () => {
             OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
           },
           async () => {
-            await writePersistedInstalledPluginIndexInstallRecords(records, {
+            await seedInstalledPluginIndex(records, {
               config,
               env: process.env,
             });
@@ -82,9 +80,16 @@ describe("post-core plugin payload degradation", () => {
               status: "warning",
               assessment: { kind: "no-payload-repair" },
               changed: false,
+              warnings: [
+                expect.objectContaining({
+                  pluginId,
+                  reason: "plugin-operator-managed",
+                  source: linkedPath,
+                }),
+              ],
               sync: {
                 switchedToBundled: [],
-                warnings: [expect.stringContaining(`"${pluginId}" at ${linkedPath}`)],
+                warnings: [],
                 errors: [],
               },
             });
@@ -122,6 +127,8 @@ describe("post-core plugin payload degradation", () => {
     ["optional", true, "warning", "optional-repair-needed", undefined],
     ["optional", false, "warning", "optional-repair-needed", undefined],
     ["invalid-config", true, "error", "core-critical", "invalid-config"],
+    ["config-read-file", true, "error", "core-critical", "config-read-failed"],
+    ["config-read-include", true, "error", "core-critical", "config-read-failed"],
     ["authority", true, undefined, undefined, undefined],
   ] as const)(
     "classifies %s with convergence errored=%s and update status=%s",
@@ -175,11 +182,14 @@ describe("post-core plugin payload degradation", () => {
             : undefined;
         const spy = vi
           .spyOn(convergence, "runPostCorePluginConvergence")
-          .mockImplementationOnce(async () => {
+          .mockImplementationOnce(async ({ cfg }) => {
             if (failure === "authority") {
               throw refusal;
             }
             return {
+              config: cfg,
+              configChanges: [],
+              installedPluginIdRecovery: new Map(),
               changes: [],
               warnings:
                 failure === "unclassified"
@@ -223,14 +233,19 @@ describe("post-core plugin payload degradation", () => {
             };
           });
         try {
+          if (failure === "invalid-config") {
+            await state.writeConfig({ gateway: { port: "invalid" } });
+          } else if (failure === "config-read-file") {
+            await fs.rm(state.configPath);
+            await fs.mkdir(state.configPath);
+          } else if (failure === "config-read-include") {
+            await state.writeConfig({ $include: "./missing-post-core-config.json" });
+          }
           const prepared = await preparePostCorePluginConfig({ requestedChannel: null });
           const params = {
             root: state.root,
             channel: "stable" as const,
             ...prepared,
-            ...(failure === "invalid-config"
-              ? { configSnapshot: { ...prepared.configSnapshot, valid: false } }
-              : {}),
             ...(failure === "unknown-requirement"
               ? {}
               : {
@@ -250,7 +265,29 @@ describe("post-core plugin payload degradation", () => {
               status,
               assessment: { kind, ...(reason ? { reason } : {}) },
             });
-            expect(result.reason).toBe(failure === "invalid-config" ? "invalid-config" : undefined);
+            expect(result.reason).toBe(kind === "core-critical" ? reason : undefined);
+            if (kind === "core-critical") {
+              expect(spy).not.toHaveBeenCalled();
+              expect(result.changed).toBe(false);
+              expect(result.failureFacts).toEqual([
+                expect.objectContaining({
+                  code: failure === "config-read-file" ? "EISDIR" : reason,
+                  ...(failure === "invalid-config" ? { affectedKey: "gateway.port" } : {}),
+                }),
+              ]);
+              expect(result.warnings).toEqual([
+                expect.objectContaining({
+                  reason,
+                  message: expect.stringContaining("refusing to restart"),
+                  guidance: expect.arrayContaining([
+                    expect.stringContaining(
+                      failure === "config-read-file" ? "file access" : "openclaw doctor",
+                    ),
+                    "Once the config loads successfully, rerun `openclaw update repair`.",
+                  ]),
+                }),
+              ]);
+            }
             if (kind === "optional-repair-needed") {
               expect(result.assessment).toMatchObject({ failures: [smokeFailure] });
             }
@@ -289,7 +326,7 @@ describe("failed cohort repair requirement assessment", () => {
         await state.writeConfig(config);
         const dataPath = await state.writeText("plugin-data.txt", "newer data survives");
         const npmConfigPath = await state.writeText("empty.npmrc", "");
-        await writePersistedInstalledPluginIndexInstallRecords(records, {
+        await seedInstalledPluginIndex(records, {
           config,
           env: process.env,
         });

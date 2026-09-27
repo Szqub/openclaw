@@ -1,19 +1,23 @@
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { Value } from "typebox/value";
-import ts from "typescript";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { typeCheckSources } from "../../../test/helpers/typescript.js";
 import { clearCronJobActive, markCronJobActive } from "../../cron/active-jobs.js";
 import { CronService } from "../../cron/service.js";
 import { createCronStoreHarness, createNoopLogger } from "../../cron/service.test-harness.js";
 import type { CronJob } from "../../cron/types.js";
 import { GatewayClientRequestError } from "../../gateway/client.js";
+import { compactCronListJob } from "../../gateway/server-methods/cron-list-projection.js";
 import { claimAgentRunContext, clearAgentRunContext } from "../../infra/agent-run-registry.js";
+import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { applyCodeModeCatalog } from "../code-mode.js";
 import {
   createCodeModeHarness,
   resetCodeModeTestState,
+  resultDetails,
   runUntilCompleted,
+  waitUntilCompleted,
 } from "../code-mode.test-support.js";
 import { createCronTool } from "./cron-tool.js";
 
@@ -29,7 +33,7 @@ const job: CronJob = {
   payload: { kind: "systemEvent", text: "Check unpaid invoices" },
   state: {},
 };
-const compactJob = {
+const legacyCompactJob = {
   id: job.id,
   name: job.name,
   enabled: true,
@@ -42,6 +46,18 @@ const compactJob = {
   lastRunAtMs: null,
   lastRunStatus: null,
   lastRunError: null,
+};
+const compactJob = {
+  ...compactCronListJob({
+    ...job,
+    agentId: "main",
+    enabled: false,
+    state: {
+      runningAtMs: 0,
+      autoDisabled: { reason: "consecutive-failures", atMs: 0, consecutiveErrors: 3 },
+    },
+  }),
+  effectiveAgentId: "main",
 };
 const page = {
   total: 1,
@@ -58,6 +74,18 @@ const createJob = {
   sessionTarget: job.sessionTarget,
   wakeMode: job.wakeMode,
   payload: job.payload,
+};
+const history = {
+  ...page,
+  entries: [
+    {
+      ts: 1_800_000_000_000,
+      jobId: job.id,
+      action: "finished",
+      status: "ok",
+      summary: "Three unpaid invoices",
+    },
+  ],
 };
 
 describe("automations output contract", () => {
@@ -77,7 +105,22 @@ describe("automations output contract", () => {
       },
     },
     { name: "compact inventory", args: { action: "list" }, reply: list },
+    {
+      name: "older compact inventory",
+      args: { action: "list" },
+      reply: { ...list, jobs: [legacyCompactJob] },
+    },
     { name: "job details", args: { action: "get", jobId: job.id }, reply: job },
+    {
+      // The scheduler reports scheduleErrorCount in state once a job has
+      // schedule-computation errors; the read schema must accept it (#157477).
+      name: "job details with scheduler diagnostics",
+      args: { action: "get", jobId: job.id },
+      reply: {
+        ...job,
+        state: { scheduleErrorCount: 3, lastError: "schedule error: bad cron expr" },
+      },
+    },
     {
       name: "creation",
       args: { action: "add", job: createJob },
@@ -117,18 +160,7 @@ describe("automations output contract", () => {
     {
       name: "run history",
       args: { action: "runs", jobId: job.id },
-      reply: {
-        ...page,
-        entries: [
-          {
-            ts: 1_800_000_000_000,
-            jobId: job.id,
-            action: "finished",
-            status: "ok",
-            summary: "Three unpaid invoices",
-          },
-        ],
-      },
+      reply: history,
     },
     { name: "wake", args: { action: "wake", text: "Review invoices" }, reply: { ok: true } },
     {
@@ -149,6 +181,8 @@ describe("automations output contract", () => {
       onTestFinished(resetCodeModeTestState);
       const { storePath } = await makeStorePath();
       const cron = new CronService({
+        scheduler: createTestGatewayScheduler(),
+        nowMs: () => Date.now(),
         storePath,
         cronEnabled: true,
         defaultAgentId: "main",
@@ -244,58 +278,95 @@ describe("automations output contract", () => {
     }
   });
 
-  it("composes discovered automation results using the real generated declaration", async () => {
+  it("composes action results through generated declarations and JavaScript", async () => {
     onTestFinished(resetCodeModeTestState);
     const h = createCodeModeHarness();
-    const tool = createCronTool(undefined, { callGatewayTool: vi.fn().mockResolvedValue(list) });
+    const replies: Record<string, unknown> = {
+      "cron.list": list,
+      "cron.status": { enabled: true, jobs: 1 },
+      "cron.get": job,
+      "cron.runs": history,
+    };
+    const gatewayCall = vi.fn().mockImplementation(async (method: string) => {
+      if (!(method in replies)) {
+        throw new Error(`Unexpected gateway method: ${method}`);
+      }
+      return replies[method];
+    });
+    const tool = createCronTool(undefined, { callGatewayTool: gatewayCall });
     applyCodeModeCatalog({ ...h.ctx, tools: [...h.tools, tool] });
     const result = await runUntilCompleted({
       execTool: expectDefined(h.tools[0], "Code Mode exec"),
       waitTool: expectDefined(h.tools[1], "Code Mode wait"),
-      code: 'const [tool] = await catalog.search("automations"); const listed = await tool({action:"list"}); const file = await API.read("tools/automations.d.ts"); return {names:listed.jobs.map(job=>job.name),file};',
+      code: 'return await API.read("tools/automations.d.ts");',
     });
-    expect(result).toMatchObject({ status: "completed", value: { names: [job.name] } });
-    const { file } = result.value as { file: { content: string } };
-    const fileName = "/automations-consumer.ts";
-    const source = ts.createSourceFile(
-      fileName,
-      file.content +
-        `
+    expect(result).toMatchObject({ status: "completed" });
+    const file = result.value as { content: string };
+    const composition = `
 async function consume() {
-  const result = await automations({ action: "list" });
-  if ("jobs" in result && "nextOffset" in result) {
-    const names: string[] = result.jobs.map(job => job.name);
-    const next: number | null = result.nextOffset;
-    // @ts-expect-error Invented invoice fields are not part of an automation.
-    result.jobs[0].invoiceTotal;
-    return { names, next };
-  }
-  if ("removed" in result && result.ok) {
-    const cleanup: "pending" | undefined = result.sessionCleanup;
-    return cleanup;
-  }
-  if ("entries" in result) {
-    const summaries: (string | undefined)[] = result.entries.map(entry => entry.summary);
-    return summaries;
-  }
-  if ("job" in result && result.job.payload.kind === "systemEvent") {
-    const text: string = result.job.payload.text;
-    return text;
-  }
+  const listed = await automations({ action: "list" });
+  const names = listed.jobs.map(job => job.name);
+  const next = listed.nextOffset;
+  const status = await automations({ action: "status" });
+  const enabled = status.enabled;
+  const jobCount = status.jobs;
+  const details = await automations({ action: "get", jobId: "invoice-check" });
+  const name = details.name;
+  const runs = await automations({ action: "runs", jobId: details.id });
+  const summaries = runs.entries.map(entry => entry.summary);
+  return { names, next, enabled, jobCount, name, summaries };
 }
-`,
-      ts.ScriptTarget.ESNext,
-      true,
-    );
-    const options = { noEmit: true, strict: true, types: [], target: ts.ScriptTarget.ESNext };
-    const host = ts.createCompilerHost(options);
-    const original = host.getSourceFile.bind(host);
-    host.getSourceFile = (name, ...args) => (name === fileName ? source : original(name, ...args));
-    const program = ts.createProgram([fileName], options, host);
-    expect(
-      ts
-        .getPreEmitDiagnostics(program)
-        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")),
-    ).toEqual([]);
+`;
+    const fileName = "/automations-consumer.ts";
+    const source =
+      file.content +
+      composition +
+      `
+async function checkContracts(action: "list" | "runs", input: Parameters<typeof automations>[0]) {
+  const listed = await automations({ action: "list" });
+  // @ts-expect-error Invented invoice fields are not part of an automation.
+  listed.jobs[0].invoiceTotal;
+  const removed = await automations({ action: "remove", jobId: "invoice-check" });
+  if (removed.ok) {
+    const cleanup: "pending" | undefined = removed.sessionCleanup;
+  }
+  const added = await automations({ action: "add", job: ${JSON.stringify(createJob)} });
+  // @ts-expect-error Add can return a direct job or a convergence envelope.
+  added.id;
+  const addedJob = "job" in added ? added.job : added;
+  const id: string = addedJob.id;
+  const run = await automations({ action: "run", jobId: id });
+  if (!run.ok) {
+    const instance: string | undefined = run.processInstanceId;
+  }
+  const selected = await automations({ action });
+  // @ts-expect-error A dynamic action cannot promise a list result.
+  selected.jobs.map(job => job.name);
+  const dynamic = await automations(input);
+  // @ts-expect-error Broad inputs retain all possible outputs.
+  dynamic.entries.map(entry => entry.summary);
+}
+`;
+    expect(typeCheckSources({ [fileName]: source })).toEqual([]);
+    const composed = await waitUntilCompleted({
+      details: resultDetails(
+        await expectDefined(h.tools[0], "Code Mode exec").execute("compose-automations", {
+          code: `${composition}\nreturn await consume();`,
+        }),
+      ),
+      waitTool: expectDefined(h.tools[1], "Code Mode wait"),
+    });
+    expect(composed, JSON.stringify(composed)).toMatchObject({
+      status: "completed",
+      value: {
+        names: [job.name],
+        next: null,
+        enabled: true,
+        jobCount: 1,
+        name: job.name,
+        summaries: ["Three unpaid invoices"],
+      },
+    });
+    expect(gatewayCall).toHaveBeenCalledTimes(4);
   });
 });

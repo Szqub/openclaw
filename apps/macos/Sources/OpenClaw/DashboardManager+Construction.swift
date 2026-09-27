@@ -1,6 +1,12 @@
+import AppKit
 import Foundation
 import OpenClawKit
 import WebKit
+
+enum DashboardRouteProbePurpose: Sendable {
+    case authentication
+    case presentation
+}
 
 extension DashboardManager {
     struct AuxiliaryWindowInstance {
@@ -24,6 +30,31 @@ extension DashboardManager {
     struct NavigationIntent {
         let id = UUID()
         let windowID: ObjectIdentifier?
+    }
+
+    @MainActor
+    struct WindowIntent {
+        let window: NSWindow?
+        private let lifetime: UInt64?
+        private let generation: UInt64?
+
+        init(_ controller: DashboardWindowController?) {
+            self.window = controller?.window
+            self.lifetime = controller?.windowLifetimeRevision
+            self.generation = controller?.windowIntentGeneration
+        }
+
+        func currentController(for target: DashboardGatewayTarget, in manager: DashboardManager)
+            -> DashboardWindowController?
+        {
+            // A replacement document may inherit the shell; a new selection,
+            // close, or experience switch retires the shell's earlier intent.
+            guard let controller = self.window?.windowController as? DashboardWindowController,
+                  manager.target(for: controller) == target,
+                  controller.windowLifetimeRevision == self.lifetime,
+                  controller.windowIntentGeneration == self.generation else { return nil }
+            return controller
+        }
     }
 
     final class ProfileObservation {
@@ -99,31 +130,23 @@ extension DashboardManager {
 extension DashboardManager {
     nonisolated static let failureURL = URL(string: "about:blank")!
 
-    nonisolated static let browserSessionRenewalLeadTime: TimeInterval = 15 * 60
-
-    nonisolated static func requiresBrowserSignIn(
-        error: Error?, expiresAt: Date?, userGesture: Bool, now: Date = Date()) -> Bool
-    {
-        if let error { return error as? GatewayBrowserSessionError == .expired }
-        guard userGesture, let expiresAt else { return false }
-        return expiresAt <= now.addingTimeInterval(Self.browserSessionRenewalLeadTime)
-    }
-
-    func canFocusWithoutReload(_ controller: DashboardWindowController, userGesture: Bool) -> Bool {
-        controller.hasCurrentBrowserSession && !controller.isShowingFailurePage &&
-            !Self.requiresBrowserSignIn(
-                error: nil, expiresAt: controller.browserSession?.expiresAt, userGesture: userGesture)
+    func canFocusWithoutReload(_ controller: DashboardWindowController) -> Bool {
+        controller.hasCurrentBrowserSession && !controller.isShowingFailurePage
     }
 
     func loadWindow(
-        _ controller: DashboardWindowController, configuration: WindowConfiguration, present: Bool)
+        _ controller: DashboardWindowController,
+        configuration: WindowConfiguration,
+        present: Bool,
+        restoringRoute: URL? = nil)
     {
         if let page = configuration.signedOut {
             controller.showSignedOut(page, present: present, autoStart: configuration.autoStartSignIn)
         } else if present {
             controller.show(url: configuration.url, auth: configuration.auth)
         } else {
-            controller.loadInBackground(url: configuration.url, auth: configuration.auth)
+            controller.loadInBackground(
+                url: configuration.url, auth: configuration.auth, restoringRoute: restoringRoute)
         }
     }
 }
@@ -143,7 +166,7 @@ extension DashboardManager.WindowConfiguration {
             profile = context.profile
             expiry = context.expiresAt
         } else {
-            guard DashboardManager.requiresBrowserSignIn(error: error, expiresAt: nil, userGesture: userGesture),
+            guard error as? GatewayBrowserSessionError == .expired,
                   let endpoint, let session = endpoint.browserSession else { return nil }
             profile = MacGatewayProfile(
                 id: profileID, name: name ?? endpoint.config.url.host ?? "Gateway", url: endpoint.config.url)
@@ -214,5 +237,42 @@ extension DashboardManager {
             mode: mode,
             displayName: name,
             browserSession: browserSession)
+    }
+}
+
+extension DashboardManager {
+    static func requiresIsolatedDashboardDocument(
+        _ controller: DashboardWindowController,
+        configuration: WindowConfiguration,
+        endpoint: GatewayConnection.EndpointSnapshot,
+        displayedRoute: (revision: UInt64?, authority: UInt64?)?,
+        comparePrimaryRoute: Bool = true) -> Bool
+    {
+        // A saved renewal may reach the catalog before its serialized cookie
+        // write finishes. The existing account lease remains valid throughout.
+        !controller.hasTLSParams(configuration.tlsParams) ||
+            controller.auth != configuration.auth ||
+            !controller.hasCurrentBrowserSession ||
+            controller.browserSession?.browserDataPrincipal != configuration.browserSession?.browserDataPrincipal ||
+            (comparePrimaryRoute && (endpoint.routeAuthority != displayedRoute?.authority ||
+                    endpoint.revision.map { $0 != displayedRoute?.revision } == true))
+    }
+}
+
+extension DashboardManager {
+    func localWindowConfiguration() async throws
+        -> (configuration: WindowConfiguration, endpoint: GatewayConnection.EndpointSnapshot)
+    {
+        let state = AppStateStore.shared
+        guard state.connectionMode == .remote, state.hostsLocalGatewayWithRemotePrimary,
+              state.gatewayConfigIsCurrentForRouting else { throw CancellationError() }
+        let generation = state.gatewayRoutingGeneration
+        let endpoint = try GatewayEndpointStore.localEndpoint(hostingBesideRemotePrimary: true)
+        let configuration = try await dashboardConfiguration(
+            endpoint: endpoint, mode: .local, target: .local, token: endpoint.config.token)
+        guard state.connectionMode == .remote, state.hostsLocalGatewayWithRemotePrimary,
+              state.gatewayRoutingGeneration == generation,
+              state.gatewayConfigIsCurrentForRouting else { throw CancellationError() }
+        return (configuration, endpoint)
     }
 }
