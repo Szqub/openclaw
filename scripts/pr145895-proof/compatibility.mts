@@ -118,6 +118,7 @@ async function main() {
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "package.json",
+    ":(glob)**/package.json",
     "packages",
   ]);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-root-compatibility-"));
@@ -142,10 +143,26 @@ async function main() {
     phases: [],
   };
   let parentCreated = false;
+  const dependencyLinks: string[] = [];
   try {
     execFileSync("git", ["worktree", "add", "--detach", parent, parentSha], { stdio: "pipe" });
     parentCreated = true;
-    fs.symlinkSync(path.join(candidate, "node_modules"), path.join(parent, "node_modules"), "dir");
+    // pnpm keeps workspace-local dependency links alongside each package, not only at root.
+    const manifests = execFileSync(
+      "git",
+      ["ls-files", "-z", "package.json", ":(glob)**/package.json"],
+      { encoding: "utf8" },
+    )
+      .split("\0")
+      .filter(Boolean);
+    for (const manifest of manifests) {
+      const relative = path.join(path.dirname(manifest), "node_modules");
+      const installed = path.join(candidate, relative);
+      const linked = path.join(parent, relative);
+      if (!fs.existsSync(installed) || !fs.existsSync(path.dirname(linked))) continue;
+      fs.symlinkSync(installed, linked, "dir");
+      dependencyLinks.push(linked);
+    }
     let expectedSchema: number | undefined;
     const invoke = (action: string, source: string) => {
       const result = spawnSync(
@@ -215,7 +232,7 @@ async function main() {
       `${JSON.stringify(report, null, 2)}\n`,
     );
     if (parentCreated) {
-      fs.unlinkSync(path.join(parent, "node_modules"));
+      for (const linked of dependencyLinks) fs.unlinkSync(linked);
       execFileSync("git", ["worktree", "remove", parent]);
     }
     fs.rmSync(root, { recursive: true });
