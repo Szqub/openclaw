@@ -29,7 +29,7 @@ jobs:
       - name: Checkout exact schema-23 candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 671383ccbf054ebaeb7d41df6bc0348e83352e28
+          ref: 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20
           fetch-depth: 5
           persist-credentials: false
       - name: Checkout proof tooling
@@ -41,10 +41,10 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Verify candidate and prepare evidence
         run: |
-          test "$(git rev-parse HEAD)" = 671383ccbf054ebaeb7d41df6bc0348e83352e28
+          test "$(git rev-parse HEAD)" = 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20
           mkdir -p "$RUNNER_TEMP/pr145895-evidence"
           printf '%s\n' 'Unchanged schema20 candidate d165:545tests/13files and7compatibility phases passed in https://github.com/Szqub/openclaw/actions/runs/36354847709 . The pristine fixture comes from that exact run.' > "$RUNNER_TEMP/pr145895-evidence/schema20-reference.txt"
-          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' 671383ccbf054ebaeb7d41df6bc0348e83352e28 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
+          printf 'candidate=%s\nparent=%s\nschema=%s\ntooling_sha=%s\nrun_id=%s\n' 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 66898a633464e85e4aea8fd5a0fd2043c88025af 23 "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/pr145895-evidence/identity.txt"
       - name: Setup frozen candidate toolchain
         uses: ./.github/actions/setup-node-env
         with:
@@ -55,6 +55,10 @@ jobs:
       - name: Install candidate dependencies
         id: install
         run: pnpm install --frozen-lockfile
+      - name: Check the skill-root fixture and regression first
+        run: |
+          set -o pipefail
+          node scripts/run-vitest.mjs run src/agents/cli-runner/prepare.test.ts -t 'skill-selected child config dir' 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/skill-root-focused.log"
       - name: Run focused regression coverage
         id: regressions
         run: |
@@ -65,6 +69,7 @@ jobs:
             src/agents/cli-runner/cli-run-settlement.test.ts \
             src/agents/cli-runner/prepare.test.ts \
             src/agents/command/attempt-execution.test.ts \
+            src/agents/command/attempt-execution.claude-config-dir.test.ts \
             src/agents/command/attempt-execution.cli.test.ts \
             src/agents/command/claude-cli-project-dir.test.ts \
             src/agents/command/claude-cli-project-dir.windows.test.ts \
@@ -81,7 +86,7 @@ jobs:
         run: gh run download 36354847709 --repo "$GITHUB_REPOSITORY" --name pr145895-schema20-upgrade-fixture --dir "$RUNNER_TEMP/schema20-fixture"
       - name: Verify same-schema older-writer compatibility and migration
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate 671383ccbf054ebaeb7d41df6bc0348e83352e28 --parent 66898a633464e85e4aea8fd5a0fd2043c88025af --schema 23 --output "$RUNNER_TEMP/pr145895-evidence" --upgrade-fixture "$RUNNER_TEMP/schema20-fixture"
+        run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --candidate 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 --parent 66898a633464e85e4aea8fd5a0fd2043c88025af --schema 23 --output "$RUNNER_TEMP/pr145895-evidence" --upgrade-fixture "$RUNNER_TEMP/schema20-fixture"
       - name: Verify skill-root regression detects the missing preparation overlay
         if: ${{ !cancelled() && steps.regressions.outcome == 'success' }}
         run: |
@@ -103,6 +108,14 @@ jobs:
           git diff --check 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD
           git diff --name-only -z 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD -- src docs | xargs -0 pnpm exec oxfmt --check
           git diff --name-only -z 66898a633464e85e4aea8fd5a0fd2043c88025af HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
+      - name: Upload preflight diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr145895-schema23-preflight
+          path: ${{ runner.temp }}/pr145895-evidence/
+          if-no-files-found: error
+          retention-days: 30
       - name: Check types and import cycles
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: |
@@ -121,7 +134,7 @@ jobs:
           echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Run isolated current-main Gateway and native Claude proof
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: node tooling/scripts/pr145895-proof/runtime.mjs --candidate 671383ccbf054ebaeb7d41df6bc0348e83352e28 --scenario all --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
+        run: node tooling/scripts/pr145895-proof/runtime.mjs --candidate 6677a20fbbc4d72e95dc38835c5d2dd06f88aa20 --scenario all --fork-entry agent --output "$RUNNER_TEMP/pr145895-evidence"
       - name: Verify tracked source stayed unchanged
         if: always()
         run: git diff --exit-code HEAD
