@@ -29,6 +29,7 @@ import {
   markAuthProfileSuccess,
 } from "./auth-profiles.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
+import { isCliBindingFlushed } from "./cli-runner/binding-flush.js";
 import { runCliCleanup } from "./cli-runner/cleanup.js";
 import { acceptsCliLiveSession } from "./cli-runner/cli-live-session-registry.js";
 import {
@@ -84,6 +85,8 @@ import {
   runAgentHarnessLlmOutputHook,
 } from "./harness/lifecycle-hook-helpers.js";
 
+export { isCliBindingFlushed };
+
 const log = createSubsystemLogger("agents/cli-runner");
 const cliRunnerDeps = cliRunSettlementDeps;
 
@@ -103,35 +106,6 @@ export function restoreCliRunnerTestDeps(): void {
   cliRunnerDeps.loadAuthProfileStoreForRuntime = loadAuthProfileStoreForRuntime;
   cliRunnerDeps.markAuthProfileFailure = markAuthProfileFailure;
   cliRunnerDeps.markAuthProfileSuccess = markAuthProfileSuccess;
-}
-
-/** Checks whether a Claude CLI session binding has reached its transcript file. */
-export async function isCliBindingFlushed(
-  sessionId: string | undefined,
-  provider: string | undefined,
-  workspaceDir?: string,
-  options?: { skipTranscriptProbe?: boolean },
-): Promise<boolean> {
-  if (!provider || !isClaudeCliBackend(provider)) {
-    return true;
-  }
-  if (!sessionId) {
-    return false;
-  }
-  // Warm-stdin sessions keep continuity in the managed stdio child and do not
-  // write native transcripts. Probing them would always clear a valid binding.
-  if (options?.skipTranscriptProbe) {
-    return true;
-  }
-  for (const delayMs of [0, 50, 150]) {
-    if (delayMs > 0) {
-      await cliRunnerDeps.delay(delayMs);
-    }
-    if (await cliRunnerDeps.claudeCliSessionTranscriptHasContent({ sessionId, workspaceDir })) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /** Prepares and runs one CLI-backed agent turn. */
@@ -567,7 +541,10 @@ async function runPreparedCliAgentOwned(
               effectiveCliSessionId,
               params.provider,
               context.cwd ?? context.workspaceDir,
-              { skipTranscriptProbe: acceptsCliLiveSession(context) },
+              {
+                skipTranscriptProbe: acceptsCliLiveSession(context),
+                projectsRoot: context.claudeTranscriptRoot,
+              },
             );
         const interruptionError = terminalInterruption
           ? formatCliTerminalInterruption(terminalInterruption)

@@ -117,6 +117,7 @@ function claudeCliSessionTranscriptPath(params: {
   sessionId: string | undefined;
   workspaceDir: string | undefined;
   homeDir?: string;
+  projectsRoot?: string;
 }): string | null {
   const sessionId = normalizeClaudeCliSessionId(params.sessionId);
   if (!sessionId) {
@@ -130,6 +131,7 @@ function claudeCliSessionTranscriptPath(params: {
     resolveClaudeCliProjectDirForWorkspace({
       workspaceDir,
       homeDir: params.homeDir,
+      projectsRoot: params.projectsRoot,
     }),
     `${sessionId}.jsonl`,
   );
@@ -143,11 +145,13 @@ export async function claudeCliSessionTranscriptHasContent(params: {
   sessionId: string | undefined;
   workspaceDir: string | undefined;
   homeDir?: string;
+  projectsRoot?: string;
 }): Promise<boolean> {
   const expectedPath = claudeCliSessionTranscriptPath({
     sessionId: params.sessionId,
     workspaceDir: params.workspaceDir,
     homeDir: params.homeDir,
+    projectsRoot: params.projectsRoot,
   });
   if (!expectedPath) {
     return false;
@@ -279,11 +283,13 @@ export async function claudeCliSessionTranscriptHasOrphanedToolUse(params: {
   sessionId: string | undefined;
   workspaceDir: string | undefined;
   homeDir?: string;
+  projectsRoot?: string;
 }): Promise<boolean> {
   const expectedPath = claudeCliSessionTranscriptPath({
     sessionId: params.sessionId,
     workspaceDir: params.workspaceDir,
     homeDir: params.homeDir,
+    projectsRoot: params.projectsRoot,
   });
   if (!expectedPath) {
     return false;
@@ -456,6 +462,7 @@ export function buildClaudeCliFallbackContextPrelude(params: {
   cliSessionId: string | undefined;
   homeDir?: string;
   cwd?: string;
+  projectsRoot?: string;
   charBudget?: number;
 }): string {
   const sessionId = params.cliSessionId?.trim();
@@ -466,6 +473,7 @@ export function buildClaudeCliFallbackContextPrelude(params: {
     cliSessionId: sessionId,
     homeDir: params.homeDir,
     cwd: params.cwd,
+    projectsRoot: params.projectsRoot,
   });
   if (!seed) {
     return "";

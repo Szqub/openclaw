@@ -737,6 +737,7 @@ export function runAgentAttempt(params: {
           cwd:
             claudeCliBinding?.cwd ??
             (params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir),
+          projectsRoot: claudeCliBinding?.transcriptRoot,
         })
       : "";
   const resolvedPrompt = resolveFallbackRetryPrompt({
@@ -1014,6 +1015,7 @@ export function runAgentAttempt(params: {
             (await claudeCliSessionTranscriptHasContent({
               sessionId: cliSessionBinding.sessionId,
               workspaceDir: cliProcessCwd,
+              projectsRoot: cliSessionBinding.transcriptRoot,
             }))
           ) {
             return cliSessionBinding;

@@ -143,6 +143,8 @@ export type CliSessionBinding = {
   promptToolNamesHash?: string;
   /** Native working directory for locating relative external transcript roots after restart. */
   cwd?: string;
+  /** External transcript root selected by the child's effective environment and working directory. */
+  transcriptRoot?: string;
   cwdHash?: string;
   mcpConfigHash?: string;
   mcpResumeHash?: string;

@@ -112,6 +112,9 @@ export function setCliSessionBinding(
         ? { promptToolNamesHash: normalizeOptionalString(binding.promptToolNamesHash) }
         : {}),
       ...(typeof binding.cwd === "string" && binding.cwd ? { cwd: binding.cwd } : {}),
+      ...(typeof binding.transcriptRoot === "string" && binding.transcriptRoot
+        ? { transcriptRoot: binding.transcriptRoot }
+        : {}),
       ...(normalizeOptionalString(binding.cwdHash)
         ? { cwdHash: normalizeOptionalString(binding.cwdHash) }
         : {}),

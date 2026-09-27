@@ -8,6 +8,10 @@ import {
   readClaudeCliFallbackSeed,
   readClaudeCliSessionMessages,
 } from "./cli-session-history.claude.js";
+import {
+  readChatHistoryCliSessionImportSnapshot,
+  resolveChatHistoryWithCliSessionImports,
+} from "./cli-session-history.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const sessionId = "native-history-session";
@@ -106,6 +110,41 @@ describe("Claude configured transcript roots", () => {
       expect(JSON.stringify(messages)).not.toContain("Wrong lexical parent");
     }
   });
+
+  it.each(["retained", "legacy"] as const)(
+    "reads a reloaded %s binding through the root the child actually used",
+    async (kind) => {
+      const params = await fixture();
+      const childRoot = path.join(params.root, "child profile");
+      const gatewayRoot = path.join(params.root, "gateway profile");
+      await writeTranscript(gatewayRoot, "Wrong gateway history");
+      await writeTranscript(childRoot, "Child native history");
+      // Legacy bindings predate the retained root and can only follow the Gateway environment.
+      vi.stubEnv("CLAUDE_CONFIG_DIR", kind === "retained" ? gatewayRoot : childRoot);
+      const entry = {
+        sessionId: "openclaw-session",
+        updatedAt: Date.now(),
+        cliSessionBindings: {
+          "claude-cli": {
+            sessionId,
+            cwd: params.cwd,
+            ...(kind === "retained" ? { transcriptRoot: path.join(childRoot, "projects") } : {}),
+          },
+        },
+      };
+      const lookup = { entry, provider: "claude-cli", localMessages: [], homeDir: params.homeDir };
+      for (const result of [
+        resolveChatHistoryWithCliSessionImports(lookup),
+        resolveChatHistoryWithCliSessionImports({
+          ...lookup,
+          preparedImportedMessages: await readChatHistoryCliSessionImportSnapshot(lookup),
+        }),
+      ]) {
+        expect(JSON.stringify(result.messages)).toContain("Child native history");
+        expect(JSON.stringify(result.messages)).not.toContain("Wrong gateway history");
+      }
+    },
+  );
 
   it("invalidates the imported snapshot when the selected profile changes", async () => {
     const params = await fixture();

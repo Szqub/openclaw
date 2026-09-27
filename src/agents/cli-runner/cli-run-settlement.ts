@@ -23,6 +23,7 @@ import { mergeAttemptToolMediaPayloads } from "../embedded-agent-runner/run/tool
 import { coerceToFailoverError, isFailoverError } from "../failover-error.js";
 import { recordAgentCleanupFailure } from "../run-cleanup-timeout.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
+import { claudeCliBindingLocation } from "./child-env.js";
 import { runCliCleanup } from "./cleanup.js";
 import { hashCliReseedPrompt } from "./reseed-envelope.js";
 import type { ClaudeCliRunDiagnosticLifecycle } from "./run-diagnostics.js";
@@ -641,9 +642,7 @@ export function buildCliRunResult(params: {
                 ...(context.promptToolNamesHash
                   ? { promptToolNamesHash: context.promptToolNamesHash }
                   : {}),
-                ...(isClaudeCliBackend(runParams.provider) && context.cwd
-                  ? { cwd: context.cwd }
-                  : {}),
+                ...claudeCliBindingLocation(runParams.provider, context),
                 ...(context.cwdHash ? { cwdHash: context.cwdHash } : {}),
                 ...(context.preparedBackend.mcpConfigHash
                   ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }

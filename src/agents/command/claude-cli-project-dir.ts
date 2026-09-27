@@ -41,7 +41,17 @@ type ClaudeCliProjectsRootParams = {
   homeDir?: string;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  /** Root already selected from the Claude child's effective environment and cwd. */
+  projectsRoot?: string;
 };
+
+// A retained root records the environment the child actually ran with, which the
+// Gateway's own environment cannot reproduce.
+function retainedProjectsRoot(params: ClaudeCliProjectsRootParams): string | undefined {
+  return typeof params.projectsRoot === "string" && params.projectsRoot
+    ? params.projectsRoot
+    : undefined;
+}
 
 function resolveClaudeCliProjectsDir(params: ClaudeCliProjectsRootParams): string {
   const env = params.env ?? process.env;
@@ -61,11 +71,12 @@ export function resolveClaudeCliProjectDirForWorkspace(params: {
   workspaceDir: string;
   homeDir?: string;
   env?: NodeJS.ProcessEnv;
+  projectsRoot?: string;
 }): string {
   const canonicalWorkspaceDir = canonicalizeWorkspaceDir(params.workspaceDir);
   return path.resolve(
     canonicalWorkspaceDir,
-    resolveClaudeCliProjectsDir(params),
+    retainedProjectsRoot(params) ?? resolveClaudeCliProjectsDir(params),
     sanitizeClaudeCliProjectKey(canonicalWorkspaceDir),
   );
 }
@@ -74,6 +85,10 @@ export function resolveClaudeCliProjectDirForWorkspace(params: {
 export function resolveClaudeCliProjectsRoot(
   params: ClaudeCliProjectsRootParams,
 ): string | undefined {
+  const retained = retainedProjectsRoot(params);
+  if (retained) {
+    return retained;
+  }
   const projectsDir = resolveClaudeCliProjectsDir(params);
   if (isFullyQualifiedProjectsDir(projectsDir)) {
     return projectsDir;
@@ -85,6 +100,10 @@ export function resolveClaudeCliProjectsRoot(
 export async function resolveClaudeCliProjectsRootAsync(
   params: ClaudeCliProjectsRootParams,
 ): Promise<string | undefined> {
+  const retained = retainedProjectsRoot(params);
+  if (retained) {
+    return retained;
+  }
   const projectsDir = resolveClaudeCliProjectsDir(params);
   if (isFullyQualifiedProjectsDir(projectsDir)) {
     return projectsDir;
