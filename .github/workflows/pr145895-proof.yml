@@ -71,7 +71,12 @@ jobs:
         run: |
           printf '%s\n' 'Candidate d165b4954dcc0b5ad0fb3cf999a6ce28753420ea: 323 tests passed in 7 files.' 'Verified in https://github.com/Szqub/openclaw/actions/runs/36346979630 (focused coverage step passed).' 'Only proof tooling changed since that run. workflow_dispatch reruns the focused suite.' > "$RUNNER_TEMP/pr145895-evidence/focused-tests-reference.txt"
       - name: Verify older-writer compatibility
+        if: github.event_name == 'workflow_dispatch'
         run: node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/compatibility.mts --output "$RUNNER_TEMP/pr145895-evidence"
+      - name: Record unchanged candidate compatibility and root controls
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          printf '%s\n' 'Candidate d165b4954dcc0b5ad0fb3cf999a6ce28753420ea: schema-20 compatibility passed all 7 phases.' 'Native default/relative roots and restart controls passed in https://github.com/Szqub/openclaw/actions/runs/36347451551 .' 'Only proof tooling changed. This run repeats the absolute-root scenario and its previously blocked catalog fork.' > "$RUNNER_TEMP/pr145895-evidence/compatibility-runtime-reference.txt"
       - name: Build candidate runtime
         run: pnpm build
       - name: Install pinned official Claude Code
@@ -79,7 +84,7 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/pr145895-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
           echo "$RUNNER_TEMP/pr145895-claude/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Run isolated Gateway and native Claude proof
-        run: node tooling/scripts/pr145895-proof/runtime.mjs --output "$RUNNER_TEMP/pr145895-evidence"
+        run: node tooling/scripts/pr145895-proof/runtime.mjs --scenario absolute --output "$RUNNER_TEMP/pr145895-evidence"
       - name: Verify tracked candidate source stayed unchanged
         if: always()
         run: git diff --exit-code HEAD

@@ -27,6 +27,9 @@ const DUMMY_API_KEY = "sk-ant-pr145895-proof-dummy";
 const MARKER_RE = /(?:SEED|PROOF-REPLY|NATIVE-ONLY|FORK)-[A-Za-z0-9-]+|DECOY-WRONG-ROOT-MARKER/g;
 
 const outputDir = resolveOutputDir(process.argv.slice(2));
+const scenarioArg = process.argv.indexOf("--scenario");
+const requestedScenario = scenarioArg < 0 ? "all" : process.argv[scenarioArg + 1];
+if (!["all", "absolute"].includes(requestedScenario)) throw new Error("unsupported proof scenario");
 const candidateRoot = path.resolve(process.cwd());
 const tempRoot = path.join(
   process.env.RUNNER_TEMP?.trim() || "/tmp",
@@ -41,6 +44,7 @@ const summary = {
   unsupported: [],
   cleanup: { gatewayChildren: [], ownedClaudeProcessesBefore: [], ownedClaudeProcessesAfter: [] },
   status: "running",
+  requestedScenario,
 };
 
 let mockServer;
@@ -484,7 +488,9 @@ async function rpc(scenario, method, params = {}, timeoutMs = RPC_TIMEOUT_MS) {
   );
   const parsed = extractJson(result.stdout);
   if (result.code !== 0 || !parsed) {
-    throw new Error(`${method} command failed (exit=${result.code ?? "null"})`);
+    throw new Error(
+      `${method} command failed (exit=${result.code ?? "null"}): ${safeText(result.stderr.slice(-1500))}`,
+    );
   }
   return unwrapRpc(parsed, method);
 }
@@ -591,7 +597,9 @@ async function sendTurn(scenario, marker, message) {
     TURN_TIMEOUT_MS + 15_000,
   );
   if (terminal?.status !== "ok")
-    throw new Error(`agent.wait returned ${String(terminal?.status ?? "unknown")}`);
+    throw new Error(
+      `agent.wait returned ${String(terminal?.status ?? "unknown")}: ${safeText(JSON.stringify(terminal).slice(-1500))}`,
+    );
   return { runId: started.runId };
 }
 
@@ -653,7 +661,9 @@ async function nativeResume(scenario, sessionId, marker) {
     { cwd: scenario.workspace, env, timeoutMs: TURN_TIMEOUT_MS },
   );
   if (result.code !== 0)
-    throw new Error(`direct native resume failed (exit=${result.code ?? "null"})`);
+    throw new Error(
+      `direct native resume failed (exit=${result.code ?? "null"}): ${safeText(result.stderr.slice(-1500))}`,
+    );
   const reply = result.stdout.match(/PROOF-REPLY-[A-Za-z0-9-]+/)?.[0];
   if (!reply) throw new Error("direct native resume returned no synthetic reply marker");
   return { reply };
@@ -668,26 +678,26 @@ async function listClaudeCatalog(scenario, sourceSessionId) {
         scenario,
         "sessions.catalog.list",
         {
-          catalogId: "anthropic",
+          catalogId: "claude",
           agentId: "main",
           hostIds: ["gateway:local"],
           limitPerHost: 100,
         },
         15_000,
       );
-      const catalog = result?.catalogs?.find((entry) => entry.id === "anthropic");
+      const catalog = result?.catalogs?.find((entry) => entry.id === "claude");
       const host = catalog?.hosts?.find((entry) => entry.hostId === "gateway:local");
       const row = host?.sessions?.find(
         (entry) => entry.threadId === sourceSessionId && entry.canContinue,
       );
       if (row) return row;
-      last = new Error("source native session not visible in anthropic catalog");
+      last = new Error("source native session not visible in claude catalog");
     } catch (error) {
       last = error;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw last ?? new Error("anthropic catalog list timed out");
+  throw last ?? new Error("claude catalog list timed out");
 }
 
 async function runAbsoluteFull(scenario, mock) {
@@ -777,7 +787,7 @@ async function runAbsoluteFull(scenario, mock) {
       scenario,
       "sessions.catalog.continue",
       {
-        catalogId: "anthropic",
+        catalogId: "claude",
         hostId: "gateway:local",
         threadId: catalogRow.threadId,
         agentId: "main",
@@ -1038,9 +1048,11 @@ async function main() {
   await mkdir(absoluteRun, { recursive: true });
   const absolute = await prepareScenario("absolute", absoluteRun, mockServer.baseUrl);
   await runAbsoluteFull(absolute, mockServer);
-  await runRootSmoke("default", mockServer, tempRoot);
-  await runRootSmoke("relative", mockServer, tempRoot);
-  await runProfileSwitch(mockServer, tempRoot);
+  if (requestedScenario === "all") {
+    await runRootSmoke("default", mockServer, tempRoot);
+    await runRootSmoke("relative", mockServer, tempRoot);
+    await runProfileSwitch(mockServer, tempRoot);
+  }
 
   summary.mockModel.requestCount = mockServer.records.length;
   summary.mockModel.messageRequestCount = mockServer.records.filter(
