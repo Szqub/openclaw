@@ -39,7 +39,6 @@ import { executeDeps } from "./execute-deps.js";
 import { createCliEventHandlers } from "./execute-events.js";
 import {
   buildCliExecLogLine,
-  CLAUDE_SELECTED_AUTH_ENV_KEYS,
   logCliInvocation,
   NODE_CLAUDE_FORWARD_ENV_KEYS,
   resolveNodeClaudeAuthEnv,
@@ -379,16 +378,18 @@ export async function executePreparedCliRun(
           });
       cleanupMcpCaptureAttempt = mcpCaptureAttempt.cleanup;
       const preparedBackendEnv = context.preparedBackend.env ?? {};
-      const hasSelectedClaudeAuth =
-        Boolean(context.preparedBackend.secretInput) ||
-        [...CLAUDE_SELECTED_AUTH_ENV_KEYS].some((key) => Object.hasOwn(preparedBackendEnv, key));
-      const selectedClaudeClearEnv = hasSelectedClaudeAuth
-        ? new Set(backend.clearEnv ?? [])
-        : undefined;
-      const configuredBackendEnv = Object.fromEntries(
-        Object.entries(backend.env ?? {}).filter(([key]) => !selectedClaudeClearEnv?.has(key)),
-      );
-      const backendEnv = { ...configuredBackendEnv, ...preparedBackendEnv };
+      const childEnv = await buildCliChildEnv({
+        provider: params.provider,
+        backend,
+        preparedBackend: context.preparedBackend,
+        overlays: [mcpCaptureAttempt.env, localProcessEnv],
+        remote: Boolean(nodePlacement),
+        cwd: context.cwd ?? context.workspaceDir,
+      });
+      const env = childEnv.env;
+      const selectedClaudeClearEnv = childEnv.selectedClaudeClearEnv;
+      // The recovery copy above is local to this call; settlement reads the caller's context.
+      inputContext.claudeTranscriptRoot = childEnv.claudeTranscriptRoot;
       const nodeEnvEntries = Object.entries(preparedBackendEnv).filter(([key]) =>
         NODE_CLAUDE_FORWARD_ENV_KEYS.has(key),
       );
@@ -404,17 +405,6 @@ export async function executePreparedCliRun(
       const nodeClearEnv = [...(selectedClaudeClearEnv ?? []), ...nodeRuntimeClearEnv].filter(
         (key, index, values) => values.indexOf(key) === index,
       );
-      const childEnv = await buildCliChildEnv({
-        provider: params.provider,
-        backendClearEnv: backend.clearEnv,
-        selectedClaudeClearEnv,
-        backendEnv,
-        overlays: [mcpCaptureAttempt.env, localProcessEnv],
-        remote: Boolean(nodePlacement),
-        cwd: context.cwd ?? context.workspaceDir,
-      });
-      const env = childEnv.env;
-      context.claudeTranscriptRoot = childEnv.claudeTranscriptRoot;
 
       let executionCommand = backend.command;
       let executionArgv0: string | undefined;

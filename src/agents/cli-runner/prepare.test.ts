@@ -290,6 +290,14 @@ function createBundledMessageToolConfig(): OpenClawConfig {
   return createCliBackendConfig({ bundleMcp: true });
 }
 
+/** Root the upcoming Claude child selects when nothing overrides the Gateway environment. */
+function gatewayClaudeProjectsRoot(): string {
+  return path.join(
+    process.env.CLAUDE_CONFIG_DIR ?? path.join(process.env.HOME ?? os.homedir(), ".claude"),
+    "projects",
+  );
+}
+
 function setCliBackendForPrepareTest(
   params: {
     authEpochMode?: CliBackendPlugin["authEpochMode"];
@@ -5829,7 +5837,11 @@ describe("prepareCliRunContext", () => {
       cliSessionId: testCase.sessionId,
     });
 
-    const transcriptArgs = { sessionId: testCase.sessionId, workspaceDir: dir };
+    const transcriptArgs = {
+      sessionId: testCase.sessionId,
+      workspaceDir: dir,
+      projectsRoot: gatewayClaudeProjectsRoot(),
+    };
     if (testCase.checksTranscript) {
       expect(transcriptCheck).toHaveBeenCalledWith(transcriptArgs);
     } else {
@@ -6225,6 +6237,7 @@ describe("prepareCliRunContext", () => {
       expect(transcriptCheck).toHaveBeenCalledWith({
         sessionId: "warm-claude-sid",
         workspaceDir: dir,
+        projectsRoot: gatewayClaudeProjectsRoot(),
       });
       expect(orphanCheck).not.toHaveBeenCalled();
       expect(context.reusableCliSession).toEqual({
@@ -6369,11 +6382,48 @@ describe("prepareCliRunContext", () => {
     expect(transcriptCheck).toHaveBeenCalledWith({
       sessionId: "live-claude-sid",
       workspaceDir: taskDir,
+      projectsRoot: gatewayClaudeProjectsRoot(),
     });
     expect(context.reusableCliSession).toEqual({
       mode: "reuse",
       sessionId: "live-claude-sid",
     });
+  });
+
+  it("checks the claude-cli transcript under the config dir the next child receives", async () => {
+    const { dir } = fixture.session;
+    const childConfigDir = path.join(dir, "child-claude-profile");
+    setCliBackendForPrepareTest({
+      prepareExecution: async () => ({ env: { CLAUDE_CONFIG_DIR: childConfigDir } }),
+    });
+    const transcriptCheck = vi.fn(async () => true);
+    const orphanCheck = vi.fn(async () => false);
+    setCliRunnerPrepareTestDeps({
+      claudeCliSessionTranscriptHasContent: transcriptCheck,
+      claudeCliSessionTranscriptHasOrphanedToolUse: orphanCheck,
+    });
+
+    await fixture.prepare({
+      sessionKey: "agent:main:telegram:direct:peer",
+      prompt: "follow-up",
+      provider: "claude-cli",
+      model: "opus",
+      // The stored root belongs to the profile a previous run wrote under.
+      cliSessionBinding: {
+        sessionId: "moved-claude-sid",
+        cwdHash: hashCliSessionText(dir),
+        transcriptRoot: path.join(dir, "previous-claude-profile", "projects"),
+      },
+      cliSessionId: "moved-claude-sid",
+    });
+
+    const expectedArgs = {
+      sessionId: "moved-claude-sid",
+      workspaceDir: dir,
+      projectsRoot: path.join(childConfigDir, "projects"),
+    };
+    expect(transcriptCheck).toHaveBeenCalledWith(expectedArgs);
+    expect(orphanCheck).toHaveBeenCalledWith(expectedArgs);
   });
 
   it.each(["prepared", "admitted"] as const)(

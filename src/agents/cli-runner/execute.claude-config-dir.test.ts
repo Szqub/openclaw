@@ -28,6 +28,7 @@ async function runWithChildConfigDir(params: {
   hostConfigDir?: string;
   childConfigDir?: string;
   workspaceDir: string;
+  recoverHistory?: boolean;
 }) {
   const context = buildPreparedCliRunContext({
     provider: "claude-cli",
@@ -36,6 +37,21 @@ async function runWithChildConfigDir(params: {
       ? {}
       : { preparedEnv: { CLAUDE_CONFIG_DIR: params.childConfigDir } }),
   });
+  if (params.recoverHistory) {
+    context.openClawHistoryPrompt = "recovered history";
+    context.cliHistoryWriter = {
+      target: {
+        agentId: "main",
+        sessionId: context.params.sessionId,
+        sessionKey: "agent:main:test",
+        storePath: path.join(params.workspaceDir, "sessions.db"),
+      },
+      runId: context.params.runId,
+      authFingerprint: "f".repeat(64),
+      assertCurrent: () => {},
+      assertReadable: () => {},
+    };
+  }
   supervisorSpawnMock.mockResolvedValue(
     createManagedRun({
       ...createSuccessfulProcessExit(),
@@ -86,6 +102,17 @@ describe("Claude CLI transcript root retention", () => {
     });
     expect(childConfigDir).toBe(hostConfigDir);
     expect(retained).toBe(path.join(hostConfigDir, "projects"));
+  });
+
+  it("retains the child override on the caller's context during history recovery", async () => {
+    const childConfigDir = path.join(os.tmpdir(), "recovered-child-claude");
+    const { retained } = await runWithChildConfigDir({
+      hostConfigDir: path.join(os.tmpdir(), "host-claude"),
+      childConfigDir,
+      workspaceDir: path.join(os.tmpdir(), "workspace"),
+      recoverHistory: true,
+    });
+    expect(retained).toBe(path.join(childConfigDir, "projects"));
   });
 
   it("retains the native home default when no config dir is selected", async () => {
