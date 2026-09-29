@@ -408,6 +408,78 @@ describe("Claude configured transcript roots", () => {
     },
   );
 
+  it.each(
+    ["explicit", "configured-cwd", "workspace"].flatMap((source) =>
+      ["relative profile", ""].map((configDir) => ({ source, configDir })),
+    ),
+  )(
+    "rejects changed current cwd from $source for '$configDir' before native I/O",
+    async ({ source, configDir }) => {
+      const params = await fixture();
+      const previousConfig = getRuntimeConfigSnapshot();
+      const nextCwd = path.join(params.root, "next child cwd");
+      await fs.mkdir(nextCwd);
+      const retainedRoot = path.join(params.cwd, configDir, "projects");
+      await writeTranscript(path.join(params.cwd, configDir), "Retained cwd native history");
+      vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+      const configureCwd = (cwd: string) => {
+        setRuntimeConfigSnapshot({
+          agents: {
+            list: [{ id: "main", ...(source === "configured-cwd" ? { cwd } : {}), workspace: cwd }],
+          },
+        });
+      };
+      const localMessages = [{ role: "user", content: "Canonical local history" }];
+      const lookup = {
+        agentId: "main",
+        homeDir: params.homeDir,
+        cwd: source === "explicit" ? params.cwd : undefined,
+        localMessages,
+        entry: {
+          sessionId: "openclaw-session",
+          updatedAt: 1,
+          cliSessionBindings: {
+            "claude-cli": { sessionId, cwd: params.cwd, transcriptRoot: retainedRoot },
+          },
+        },
+      };
+      const syncReader = vi.spyOn(nativeHistory, "readClaudeCliSessionMessages");
+      const asyncReader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+      try {
+        configureCwd(params.cwd);
+        const preparedImportedMessages = await readChatHistoryCliSessionImportSnapshot(lookup);
+        expect(JSON.stringify(preparedImportedMessages)).toContain("Retained cwd native history");
+        expect(asyncReader).toHaveBeenCalledOnce();
+        asyncReader.mockClear();
+        configureCwd(nextCwd);
+        if (source === "explicit") lookup.cwd = nextCwd;
+        expect(
+          await readChatHistoryCliSessionImportSnapshot(lookup),
+          "CURRENT_CWD_READ_DENIED: a retained cwd must not authorize a former relative root",
+        ).toEqual([]);
+        for (const request of [lookup, { ...lookup, preparedImportedMessages }]) {
+          expect(resolveChatHistoryWithCliSessionImports(request)).toEqual({
+            messages: localMessages,
+            imported: false,
+            expanded: false,
+          });
+        }
+        expect(syncReader).not.toHaveBeenCalled();
+        expect(asyncReader).not.toHaveBeenCalled();
+        expect(lookup.entry.cliSessionBindings["claude-cli"]).toEqual({
+          sessionId,
+          cwd: params.cwd,
+          transcriptRoot: retainedRoot,
+        });
+      } finally {
+        syncReader.mockRestore();
+        asyncReader.mockRestore();
+        if (previousConfig) setRuntimeConfigSnapshot(previousConfig);
+        else clearRuntimeConfigSnapshot();
+      }
+    },
+  );
+
   it("invalidates the imported snapshot when the selected profile changes", async () => {
     const params = await fixture();
     const firstRoot = path.join(params.root, "first-profile");
