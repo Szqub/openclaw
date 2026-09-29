@@ -10,12 +10,44 @@ on:
         description: Verification scope
         type: choice
         default: all
-        options: [all, runtime, upgrade]
+        options: [all, runtime, upgrade, cwd-before]
 
 permissions:
   contents: read
 
 jobs:
+  cwd-before:
+    if: github.repository == 'Szqub/openclaw' && inputs.lane == 'cwd-before'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "26.x"
+          install-bun: "false"
+          install-deps: "false"
+          cache-mode: "off"
+      - run: pnpm install --frozen-lockfile
+      - name: Prove current-cwd rejection fails before the repair
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr145895-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
+          set +e
+          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts -t 'rejects changed current cwd' --maxWorkers=1 > "$RUNNER_TEMP/pr145895-evidence/cwd-before.log" 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync(process.argv[1],"utf8").replace(/\x1b\[[0-9;]*m/g, ""); assert.match(log,/AssertionError: CURRENT_CWD_READ_DENIED/); assert.match(log,/Tests\s+6 failed/);' "$RUNNER_TEMP/pr145895-evidence/cwd-before.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr145895-cwd-before
+          path: ${{ runner.temp }}/pr145895-evidence
+          retention-days: 30
   history:
     if: github.repository == 'Szqub/openclaw' && inputs.lane == 'all'
     runs-on: ubuntu-24.04
@@ -78,7 +110,7 @@ jobs:
           path: ${{ runner.temp }}/pr145895-evidence
           retention-days: 30
   release-and-runtime:
-    if: github.repository == 'Szqub/openclaw'
+    if: github.repository == 'Szqub/openclaw' && inputs.lane != 'cwd-before'
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     steps:
