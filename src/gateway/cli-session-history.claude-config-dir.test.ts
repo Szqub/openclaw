@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as nativeSnapshot from "./cli-session-history.claude-snapshot.js";
 import { readClaudeCliSessionMessagesAsync } from "./cli-session-history.claude-snapshot.js";
+import * as nativeHistory from "./cli-session-history.claude.js";
 import {
   readClaudeCliFallbackSeed,
   readClaudeCliSessionMessages,
@@ -119,8 +121,7 @@ describe("Claude configured transcript roots", () => {
       const gatewayRoot = path.join(params.root, "gateway profile");
       await writeTranscript(gatewayRoot, "Wrong gateway history");
       await writeTranscript(childRoot, "Child native history");
-      // Legacy bindings predate the retained root and can only follow the Gateway environment.
-      vi.stubEnv("CLAUDE_CONFIG_DIR", kind === "retained" ? gatewayRoot : childRoot);
+      vi.stubEnv("CLAUDE_CONFIG_DIR", childRoot);
       const entry = {
         sessionId: "openclaw-session",
         updatedAt: Date.now(),
@@ -133,6 +134,8 @@ describe("Claude configured transcript roots", () => {
         },
       };
       const lookup = { entry, provider: "claude-cli", localMessages: [], homeDir: params.homeDir };
+      const syncReader = vi.spyOn(nativeHistory, "readClaudeCliSessionMessages");
+      const asyncReader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
       for (const result of [
         resolveChatHistoryWithCliSessionImports(lookup),
         resolveChatHistoryWithCliSessionImports({
@@ -142,6 +145,62 @@ describe("Claude configured transcript roots", () => {
       ]) {
         expect(JSON.stringify(result.messages)).toContain("Child native history");
         expect(JSON.stringify(result.messages)).not.toContain("Wrong gateway history");
+      }
+      expect(syncReader).toHaveBeenCalledOnce();
+      expect(asyncReader).toHaveBeenCalledOnce();
+      syncReader.mockRestore();
+      asyncReader.mockRestore();
+    },
+  );
+
+  it.each(["changed", "unset"] as const)(
+    "rejects a %s profile before retained native-history I/O",
+    async (kind) => {
+      const params = await fixture();
+      const childRoot = path.join(params.root, "child profile");
+      await writeTranscript(childRoot, "Retained native history");
+      vi.stubEnv("CLAUDE_CONFIG_DIR", childRoot);
+      const entry = {
+        sessionId: "openclaw-session",
+        updatedAt: 1,
+        cliSessionBindings: {
+          "claude-cli": {
+            sessionId,
+            cwd: params.cwd,
+            transcriptRoot: path.join(childRoot, "projects"),
+          },
+        },
+      };
+      const localMessages = [{ role: "user", content: "Local history survives" }];
+      const lookup = { entry, provider: "claude-cli", localMessages, homeDir: params.homeDir };
+      const preparedImportedMessages = await readChatHistoryCliSessionImportSnapshot(lookup);
+      expect(JSON.stringify(preparedImportedMessages)).toContain("Retained native history");
+      vi.stubEnv(
+        "CLAUDE_CONFIG_DIR",
+        kind === "changed" ? path.join(params.root, "new profile") : undefined,
+      );
+      const syncReader = vi.spyOn(nativeHistory, "readClaudeCliSessionMessages");
+      const asyncReader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+      try {
+        expect(
+          await readChatHistoryCliSessionImportSnapshot(lookup),
+          "CURRENT_PROFILE_READ_DENIED: changed profiles must not import retained history",
+        ).toEqual([]);
+        for (const request of [lookup, { ...lookup, preparedImportedMessages }]) {
+          expect(resolveChatHistoryWithCliSessionImports(request)).toEqual({
+            messages: localMessages,
+            imported: false,
+            expanded: false,
+          });
+        }
+        expect(syncReader).not.toHaveBeenCalled();
+        expect(asyncReader).not.toHaveBeenCalled();
+        expect(entry.cliSessionBindings["claude-cli"].transcriptRoot).toBe(
+          path.join(childRoot, "projects"),
+        );
+      } finally {
+        syncReader.mockRestore();
+        asyncReader.mockRestore();
       }
     },
   );

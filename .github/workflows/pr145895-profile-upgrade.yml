@@ -1,0 +1,44 @@
+name: Claude profile and release upgrade proof
+
+on:
+  push:
+    branches: [proof/claude-profile-upgrade-20260929]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    if: github.repository == 'Szqub/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "26.x"
+          install-bun: "false"
+          install-deps: "false"
+          cache-mode: "off"
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify regression detects the original history boundary
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr145895-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
+          set +e
+          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts -t 'rejects a .* profile before retained native-history I/O' > "$RUNNER_TEMP/pr145895-evidence/history-before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/pr145895-evidence/history-before.log"
+          test "$result" -ne 0
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync(process.argv[1],"utf8"); assert.match(log,/AssertionError: CURRENT_PROFILE_READ_DENIED/); assert.match(log,/Retained native history/);' "$RUNNER_TEMP/pr145895-evidence/history-before.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr145895-history-before
+          path: ${{ runner.temp }}/pr145895-evidence
+          retention-days: 30
