@@ -10,12 +10,7 @@ import {
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
 import * as nativeSnapshot from "./cli-session-history.claude-snapshot.js";
-import { readClaudeCliSessionMessagesAsync } from "./cli-session-history.claude-snapshot.js";
 import * as nativeHistory from "./cli-session-history.claude.js";
-import {
-  readClaudeCliFallbackSeed,
-  readClaudeCliSessionMessages,
-} from "./cli-session-history.claude.js";
 import {
   readChatHistoryCliSessionImportSnapshot,
   resolveChatHistoryWithCliSessionImports,
@@ -95,9 +90,9 @@ describe("Claude configured transcript roots", () => {
         localMessages: [],
       };
       for (const result of [
-        readClaudeCliSessionMessages(params),
-        await readClaudeCliSessionMessagesAsync(params),
-        readClaudeCliFallbackSeed(params),
+        nativeHistory.readClaudeCliSessionMessages(params),
+        await nativeSnapshot.readClaudeCliSessionMessagesAsync(params),
+        nativeHistory.readClaudeCliFallbackSeed(params),
         resolveChatHistoryWithCliSessionImports(historyParams).messages,
         await readChatHistoryCliSessionImportSnapshot(historyParams),
       ]) {
@@ -216,9 +211,9 @@ describe("Claude configured transcript roots", () => {
     vi.stubEnv("CLAUDE_CONFIG_DIR", "relative profile");
     await writeTranscript(path.join(homeDir, ".claude"), "Wrong default history");
     const params = { cliSessionId: sessionId, homeDir };
-    expect(readClaudeCliSessionMessages(params)).toEqual([]);
-    expect(await readClaudeCliSessionMessagesAsync(params)).toEqual([]);
-    expect(readClaudeCliFallbackSeed(params)).toBeUndefined();
+    expect(nativeHistory.readClaudeCliSessionMessages(params)).toEqual([]);
+    expect(await nativeSnapshot.readClaudeCliSessionMessagesAsync(params)).toEqual([]);
+    expect(nativeHistory.readClaudeCliFallbackSeed(params)).toBeUndefined();
   });
 
   it("does not resolve a node-placed rootless binding against Gateway files", async () => {
@@ -260,8 +255,8 @@ describe("Claude configured transcript roots", () => {
     await writeTranscript(path.join(params.root, "physical", "profile"), "Physical native history");
     const lookup = { ...params, cwd: logicalCwd };
     for (const messages of [
-      readClaudeCliSessionMessages(lookup),
-      await readClaudeCliSessionMessagesAsync(lookup),
+      nativeHistory.readClaudeCliSessionMessages(lookup),
+      await nativeSnapshot.readClaudeCliSessionMessagesAsync(lookup),
     ]) {
       expect(JSON.stringify(messages)).toContain("Physical native history");
       expect(JSON.stringify(messages)).not.toContain("Wrong lexical parent");
@@ -367,9 +362,11 @@ describe("Claude configured transcript roots", () => {
     await writeTranscript(firstRoot, "History from profile A");
     await writeTranscript(secondRoot, "History from profile B");
     vi.stubEnv("CLAUDE_CONFIG_DIR", firstRoot);
-    expect(JSON.stringify(await readClaudeCliSessionMessagesAsync(params))).toContain("profile A");
+    expect(
+      JSON.stringify(await nativeSnapshot.readClaudeCliSessionMessagesAsync(params)),
+    ).toContain("profile A");
     vi.stubEnv("CLAUDE_CONFIG_DIR", secondRoot);
-    const messages = await readClaudeCliSessionMessagesAsync(params);
+    const messages = await nativeSnapshot.readClaudeCliSessionMessagesAsync(params);
     expect(JSON.stringify(messages)).toContain("profile B");
     expect(JSON.stringify(messages)).not.toContain("profile A");
   });
