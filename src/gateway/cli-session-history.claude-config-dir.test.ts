@@ -3,6 +3,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as cliBackends from "../agents/cli-backends.js";
+import {
+  clearRuntimeConfigSnapshot,
+  getRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import * as nativeSnapshot from "./cli-session-history.claude-snapshot.js";
 import { readClaudeCliSessionMessagesAsync } from "./cli-session-history.claude-snapshot.js";
 import * as nativeHistory from "./cli-session-history.claude.js";
@@ -73,13 +79,134 @@ describe("Claude configured transcript roots", () => {
         await writeTranscript(defaultRoot, "Wrong default history");
       }
       await writeTranscript(selectedRoot, "Selected native history");
+      const historyParams = {
+        ...params,
+        entry: {
+          sessionId: "openclaw-session",
+          updatedAt: 1,
+          cliSessionBindings: {
+            "claude-cli": {
+              sessionId,
+              cwd: params.cwd,
+              transcriptRoot: path.join(selectedRoot, "projects"),
+            },
+          },
+        },
+        localMessages: [],
+      };
       for (const result of [
         readClaudeCliSessionMessages(params),
         await readClaudeCliSessionMessagesAsync(params),
         readClaudeCliFallbackSeed(params),
+        resolveChatHistoryWithCliSessionImports(historyParams).messages,
+        await readChatHistoryCliSessionImportSnapshot(historyParams),
       ]) {
         expect(JSON.stringify(result)).toContain("Selected native history");
         expect(JSON.stringify(result)).not.toContain("Wrong default history");
+      }
+    },
+  );
+
+  it("uses the current skill configuration to authorize a retained profile", async () => {
+    const params = await fixture();
+    const previousConfig = getRuntimeConfigSnapshot();
+    const childRoot = path.join(params.root, "skill profile");
+    await writeTranscript(childRoot, "Skill-selected native history");
+    vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
+    const lookup = {
+      ...params,
+      localMessages: [],
+      entry: {
+        sessionId: "openclaw-session",
+        updatedAt: 1,
+        skillsSnapshot: { prompt: "", skills: [{ name: "native-profile" }] },
+        cliSessionBindings: {
+          "claude-cli": {
+            sessionId,
+            cwd: params.cwd,
+            transcriptRoot: path.join(childRoot, "projects"),
+          },
+        },
+      },
+    };
+    const reader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+    try {
+      setRuntimeConfigSnapshot({
+        skills: { entries: { "native-profile": { env: { CLAUDE_CONFIG_DIR: childRoot } } } },
+      });
+      expect(JSON.stringify(await readChatHistoryCliSessionImportSnapshot(lookup))).toContain(
+        "Skill-selected native history",
+      );
+      expect(reader).toHaveBeenCalledOnce();
+      reader.mockClear();
+      setRuntimeConfigSnapshot({ skills: { entries: { "native-profile": { enabled: false } } } });
+      expect(await readChatHistoryCliSessionImportSnapshot(lookup)).toEqual([]);
+      expect(reader).not.toHaveBeenCalled();
+    } finally {
+      reader.mockRestore();
+      if (previousConfig) {
+        setRuntimeConfigSnapshot(previousConfig);
+      } else {
+        clearRuntimeConfigSnapshot();
+      }
+    }
+  });
+
+  it.each(["override", "clear"] as const)(
+    "authorizes retained history using the backend's current %s environment",
+    async (kind) => {
+      const params = await fixture();
+      const selectedRoot =
+        kind === "clear"
+          ? path.join(params.homeDir, ".claude")
+          : path.join(params.root, "backend profile");
+      await writeTranscript(selectedRoot, "Backend-selected native history");
+      vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(params.root, "gateway profile"));
+      const backend = vi.spyOn(cliBackends, "resolveCliBackendConfig").mockReturnValue({
+        id: "claude-cli",
+        bundleMcp: false,
+        config: {
+          command: "claude",
+          ...(kind === "clear"
+            ? { clearEnv: ["CLAUDE_CONFIG_DIR"] }
+            : { env: { CLAUDE_CONFIG_DIR: selectedRoot } }),
+        },
+      });
+      const reader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+      const lookup = {
+        ...params,
+        localMessages: [],
+        entry: {
+          sessionId: "openclaw-session",
+          updatedAt: 1,
+          cliSessionBindings: {
+            "claude-cli": {
+              sessionId,
+              cwd: params.cwd,
+              transcriptRoot: path.join(selectedRoot, "projects"),
+            },
+          },
+        },
+      };
+      try {
+        expect(JSON.stringify(await readChatHistoryCliSessionImportSnapshot(lookup))).toContain(
+          "Backend-selected native history",
+        );
+        expect(reader).toHaveBeenCalledOnce();
+        reader.mockClear();
+        backend.mockReturnValue({
+          id: "claude-cli",
+          bundleMcp: false,
+          config: {
+            command: "claude",
+            env: { CLAUDE_CONFIG_DIR: path.join(params.root, "new backend profile") },
+          },
+        });
+        expect(await readChatHistoryCliSessionImportSnapshot(lookup)).toEqual([]);
+        expect(reader).not.toHaveBeenCalled();
+      } finally {
+        backend.mockRestore();
+        reader.mockRestore();
       }
     },
   );
@@ -92,6 +219,34 @@ describe("Claude configured transcript roots", () => {
     expect(readClaudeCliSessionMessages(params)).toEqual([]);
     expect(await readClaudeCliSessionMessagesAsync(params)).toEqual([]);
     expect(readClaudeCliFallbackSeed(params)).toBeUndefined();
+  });
+
+  it("does not resolve a node-placed rootless binding against Gateway files", async () => {
+    const params = await fixture();
+    vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
+    await writeTranscript(path.join(params.homeDir, ".claude"), "Stale Gateway-native history");
+    const lookup = {
+      ...params,
+      localMessages: [],
+      entry: {
+        sessionId: "openclaw-session",
+        updatedAt: 1,
+        execHost: "node" as const,
+        execNode: "fixture-node",
+        cliSessionBindings: { "claude-cli": { sessionId } },
+      },
+    };
+    const syncReader = vi.spyOn(nativeHistory, "readClaudeCliSessionMessages");
+    const asyncReader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+    try {
+      expect(await readChatHistoryCliSessionImportSnapshot(lookup)).toEqual([]);
+      expect(resolveChatHistoryWithCliSessionImports(lookup).imported).toBe(false);
+      expect(syncReader).not.toHaveBeenCalled();
+      expect(asyncReader).not.toHaveBeenCalled();
+    } finally {
+      syncReader.mockRestore();
+      asyncReader.mockRestore();
+    }
   });
 
   it("resolves a symlinked child cwd before the relative parent path", async () => {

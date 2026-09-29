@@ -67,6 +67,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -356,6 +357,20 @@ class MainViewModel private constructor(
   private val chatDraftState = MutableStateFlow<ChatDraft?>(null)
   internal val chatDraft: StateFlow<ChatDraft?> = chatDraftState
   private val chatDraftLock = Any()
+  private val chatBrowserDismissalsState = MutableStateFlow<Map<ChatComposerOwner, List<String>>>(emptyMap())
+  internal val chatBrowserDismissals = chatBrowserDismissalsState.asStateFlow()
+
+  internal fun dismissChatBrowser(
+    owner: ChatComposerOwner,
+    presentation: List<String>,
+  ) {
+    chatBrowserDismissalsState.update { it + (owner to presentation) }
+  }
+
+  internal fun reopenChatBrowser(owner: ChatComposerOwner) {
+    chatBrowserDismissalsState.update { it - owner }
+  }
+
   private var attachedComposerRuntime: NodeRuntime? = null
   private var removeChatSessionDeletionListener: (() -> Unit)? = null
 
@@ -504,7 +519,7 @@ class MainViewModel private constructor(
 
   val runtimeInitialized: StateFlow<Boolean> =
     runtimeRef
-      .flatMapLatest { runtime -> flowOf(runtime != null) }
+      .map { runtime -> runtime != null }
       .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
   val gateways: StateFlow<List<GatewayEndpoint>> = runtimeState(initial = emptyList()) { it.gateways }
@@ -518,7 +533,6 @@ class MainViewModel private constructor(
   val notificationForwardingQuietEnd: StateFlow<String> = prefs.notificationForwardingQuietEnd
   val notificationForwardingMaxEventsPerMinute: StateFlow<Int> =
     prefs.notificationForwardingMaxEventsPerMinute
-  val notificationForwardingSessionKey: StateFlow<String?> = prefs.notificationForwardingSessionKey
 
   val isConnected: StateFlow<Boolean> = runtimeState(initial = false) { it.isConnected }
   val gatewayControlPage: StateFlow<NodeRuntime.GatewayControlPage?> =
@@ -609,7 +623,6 @@ class MainViewModel private constructor(
   val locationMode: StateFlow<LocationMode> = prefs.locationMode
   val locationPreciseEnabled: StateFlow<Boolean> = prefs.locationPreciseEnabled
   val preventSleep: StateFlow<Boolean> = prefs.preventSleep
-  val manualEnabled: StateFlow<Boolean> = prefs.manualEnabled
   val manualHost: StateFlow<String> = prefs.manualHost
   val manualPort: StateFlow<Int> = prefs.manualPort
   val manualTls: StateFlow<Boolean> = prefs.manualTls
@@ -764,22 +777,6 @@ class MainViewModel private constructor(
     prefs.setPreventSleep(value)
   }
 
-  fun setManualEnabled(value: Boolean) {
-    prefs.setManualEnabled(value)
-  }
-
-  fun setManualHost(value: String) {
-    prefs.setManualHost(value)
-  }
-
-  fun setManualPort(value: Int) {
-    prefs.setManualPort(value)
-  }
-
-  fun setManualTls(value: Boolean) {
-    prefs.setManualTls(value)
-  }
-
   /** Auth replacement retires the old gateway identity, including every retained composer owner. */
   internal suspend fun clearChatComposerGateway(stableId: String) {
     val gateway = stableId.trim()
@@ -824,6 +821,7 @@ class MainViewModel private constructor(
     // Repeat after suspending share cleanup. Any callback that raced the first tombstone is
     // serialized with this final token-and-attachment purge before cleanup returns.
     chatComposerState.removeMediaOwners(matches)
+    chatBrowserDismissalsState.update { dismissals -> dismissals.filterKeys { !matches(it) } }
   }
 
   internal fun saveGatewayConfigAndConnect(
@@ -971,14 +969,6 @@ class MainViewModel private constructor(
     start: String,
     end: String,
   ): Boolean = ensureRuntime().setNotificationForwardingQuietHours(enabled = enabled, start = start, end = end)
-
-  fun setNotificationForwardingMaxEventsPerMinute(value: Int) {
-    ensureRuntime().setNotificationForwardingMaxEventsPerMinute(value)
-  }
-
-  fun setNotificationForwardingSessionKey(value: String?) {
-    ensureRuntime().setNotificationForwardingSessionKey(value)
-  }
 
   fun setVoiceScreenActive(active: Boolean) {
     ensureRuntime().setVoiceScreenActive(active)

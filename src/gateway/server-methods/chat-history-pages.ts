@@ -102,6 +102,9 @@ export async function readChatHistoryPage(
     },
     signal,
   );
+  if (page.encodedResponse) {
+    return page;
+  }
   const project = createCurrentUserProfileMessageProjector(resolveCurrentUserProfileDisplay);
   return {
     ...page,
@@ -152,12 +155,14 @@ async function readChatHistoryPageLocal(params: ChatHistoryPageParams): Promise<
               resolveChatHistoryWithCliSessionImports,
             } = await import("../cli-session-history.js");
             const importedMessages = await readChatHistoryCliSessionImportSnapshot({
+              agentId: params.sessionAgentId,
               entry,
               provider,
               localMessages: incrementalTail.rawMessages,
               cwd: params.cwd,
             });
             const cliHistory = resolveChatHistoryWithCliSessionImports({
+              agentId: params.sessionAgentId,
               entry,
               provider,
               localMessages: incrementalTail.rawMessages,
@@ -179,6 +184,7 @@ async function readChatHistoryPageLocal(params: ChatHistoryPageParams): Promise<
                 typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
               );
               const completeCliHistory = resolveChatHistoryWithCliSessionImports({
+                agentId: params.sessionAgentId,
                 entry,
                 provider,
                 localMessages: completeLocalMessages,

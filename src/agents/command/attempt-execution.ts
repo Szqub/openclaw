@@ -37,6 +37,7 @@ import {
   resolveCliExecutionAuthProfileId,
 } from "../cli-execution-auth.js";
 import { runCliAgent } from "../cli-runner.js";
+import { resolveAuthorizedClaudeCliBinding } from "../cli-runner/child-env.js";
 import { hasCliLiveSession } from "../cli-runner/cli-live-session-registry.js";
 import { buildCliMcpDelegationCapabilityBinding } from "../cli-runner/mcp-grant-context.js";
 import { resolveCliRuntimeToolsAllow } from "../cli-runner/tool-policy.js";
@@ -192,19 +193,17 @@ export function runAgentAttempt(params: {
     inputProvenance: params.opts.inputProvenance,
     internalEvents: params.opts.internalEvents,
   });
-  const exactSubagentAnnounceHandoff =
-    isSubagentAnnounceHandoff &&
-    isTrustedSubagentCompletionHandoffForRun({
-      handoff: params.opts.trustedInternalHandoff,
-      inputProvenance: params.opts.inputProvenance,
-      internalEvents: params.opts.internalEvents,
-      sessionKey: params.sessionKey,
-      sessionId: params.sessionId,
-      provider: params.providerOverride,
-      model: params.modelOverride,
-    });
-  const trustedSubagentAnnounceHandoff =
-    exactSubagentAnnounceHandoff &&
+  const exactSubagentCompletionHandoff = isTrustedSubagentCompletionHandoffForRun({
+    handoff: params.opts.trustedInternalHandoff,
+    inputProvenance: params.opts.inputProvenance,
+    internalEvents: params.opts.internalEvents,
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+    provider: params.providerOverride,
+    model: params.modelOverride,
+  });
+  const trustedSubagentCompletionHandoff =
+    exactSubagentCompletionHandoff &&
     hasVerifiedRequesterCompletionHandoff({
       config: params.cfg,
       sessionKey: params.sessionKey,
@@ -214,6 +213,8 @@ export function runAgentAttempt(params: {
       modelProvider: params.providerOverride,
       modelId: params.modelOverride,
     });
+  const trustedSubagentAnnounceHandoff =
+    isSubagentAnnounceHandoff && trustedSubagentCompletionHandoff;
   const completionRequestsMessageDelivery =
     trustedSubagentAnnounceHandoff &&
     !isRawModelRun &&
@@ -259,7 +260,19 @@ export function runAgentAttempt(params: {
     completionToolPolicies !== undefined &&
     isToolAllowedByPolicies("message", Object.values(completionToolPolicies)) &&
     isRuntimeToolAllowed("message", params.opts.toolsAllow);
-  const claudeCliBinding = getCliSessionBinding(params.sessionEntry, "claude-cli");
+  const claudeCliBinding =
+    !isRawModelRun &&
+    params.isFallbackRetry &&
+    isClaudeCliProvider(params.originalProvider) &&
+    !isClaudeCliProvider(params.providerOverride)
+      ? resolveAuthorizedClaudeCliBinding({
+          entry: params.sessionEntry,
+          config: params.cfg,
+          agentId: params.sessionAgentId,
+          skillsSnapshot: params.skillsSnapshot,
+          cwd: params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir,
+        })
+      : undefined;
   const claudeCliFallbackPrelude =
     !isRawModelRun &&
     params.isFallbackRetry &&
@@ -592,6 +605,20 @@ export function runAgentAttempt(params: {
               }
             : undefined;
         const prepareCliSessionBinding = async () => {
+          // Remote placement validates its own transcript; no Gateway-local probe
+          // may clear the node's valid binding because its files are absent here.
+          if (params.sessionEntry?.execHost === "node") {
+            return;
+          }
+          const authorizedBinding = isClaudeCliProvider(cliExecutionProvider)
+            ? resolveAuthorizedClaudeCliBinding({
+                entry: params.sessionEntry,
+                config: params.cfg,
+                agentId: params.sessionAgentId,
+                skillsSnapshot: params.skillsSnapshot,
+                cwd: cliProcessCwd,
+              })
+            : undefined;
           const hasManagedClaudeLiveSession = Boolean(
             isClaudeCliProvider(cliExecutionProvider) &&
             cliSessionBinding?.sessionId &&
@@ -607,12 +634,13 @@ export function runAgentAttempt(params: {
           if (
             !isClaudeCliProvider(cliExecutionProvider) ||
             !cliSessionBinding?.sessionId ||
-            hasManagedClaudeLiveSession ||
-            (await claudeCliSessionTranscriptHasContent({
-              sessionId: cliSessionBinding.sessionId,
-              workspaceDir: cliProcessCwd,
-              projectsRoot: cliSessionBinding.transcriptRoot,
-            }))
+            (authorizedBinding &&
+              (hasManagedClaudeLiveSession ||
+                (await claudeCliSessionTranscriptHasContent({
+                  sessionId: authorizedBinding.sessionId,
+                  workspaceDir: cliProcessCwd,
+                  projectsRoot: authorizedBinding.transcriptRoot,
+                }))))
           ) {
             return;
           }
@@ -906,7 +934,7 @@ export function runAgentAttempt(params: {
     bootstrapContextRunKind: params.opts.bootstrapContextRunKind,
     toolsAllow: runtimeToolsAllow,
     runtimePluginToolGrant: params.opts.runtimePluginToolGrant,
-    trustedInternalHandoff: trustedSubagentAnnounceHandoff
+    trustedInternalHandoff: trustedSubagentCompletionHandoff
       ? params.opts.trustedInternalHandoff
       : undefined,
     cronCreatorAuthorityCapability: params.opts.cronCreatorAuthorityCapability,

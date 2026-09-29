@@ -4,6 +4,10 @@ on:
   push:
     branches: [proof/claude-profile-upgrade-20260929]
   workflow_dispatch:
+    inputs:
+      candidate:
+        description: Exact candidate commit (blank uses tooling commit)
+        type: string
 
 permissions:
   contents: read
@@ -12,10 +16,14 @@ jobs:
   history:
     if: github.repository == 'Szqub/openclaw'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
+    env:
+      OPENCLAW_VITEST_MAX_WORKERS: "2"
+      OPENCLAW_TEST_PROJECTS_PARALLEL: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ inputs.candidate || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-node-env
         with:
@@ -25,20 +33,88 @@ jobs:
           cache-mode: "off"
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
-      - name: Verify regression detects the original history boundary
+      - name: Focused final-history boundary
         run: |
           mkdir -p "$RUNNER_TEMP/pr145895-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
-          set +e
-          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts -t 'rejects a .* profile before retained native-history I/O' > "$RUNNER_TEMP/pr145895-evidence/history-before.log" 2>&1
-          result=$?
-          set -e
-          cat "$RUNNER_TEMP/pr145895-evidence/history-before.log"
-          test "$result" -ne 0
-          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync(process.argv[1],"utf8"); assert.match(log,/AssertionError: CURRENT_PROFILE_READ_DENIED/); assert.match(log,/Retained native history/);' "$RUNNER_TEMP/pr145895-evidence/history-before.log"
+          set -o pipefail
+          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts src/gateway/server-methods/chat-history-handler.cli-import.test.ts 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/history-after.log"
+      - name: Full touched regression groups
+        run: |
+          set -o pipefail
+          node scripts/run-vitest.mjs src/agents/command/claude-cli-project-dir.test.ts src/agents/command/claude-cli-project-dir.windows.test.ts src/agents/cli-session.test.ts src/agents/cli-runner.claude-config-dir.test.ts src/agents/cli-runner/execute.claude-config-dir.test.ts src/agents/cli-runner/prepare.test.ts src/agents/cli-runner/cli-run-settlement.test.ts src/agents/command/attempt-execution.claude-config-dir.test.ts src/agents/command/attempt-execution.cli.test.ts src/agents/command/attempt-execution.test.ts src/commands/doctor-claude-cli.test.ts src/commands/doctor/shared/legacy-cli-session-binding.test.ts src/gateway/cli-session-history.test.ts src/gateway/cli-session-history.claude-snapshot.test.ts src/gateway/cli-session-history.claude-input.test.ts src/skills/loading/skills.test.ts src/state/openclaw-agent-db.storage-migration.test.ts src/state/openclaw-agent-db-session-migrations.test.ts src/state/openclaw-agent-db-maintenance.test.ts 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/regressions.log"
+      - name: Types, lint, imports and docs
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
+          pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
+          pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/imports.log"
+          git fetch --no-tags https://github.com/openclaw/openclaw.git d70b7a4a40944800fd0aa87565ca8706bbb2ab68
+          git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src docs | xargs -0 node_modules/.bin/oxfmt --check
+          git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
+          pnpm docs:list > "$RUNNER_TEMP/pr145895-evidence/docs-list.log"
+          git diff --check d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr145895-history-before
+          name: pr145895-history-after
+          path: ${{ runner.temp }}/pr145895-evidence
+          retention-days: 30
+  release-and-runtime:
+    if: github.repository == 'Szqub/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          sparse-checkout: scripts/pr145895-proof
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "26.x"
+          install-bun: "false"
+          install-deps: "false"
+          cache-mode: "off"
+      - name: Install candidate dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build candidate runtime
+        run: pnpm build:docker
+      - name: Acquire and verify actual published release
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr145895-evidence" "$RUNNER_TEMP/released-package"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
+          npm pack openclaw@2026.9.6 --pack-destination "$RUNNER_TEMP/released-package" --json > "$RUNNER_TEMP/pr145895-evidence/npm-artifact.json"
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; import {createHash} from "node:crypto"; const bytes=fs.readFileSync(process.argv[1]); assert.equal("sha512-"+createHash("sha512").update(bytes).digest("base64"), "sha512-Ie0kyQSCVfFqixsgVg39vevUDq01Ch5u3+7Yu5Y3qARczmdAe+lzp8bVnO9925rHiW/+CFp70zfORCyPmCH31g==");' "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
+          npm install --prefix "$RUNNER_TEMP/released-package" --no-audit --no-fund "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
+      - name: Released writer, candidate Doctor, write and fresh-process reopen
+        run: |
+          set -o pipefail
+          export OPENCLAW_STATE_DIR="$RUNNER_TEMP/release-upgrade-state"
+          export OPENCLAW_CONFIG_PATH="$OPENCLAW_STATE_DIR/openclaw.json"
+          export OPENCLAW_HOME="$RUNNER_TEMP/release-upgrade-home"
+          mkdir -p "$OPENCLAW_STATE_DIR" "$OPENCLAW_HOME"
+          env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node tooling/scripts/pr145895-proof/release-upgrade.mjs seed "$RUNNER_TEMP/released-package" "$RUNNER_TEMP/pr145895-evidence"
+          cp -a "$OPENCLAW_STATE_DIR" "$RUNNER_TEMP/release-upgrade-backup"
+          env HOME="$OPENCLAW_HOME" timeout -k 10s 600s node openclaw.mjs doctor --fix --non-interactive --yes 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/doctor.log"
+          for phase in read write reopen; do
+            env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/release-upgrade.mjs "$phase" "$PWD" "$RUNNER_TEMP/pr145895-evidence"
+          done
+      - name: Native same-profile and changed-profile final history
+        if: ${{ !cancelled() }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/native-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
+          export PATH="$RUNNER_TEMP/native-claude/node_modules/.bin:$PATH"
+          node tooling/scripts/pr145895-proof/runtime.mjs --candidate "$(git rev-parse HEAD)" --scenario profile-switch --output "$RUNNER_TEMP/pr145895-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr145895-release-runtime
           path: ${{ runner.temp }}/pr145895-evidence
           retention-days: 30

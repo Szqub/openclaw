@@ -1,6 +1,7 @@
 // Completed cron work must become durable before unrelated batch work drains.
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it, vi } from "vitest";
+import { observeCronStoreCommits } from "../../../test/helpers/cron/runtime-mutation.js";
 import {
   createCronRegressionState,
   createDueIsolatedJob,
@@ -22,6 +23,7 @@ import { cronStoreKey } from "../store/key.js";
 import type { CronJob } from "../types.js";
 import { start, stop } from "./ops-lifecycle.js";
 import { add, remove } from "./ops-mutations.js";
+import * as runtimeMutation from "./runtime-mutation.js";
 import { createCronServiceState } from "./state.js";
 import type { TimedCronRunOutcome } from "./timer-execution-timeout.js";
 import {
@@ -36,6 +38,20 @@ const fixtures = setupCronRegressionFixtures({
 });
 
 type BatchTrigger = "scheduled" | "startup";
+
+function observeFinalizationRejection(onRejected: () => void) {
+  const execute = runtimeMutation.runCronRuntimeMutation;
+  return vi.spyOn(runtimeMutation, "runCronRuntimeMutation").mockImplementation(async (params) => {
+    try {
+      return await execute(params);
+    } catch (error) {
+      if (params.type === "cron.finalizeRuns") {
+        onRejected();
+      }
+      throw error;
+    }
+  });
+}
 
 function createBatchState(params: {
   storePath: string;
@@ -156,7 +172,6 @@ describe("cron batch outcome finalization", () => {
 
       let now = reservedAt;
       let reservationPersisted = false;
-      let terminalWriteRejected = false;
       const events: Array<{ action: string; jobId: string; status?: string }> = [];
       const runIsolatedAgentJob = vi.fn(async () => ({
         status: "ok" as const,
@@ -169,28 +184,23 @@ describe("cron batch outcome finalization", () => {
         onEvent: (event) => events.push(event),
       });
       const database = openOpenClawStateDatabase().db;
-      const functionName = `observe_advanced_clock_${trigger}`;
-      const triggerName = `observe_advanced_clock_${trigger}`;
-      database.function(functionName, (writtenJobId, stateJson) => {
-        if (writtenJobId !== job.id || typeof stateJson !== "string") {
-          return 0;
-        }
-        const persistedState = JSON.parse(stateJson) as CronJob["state"];
-        if (!reservationPersisted && persistedState.queuedAtMs === reservedAt) {
+      const stopObserving = observeCronStoreCommits(store.storePath, () => {
+        const queued = database
+          .prepare(
+            "SELECT 1 FROM cron_jobs WHERE store_key = ? AND job_id = ? AND json_extract(state_json, '$.queuedAtMs') = ?",
+          )
+          .get(cronStoreKey(store.storePath), job.id, reservedAt);
+        if (!reservationPersisted && queued) {
           reservationPersisted = true;
           now = startedAt;
-        } else if (!terminalWriteRejected && persistedState.lastRunStatus === "ok") {
-          terminalWriteRejected = true;
-          throw new Error("cron terminal write failed");
         }
-        return 0;
       });
+      const triggerName = `observe_advanced_clock_${trigger}`;
       database.exec(`
-        CREATE TEMP TRIGGER ${triggerName}
+        CREATE TRIGGER ${triggerName}
         AFTER UPDATE ON cron_jobs
-        BEGIN
-          SELECT ${functionName}(NEW.job_id, NEW.state_json);
-        END;
+        WHEN NEW.job_id = '${job.id}' AND json_extract(NEW.state_json, '$.lastRunStatus') = 'ok'
+        BEGIN SELECT RAISE(ABORT, 'cron terminal write failed'); END;
       `);
 
       let recoveryState: ReturnType<typeof createCronServiceState> | undefined;
@@ -240,6 +250,7 @@ describe("cron batch outcome finalization", () => {
         });
         expect(events.filter((event) => event.action === "finished")).toHaveLength(0);
       } finally {
+        stopObserving();
         database.exec(`DROP TRIGGER IF EXISTS ${triggerName}`);
         stop(state);
         if (recoveryState) {
@@ -285,7 +296,11 @@ describe("cron batch outcome finalization", () => {
 
       try {
         await started.promise;
-        await expect(remove(state, original.id)).resolves.toEqual({ ok: true, removed: true });
+        await expect(remove(state, original.id)).resolves.toEqual({
+          ok: true,
+          removed: true,
+          activeRunCancellationRequested: true,
+        });
         await add(state, {
           id: original.id,
           name: "independent replacement scheduled job",
@@ -562,7 +577,7 @@ describe("cron batch outcome finalization", () => {
     });
     const database = openOpenClawStateDatabase().db;
     database.exec(`
-      CREATE TEMP TRIGGER reject_auto_disable_terminal_write
+      CREATE TRIGGER reject_auto_disable_terminal_write
       BEFORE UPDATE ON cron_jobs
       WHEN NEW.job_id = '${job.id}'
         AND json_extract(NEW.state_json, '$.autoDisabled') IS NOT NULL
@@ -698,27 +713,13 @@ describe("cron batch outcome finalization", () => {
       const terminalWriteFailed = createDeferred();
       const secondStarted = createDeferred();
       const releaseSecond = createDeferred<{ status: "ok"; summary: string }>();
-      let rejectedTerminalWrite = false;
       const database = openOpenClawStateDatabase().db;
-      const functionName = `reject_sibling_terminal_${trigger}`;
       const triggerName = `reject_sibling_terminal_${trigger}`;
-      database.function(functionName, (jobId, stateJson) => {
-        if (jobId === first.id && typeof stateJson === "string") {
-          const persistedState = JSON.parse(stateJson) as CronJob["state"];
-          if (!rejectedTerminalWrite && persistedState.lastRunStatus === "ok") {
-            rejectedTerminalWrite = true;
-            terminalWriteFailed.resolve();
-            throw new Error("cron terminal write failed");
-          }
-        }
-        return 0;
-      });
       database.exec(`
-        CREATE TEMP TRIGGER ${triggerName}
+        CREATE TRIGGER ${triggerName}
         AFTER UPDATE ON cron_jobs
-        BEGIN
-          SELECT ${functionName}(NEW.job_id, NEW.state_json);
-        END;
+        WHEN NEW.job_id = '${first.id}' AND json_extract(NEW.state_json, '$.lastRunStatus') = 'ok'
+        BEGIN SELECT RAISE(ABORT, 'cron terminal write failed'); END;
       `);
       const state = createBatchState({
         storePath: store.storePath,
@@ -732,6 +733,7 @@ describe("cron batch outcome finalization", () => {
         }),
       });
 
+      const failureObserver = observeFinalizationRejection(() => terminalWriteFailed.resolve());
       const completion = startBatch(trigger, state).then(
         () => undefined,
         (error: unknown) => error,
@@ -754,6 +756,7 @@ describe("cron batch outcome finalization", () => {
       } finally {
         releaseSecond.resolve({ status: "ok", summary: "later completion" });
         await completion;
+        failureObserver.mockRestore();
         database.exec(`DROP TRIGGER IF EXISTS ${triggerName}`);
         if (state.timer) {
           state.timer.cancel();
@@ -777,25 +780,12 @@ describe("cron batch outcome finalization", () => {
     });
     await saveCronStore(store.storePath, { version: 1, jobs: [first, unstarted] });
 
-    let rejectedTerminalWrite = false;
     const database = openOpenClawStateDatabase().db;
-    database.function("reject_startup_terminal", (jobId, stateJson) => {
-      if (jobId === first.id && typeof stateJson === "string") {
-        const persistedState = JSON.parse(stateJson) as CronJob["state"];
-        if (!rejectedTerminalWrite && persistedState.lastRunStatus === "ok") {
-          rejectedTerminalWrite = true;
-          stop(state);
-          throw new Error("startup terminal write failed");
-        }
-      }
-      return 0;
-    });
     database.exec(`
-      CREATE TEMP TRIGGER reject_startup_terminal
+      CREATE TRIGGER reject_startup_terminal
       AFTER UPDATE ON cron_jobs
-      BEGIN
-        SELECT reject_startup_terminal(NEW.job_id, NEW.state_json);
-      END;
+      WHEN NEW.job_id = '${first.id}' AND json_extract(NEW.state_json, '$.lastRunStatus') = 'ok'
+      BEGIN SELECT RAISE(ABORT, 'startup terminal write failed'); END;
     `);
     const runIsolatedAgentJob = vi.fn(async () => ({
       status: "ok" as const,
@@ -807,6 +797,7 @@ describe("cron batch outcome finalization", () => {
       runIsolatedAgentJob,
     });
 
+    const failureObserver = observeFinalizationRejection(() => stop(state));
     try {
       await expect(runMissedJobs(state)).rejects.toThrow("startup terminal write failed");
       expect(runIsolatedAgentJob).toHaveBeenCalledOnce();
@@ -819,6 +810,7 @@ describe("cron batch outcome finalization", () => {
       expect(isCronJobActive(first.id)).toBe(false);
       expect(isCronJobActive(unstarted.id)).toBe(false);
     } finally {
+      failureObserver.mockRestore();
       database.exec("DROP TRIGGER IF EXISTS reject_startup_terminal");
       if (state.timer) {
         state.timer.cancel();
