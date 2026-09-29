@@ -10,7 +10,7 @@ on:
         description: Verification scope
         type: choice
         default: all
-        options: [all, runtime, upgrade, cwd-before]
+        options: [all, runtime, upgrade, cwd-before, cwd-after]
 
 permissions:
   contents: read
@@ -49,12 +49,13 @@ jobs:
           path: ${{ runner.temp }}/pr145895-evidence
           retention-days: 30
   history:
-    if: github.repository == 'Szqub/openclaw' && inputs.lane == 'all'
+    if: github.repository == 'Szqub/openclaw' && (inputs.lane == 'all' || inputs.lane == 'cwd-after')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       OPENCLAW_VITEST_MAX_WORKERS: "2"
       OPENCLAW_TEST_PROJECTS_PARALLEL: "1"
+      PR145895_PROOF_LANE: ${{ inputs.lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -96,7 +97,12 @@ jobs:
         run: |
           set -o pipefail
           pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
-          pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
+          if [ "$PR145895_PROOF_LANE" = "cwd-after" ]; then
+            node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.gateway-root.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-gateway-root.log"
+            node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.agents-sessions.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-agents-sessions.log"
+          else
+            pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
+          fi
           pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/imports.log"
           git fetch --depth=1 --no-tags https://github.com/openclaw/openclaw.git a5690b3072c9bb3b29723f6389cf9529474e2e92
           git diff --name-only -z a5690b3072c9bb3b29723f6389cf9529474e2e92 HEAD -- src docs | xargs -0 node_modules/.bin/oxfmt --check
