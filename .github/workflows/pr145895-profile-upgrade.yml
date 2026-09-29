@@ -99,7 +99,7 @@ jobs:
           pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
           if [ "$PR145895_PROOF_LANE" = "cwd-after" ]; then
             node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.gateway-root.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-gateway-root.log"
-            node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.agents-sessions.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-agents-sessions.log"
+            node scripts/run-tsgo.mjs -p test/tsconfig/tsconfig.core.test.commands.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-commands.log"
           else
             pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
           fi
