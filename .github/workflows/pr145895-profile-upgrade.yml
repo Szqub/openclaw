@@ -41,7 +41,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/pr145895-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
           set -o pipefail
-          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts src/gateway/server-methods/chat-history-handler.cli-import.test.ts 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/history-after.log"
+          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts --maxWorkers=1 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/history-after.log"
+          node scripts/run-vitest.mjs src/gateway/server-methods/chat-history-handler.cli-import.test.ts src/tui/embedded-backend.test.ts 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/history-callers.log"
+      - name: Verify legacy-cwd regression against the previous shared owner
+        run: |
+          git fetch --depth=1 --no-tags origin dd40313c82b0dad9f9c232d203e646ab918e1bae
+          cp src/agents/cli-runner/child-env.ts "$RUNNER_TEMP/child-env-fixed.ts"
+          trap 'cp "$RUNNER_TEMP/child-env-fixed.ts" src/agents/cli-runner/child-env.ts' EXIT
+          git show dd40313c82b0dad9f9c232d203e646ab918e1bae:src/agents/cli-runner/child-env.ts > src/agents/cli-runner/child-env.ts
+          set +e
+          node scripts/run-vitest.mjs src/gateway/cli-session-history.claude-config-dir.test.ts -t 'resolves legacy relative history' > "$RUNNER_TEMP/pr145895-evidence/legacy-cwd-before.log" 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync(process.argv[1],"utf8"); assert.match(log,/AssertionError: LEGACY_HISTORY_CWD/);' "$RUNNER_TEMP/pr145895-evidence/legacy-cwd-before.log"
       - name: Full touched regression groups
         run: |
           set -o pipefail
@@ -53,7 +66,7 @@ jobs:
           pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
           pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
           pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/imports.log"
-          git fetch --no-tags https://github.com/openclaw/openclaw.git d70b7a4a40944800fd0aa87565ca8706bbb2ab68
+          git fetch --depth=1 --no-tags https://github.com/openclaw/openclaw.git d70b7a4a40944800fd0aa87565ca8706bbb2ab68
           git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src docs | xargs -0 node_modules/.bin/oxfmt --check
           git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
           pnpm docs:list > "$RUNNER_TEMP/pr145895-evidence/docs-list.log"
