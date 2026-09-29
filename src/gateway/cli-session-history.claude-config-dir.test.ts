@@ -147,6 +147,57 @@ describe("Claude configured transcript roots", () => {
     }
   });
 
+  it.each(["spawned-cwd", "run-cwd", "spawned-workspace", "workspace"] as const)(
+    "resolves legacy relative history from %s without caller-specific cwd inference",
+    async (kind) => {
+      const params = await fixture();
+      const previousConfig = getRuntimeConfigSnapshot();
+      const selectedCwd = path.join(params.root, "selected cwd");
+      await fs.mkdir(selectedCwd);
+      await writeTranscript(path.join(selectedCwd, "relative profile"), "Legacy relative history");
+      vi.stubEnv("CLAUDE_CONFIG_DIR", "relative profile");
+      const lookup = {
+        agentId: "main",
+        homeDir: params.homeDir,
+        localMessages: [],
+        entry: {
+          sessionId: "openclaw-session",
+          updatedAt: 1,
+          cliSessionBindings: { "claude-cli": { sessionId } },
+          ...(kind === "spawned-cwd" ? { spawnedCwd: selectedCwd } : {}),
+          ...(kind === "spawned-workspace" ? { spawnedWorkspaceDir: selectedCwd } : {}),
+        },
+      };
+      try {
+        setRuntimeConfigSnapshot({
+          agents: {
+            list: [
+              {
+                id: "main",
+                cwd: kind === "run-cwd" ? selectedCwd : undefined,
+                workspace:
+                  kind === "workspace" ? selectedCwd : path.join(params.root, "wrong workspace"),
+              },
+            ],
+          },
+        });
+        expect(
+          JSON.stringify(await readChatHistoryCliSessionImportSnapshot(lookup)),
+          "LEGACY_HISTORY_CWD: legacy imports must resolve the selected agent directory",
+        ).toContain("Legacy relative history");
+        expect(JSON.stringify(resolveChatHistoryWithCliSessionImports(lookup).messages)).toContain(
+          "Legacy relative history",
+        );
+      } finally {
+        if (previousConfig) {
+          setRuntimeConfigSnapshot(previousConfig);
+        } else {
+          clearRuntimeConfigSnapshot();
+        }
+      }
+    },
+  );
+
   it.each(["override", "clear"] as const)(
     "authorizes retained history using the backend's current %s environment",
     async (kind) => {
@@ -318,6 +369,8 @@ describe("Claude configured transcript roots", () => {
             sessionId,
             cwd: params.cwd,
             transcriptRoot: path.join(childRoot, "projects"),
+            forceReuse: true,
+            authProfileId: "retired-profile",
           },
         },
       };

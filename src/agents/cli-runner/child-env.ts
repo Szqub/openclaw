@@ -6,6 +6,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
 import { resolveSkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
 import type { SkillSnapshot } from "../../skills/types.js";
+import { resolveAgentRunCwd, resolveAgentWorkspaceDir } from "../agent-scope-config.js";
 import { resolveCliBackendConfig } from "../cli-backends.js";
 import {
   resolveClaudeCliProjectsRoot,
@@ -127,7 +128,16 @@ export function resolveAuthorizedClaudeCliBinding(params: {
   const currentRoot = resolveClaudeCliProjectsRoot({
     env: child.env,
     homeDir: params.homeDir,
-    cwd: binding.cwd ?? params.cwd,
+    // History callers (RPC and embedded TUI) share the same legacy cwd policy.
+    cwd:
+      binding.cwd ??
+      params.cwd ??
+      (params.agentId && config
+        ? (params.entry?.spawnedCwd ??
+          resolveAgentRunCwd(config, params.agentId) ??
+          params.entry?.spawnedWorkspaceDir ??
+          resolveAgentWorkspaceDir(config, params.agentId))
+        : undefined),
   });
   return currentRoot && (!binding.transcriptRoot || binding.transcriptRoot === currentRoot)
     ? { ...binding, transcriptRoot: currentRoot }
