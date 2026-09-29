@@ -531,10 +531,28 @@ async function waitForGateway(scenario) {
 
 async function startGateway(scenario, tag) {
   const logPath = path.join(scenario.runDir, `gateway-${tag}.log`);
+  const tracePath = scenario.traceFiles
+    ? path.join(scenario.runDir, `files-${tag}.trace`)
+    : undefined;
   const fd = openSync(logPath, "a");
   const child = spawn(
-    process.execPath,
+    tracePath ? "strace" : process.execPath,
     [
+      ...(tracePath
+        ? [
+            "-f",
+            "-qq",
+            "-y",
+            "-e",
+            "trace=%file",
+            "-s",
+            "4096",
+            "-o",
+            tracePath,
+            "--",
+            process.execPath,
+          ]
+        : []),
       summary.cliEntry,
       "gateway",
       "run",
@@ -555,9 +573,30 @@ async function startGateway(scenario, tag) {
     },
   );
   closeSync(fd);
-  currentGateway = { child, scenario, tag, logPath };
+  currentGateway = { child, scenario, tag, logPath, tracePath };
   summary.cleanup.gatewayChildren.push({ tag, pid: child.pid });
   await waitForGateway(scenario);
+}
+
+async function assertNativeFileBoundary(scenario, expectedAccess, checks, name) {
+  if (!currentGateway?.tracePath) throw new Error("missing Gateway filesystem trace");
+  const trace = await readFile(currentGateway.tracePath, "utf8");
+  if (!trace.includes("execve("))
+    throw new Error("Gateway filesystem trace is empty or incomplete");
+  const nativeRoot = path.join(scenario.selectedRoot, "projects");
+  const operations = trace.split("\n").filter((line) => line.includes(nativeRoot));
+  const opens = operations.filter(
+    (line) => /\bopen(?:at|at2)?\(/u.test(line) && line.includes(".jsonl"),
+  );
+  if (expectedAccess ? opens.length === 0 : operations.length !== 0)
+    throw new Error(`${name}: unexpected native transcript filesystem access`);
+  // Only counts leave the isolated runner. Raw syscall traces remain temporary.
+  checks.push({
+    name,
+    status: "passed",
+    nativePathOperations: operations.length,
+    nativeTranscriptOpens: opens.length,
+  });
 }
 
 async function stopGateway() {
@@ -1042,6 +1081,7 @@ async function runProfileSwitch(mock, runDir) {
     if (!nativeSessionId) throw new Error("missing established native session");
     const nativeMarker = `NATIVE-ONLY-profile-${randomUUID()}`;
     await nativeResume(scenario, nativeSessionId, nativeMarker);
+    scenario.traceFiles = true;
     await startGateway(scenario, "same-profile-restart");
     const allowed = await rpc(scenario, "chat.history", {
       sessionKey: scenario.sessionKey,
@@ -1050,6 +1090,7 @@ async function runProfileSwitch(mock, runDir) {
     if (!JSON.stringify(allowed).includes(nativeMarker))
       throw new Error("same-profile restart did not import the native-only marker");
     step.checks.push({ name: "same-profile-restart-native-import", status: "passed" });
+    await assertNativeFileBoundary(scenario, true, step.checks, "same-profile-native-file-open");
     await stopGateway();
     scenario.configDirValue = switchedRoot;
     scenario.env = undefined;
@@ -1081,6 +1122,33 @@ async function runProfileSwitch(mock, runDir) {
     if (!JSON.stringify(rejected).includes(scenario.seed))
       throw new Error("profile rejection discarded canonical local history");
     step.checks.push({ name: "changed-profile-rejects-native-only-history", status: "passed" });
+    await assertNativeFileBoundary(
+      scenario,
+      false,
+      step.checks,
+      "changed-profile-zero-old-native-path-operations",
+    );
+    await stopGateway();
+    scenario.kind = "default";
+    await startGateway(scenario, "unset-profile");
+    const unset = await rpc(scenario, "chat.history", {
+      sessionKey: scenario.sessionKey,
+      limit: 100,
+    });
+    if (
+      JSON.stringify(unset).includes(nativeMarker) ||
+      !JSON.stringify(unset).includes(scenario.seed)
+    )
+      throw new Error("unset profile did not preserve only canonical local history");
+    await assertNativeFileBoundary(
+      scenario,
+      false,
+      step.checks,
+      "unset-profile-zero-old-native-path-operations",
+    );
+    await stopGateway();
+    scenario.kind = "absolute";
+    await startGateway(scenario, "switch-b-new-turn");
     let outcome = "started";
     try {
       await sendTurn(

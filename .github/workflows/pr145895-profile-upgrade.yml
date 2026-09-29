@@ -127,6 +127,7 @@ jobs:
       - name: Native same-profile and changed-profile final history
         if: ${{ !cancelled() && inputs.lane != 'upgrade' }}
         run: |
+          strace --version
           npm install --prefix "$RUNNER_TEMP/native-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
           export PATH="$RUNNER_TEMP/native-claude/node_modules/.bin:$PATH"
           node tooling/scripts/pr145895-proof/runtime.mjs --candidate "$(git rev-parse HEAD)" --scenario profile-switch --output "$RUNNER_TEMP/pr145895-evidence"
