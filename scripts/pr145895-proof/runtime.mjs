@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -1054,9 +1054,12 @@ async function runRootSmoke(kind, mock, runDir) {
   return step;
 }
 
-async function runProfileSwitch(mock, runDir) {
-  const switchDir = path.join(runDir, "profile-switch");
-  const scenario = await prepareScenario("absolute", switchDir, mock.baseUrl, "profile-switch");
+async function runProfileSwitch(mock, runDir, kind = "absolute") {
+  const label = `${kind}-profile-switch`;
+  const switchDir = path.join(runDir, label);
+  const scenario = await prepareScenario(kind, switchDir, mock.baseUrl, label);
+  // Relative child roots use real cwd; keep syscall matching on that same physical path.
+  if (kind === "relative") scenario.selectedRoot = await realpath(scenario.selectedRoot);
   const switchedRoot = path.join(switchDir, "claude-switched");
   await mkdir(switchedRoot, { recursive: true });
   await writeFile(
@@ -1067,7 +1070,7 @@ async function runProfileSwitch(mock, runDir) {
       2,
     ),
   );
-  const step = { name: "profile-switch-history-authority", status: "running", checks: [] };
+  const step = { name: `${kind}-profile-switch-history-authority`, status: "running", checks: [] };
   try {
     await startGateway(scenario, "switch-a");
     await sendTurn(
@@ -1092,6 +1095,49 @@ async function runProfileSwitch(mock, runDir) {
     step.checks.push({ name: "same-profile-restart-native-import", status: "passed" });
     await assertNativeFileBoundary(scenario, true, step.checks, "same-profile-native-file-open");
     await stopGateway();
+    if (kind === "relative") {
+      const originalConfig = await readFile(scenario.config, "utf8");
+      const config = JSON.parse(originalConfig);
+      const nextCwd = path.join(switchDir, "next-child-cwd");
+      await mkdir(nextCwd);
+      config.agents.defaults.cwd = nextCwd;
+      await writeFile(scenario.config, `${JSON.stringify(config, null, 2)}\n`);
+      await startGateway(scenario, "relative-changed-cwd");
+      const changedCwdHistory = await rpc(scenario, "chat.history", {
+        sessionKey: scenario.sessionKey,
+        limit: 100,
+      });
+      if (
+        JSON.stringify(changedCwdHistory).includes(nativeMarker) ||
+        !JSON.stringify(changedCwdHistory).includes(scenario.seed)
+      )
+        throw new Error("changed current cwd did not reject old relative native history");
+      await assertNativeFileBoundary(
+        scenario,
+        false,
+        step.checks,
+        "changed-cwd-zero-old-native-path-operations",
+      );
+      await stopGateway();
+      const relativeConfigDir = scenario.configDirValue;
+      scenario.configDirValue = scenario.selectedRoot;
+      await startGateway(scenario, "absolute-root-changed-cwd");
+      const absoluteHistory = await rpc(scenario, "chat.history", {
+        sessionKey: scenario.sessionKey,
+        limit: 100,
+      });
+      if (!JSON.stringify(absoluteHistory).includes(nativeMarker))
+        throw new Error("unchanged absolute root lost history when current cwd changed");
+      await assertNativeFileBoundary(
+        scenario,
+        true,
+        step.checks,
+        "absolute-root-changed-cwd-native-file-open",
+      );
+      await stopGateway();
+      scenario.configDirValue = relativeConfigDir;
+      await writeFile(scenario.config, originalConfig);
+    }
     scenario.configDirValue = switchedRoot;
     scenario.env = undefined;
     await startGateway(scenario, "switch-b");
@@ -1268,6 +1314,7 @@ async function main() {
 
   if (requestedScenario === "profile-switch") {
     await runProfileSwitch(mockServer, tempRoot);
+    await runProfileSwitch(mockServer, tempRoot, "relative");
   } else if (requestedScenario === "native-fork") {
     await runStandaloneNativeFork(mockServer);
   } else {
