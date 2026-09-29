@@ -105,7 +105,8 @@ async function withImportedHistory(
       message: { role: "assistant", content: "Local answer", timestamp: timestamp + 1 },
     });
     if (configKind === "bound") {
-      // The original local transcript and current config do not own the later native cwd.
+      // An unchanged absolute profile stays authorized even when current cwd
+      // differs from the completed native child's historical directory.
       const context = buildPreparedCliRunContext({ provider: "claude-cli", ...scope });
       context.cwd = childCwd;
       context.claudeTranscriptRoot = path.join(childCwd, "alternate-claude", "projects");
@@ -131,9 +132,9 @@ async function withImportedHistory(
     );
     vi.stubEnv(
       "CLAUDE_CONFIG_DIR",
-      configKind === "relative" || configKind === "bound"
+      configKind === "relative"
         ? "alternate-claude"
-        : configKind === "absolute"
+        : configKind === "absolute" || configKind === "bound"
           ? configDir
           : undefined,
     );
