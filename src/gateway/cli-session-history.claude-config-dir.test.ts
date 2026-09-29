@@ -451,8 +451,8 @@ describe("Claude configured transcript roots", () => {
         expect(JSON.stringify(preparedImportedMessages)).toContain("Retained cwd native history");
         expect(asyncReader).toHaveBeenCalledOnce();
         asyncReader.mockClear();
-        configureCwd(nextCwd);
         if (source === "explicit") lookup.cwd = nextCwd;
+        else configureCwd(nextCwd);
         expect(
           await readChatHistoryCliSessionImportSnapshot(lookup),
           "CURRENT_CWD_READ_DENIED: a retained cwd must not authorize a former relative root",
