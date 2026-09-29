@@ -1,20 +1,23 @@
 name: Claude profile and release upgrade proof
 
 on:
-  push:
-    branches: [proof/claude-profile-upgrade-20260929]
   workflow_dispatch:
     inputs:
       candidate:
         description: Exact candidate commit (blank uses tooling commit)
         type: string
+      lane:
+        description: Verification scope
+        type: choice
+        default: all
+        options: [all, upgrade]
 
 permissions:
   contents: read
 
 jobs:
   history:
-    if: github.repository == 'Szqub/openclaw'
+    if: github.repository == 'Szqub/openclaw' && inputs.lane != 'upgrade'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -84,30 +87,32 @@ jobs:
           cache-mode: "off"
       - name: Install candidate dependencies
         run: pnpm install --frozen-lockfile
-      - name: Build candidate runtime
-        run: pnpm build:docker
+      - name: Build and check the canonical candidate package
+        run: node scripts/package-openclaw-for-docker.mjs --allow-unreleased-changelog --output-dir "$RUNNER_TEMP/candidate-package" --output-name openclaw-candidate.tgz
       - name: Acquire and verify actual published release
         run: |
           mkdir -p "$RUNNER_TEMP/pr145895-evidence" "$RUNNER_TEMP/released-package"
           git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
           npm pack openclaw@2026.9.6 --pack-destination "$RUNNER_TEMP/released-package" --json > "$RUNNER_TEMP/pr145895-evidence/npm-artifact.json"
           node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; import {createHash} from "node:crypto"; const bytes=fs.readFileSync(process.argv[1]); assert.equal("sha512-"+createHash("sha512").update(bytes).digest("base64"), "sha512-Ie0kyQSCVfFqixsgVg39vevUDq01Ch5u3+7Yu5Y3qARczmdAe+lzp8bVnO9925rHiW/+CFp70zfORCyPmCH31g==");' "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
-          npm install --prefix "$RUNNER_TEMP/released-package" --no-audit --no-fund "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
-      - name: Released writer, candidate Doctor, write and fresh-process reopen
+          npm install --global --prefix "$RUNNER_TEMP/released-package" --no-audit --no-fund "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
+      - name: Published writer and updater, candidate write and fresh-process reopen
         run: |
           set -o pipefail
           export OPENCLAW_STATE_DIR="$RUNNER_TEMP/release-upgrade-state"
           export OPENCLAW_CONFIG_PATH="$OPENCLAW_STATE_DIR/openclaw.json"
           export OPENCLAW_HOME="$RUNNER_TEMP/release-upgrade-home"
           mkdir -p "$OPENCLAW_STATE_DIR" "$OPENCLAW_HOME"
-          env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node tooling/scripts/pr145895-proof/release-upgrade.mjs seed "$RUNNER_TEMP/released-package" "$RUNNER_TEMP/pr145895-evidence"
+          package_root="$RUNNER_TEMP/released-package/lib/node_modules/openclaw"
+          env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node tooling/scripts/pr145895-proof/release-upgrade.mjs seed "$package_root" "$RUNNER_TEMP/pr145895-evidence"
           cp -a "$OPENCLAW_STATE_DIR" "$RUNNER_TEMP/release-upgrade-backup"
-          env HOME="$OPENCLAW_HOME" timeout -k 10s 600s node openclaw.mjs doctor --fix --non-interactive --yes 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/doctor.log"
+          (cd "$RUNNER_TEMP" && env HOME="$OPENCLAW_HOME" npm_config_prefix="$RUNNER_TEMP/released-package" timeout -k 10s 1800s node "$package_root/openclaw.mjs" update --tag "file:$RUNNER_TEMP/candidate-package/openclaw-candidate.tgz" --no-restart --yes --json --timeout 1200) 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/published-updater.log"
           for phase in read write reopen; do
-            env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node --import ./scripts/tsx.mjs tooling/scripts/pr145895-proof/release-upgrade.mjs "$phase" "$PWD" "$RUNNER_TEMP/pr145895-evidence"
+            env HOME="$OPENCLAW_HOME" timeout -k 10s 180s node tooling/scripts/pr145895-proof/release-upgrade.mjs "$phase" "$package_root" "$RUNNER_TEMP/pr145895-evidence" "$(git rev-parse HEAD)"
           done
+          git diff --exit-code HEAD
       - name: Native same-profile and changed-profile final history
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.lane != 'upgrade' }}
         run: |
           npm install --prefix "$RUNNER_TEMP/native-claude" --no-audit --no-fund @anthropic-ai/claude-code@2.1.269
           export PATH="$RUNNER_TEMP/native-claude/node_modules/.bin:$PATH"

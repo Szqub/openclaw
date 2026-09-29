@@ -7,9 +7,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
-const [phase, installation, evidenceDir] = process.argv.slice(2);
+const [phase, packageRoot, evidenceDir, expectedCommit] = process.argv.slice(2);
 assert(["seed", "read", "write", "reopen"].includes(phase));
-assert(installation && evidenceDir && process.env.OPENCLAW_STATE_DIR);
+assert(packageRoot && evidenceDir && process.env.OPENCLAW_STATE_DIR);
 const stateDir = process.env.OPENCLAW_STATE_DIR;
 const storePath = path.join(stateDir, "agents/main/agent/openclaw-agent.sqlite");
 const scope = { agentId: "main", sessionKey: "agent:main:release-upgrade", storePath };
@@ -18,17 +18,17 @@ const localId = "b3220628-af97-4b08-a1fd-bb80e165c372";
 const nativeId = "6a2cb7b5-e349-415a-b5fa-e6cc4361b085";
 const canary = "Published release transcript survives candidate maintenance";
 const candidate = phase !== "seed";
-const packageRoot = candidate ? installation : path.join(installation, "node_modules/openclaw");
 const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
 const requirePackage = createRequire(path.join(packageRoot, "package.json"));
 const load = (name) =>
-  import(
-    pathToFileURL(
-      candidate
-        ? path.join(packageRoot, `src/plugin-sdk/${name}.ts`)
-        : requirePackage.resolve(`openclaw/plugin-sdk/${name}`),
-    ).href
+  import(pathToFileURL(requirePackage.resolve(`openclaw/plugin-sdk/${name}`)).href);
+if (candidate) {
+  assert(expectedCommit, "Candidate package requires an exact build commit");
+  const buildInfo = JSON.parse(
+    fs.readFileSync(path.join(packageRoot, "dist/build-info.json"), "utf8"),
   );
+  assert.equal(buildInfo.commit, expectedCommit);
+}
 const store = await load("session-store-runtime");
 const transcript = await load("session-transcript-runtime");
 const read = () => store.getSessionEntry(scope);
@@ -124,20 +124,15 @@ if (phase === "seed") {
   const cwd = path.join(stateDir, "workspace");
   const transcriptRoot = path.join(stateDir, "claude-profile", "projects");
   if (phase === "write") {
-    const owner = await import(
-      pathToFileURL(path.join(packageRoot, "src/agents/cli-session.ts")).href
-    );
     assert(
       await store.patchSessionEntry({
         ...scope,
         update(current) {
-          owner.setCliSessionBinding(current, "claude-cli", {
-            ...current.cliSessionBindings["claude-cli"],
-            cwd,
-            transcriptRoot,
-          });
           return {
-            cliSessionBindings: current.cliSessionBindings,
+            cliSessionBindings: {
+              ...current.cliSessionBindings,
+              "claude-cli": { ...current.cliSessionBindings["claude-cli"], cwd, transcriptRoot },
+            },
             cliSessionIds: current.cliSessionIds,
             label: "candidate-write-survives-reopen",
           };
