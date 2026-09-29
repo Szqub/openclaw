@@ -3471,14 +3471,16 @@ describe("CLI attempt execution", () => {
     });
   });
 
-  it.each(["absolute", "relative", "bound", "changed"] as const)(
-    "seeds the actual fallback prompt from the %s Claude config directory",
+  it.each(["absolute", "relative", "bound", "changed", "changed-cwd"] as const)(
+    "uses only authorized %s Claude history in the actual fallback prompt",
     async (kind) => {
       const homeDir = path.join(tmpDir, "fallback-home");
       const childCwd = path.join(tmpDir, "task-subdirectory");
       await fs.mkdir(childCwd, { recursive: true });
       const configDir =
-        kind === "absolute" ? path.join(tmpDir, "alternate Claude") : "alternate Claude";
+        kind === "absolute" || kind === "bound"
+          ? path.join(tmpDir, "alternate Claude")
+          : "alternate Claude";
       vi.stubEnv("HOME", homeDir);
       vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
       const cliSessionId = "configured-fallback-session";
@@ -3504,14 +3506,17 @@ describe("CLI attempt execution", () => {
       const attempt = await runOpenClawEmbeddedAttemptForTest({
         originalProvider: "claude-cli",
         isFallbackRetry: true,
-        cwd: kind === "bound" ? tmpDir : childCwd,
+        cwd: kind === "bound" || kind === "changed-cwd" ? tmpDir : childCwd,
         body: "Continue this task",
         sessionEntry: {
           cliSessionBindings: {
             "claude-cli": {
               sessionId: cliSessionId,
-              ...(kind === "bound" || kind === "changed"
-                ? { cwd: childCwd, transcriptRoot: path.join(childCwd, configDir, "projects") }
+              ...(kind === "bound" || kind === "changed" || kind === "changed-cwd"
+                ? {
+                    cwd: childCwd,
+                    transcriptRoot: path.join(path.resolve(childCwd, configDir), "projects"),
+                  }
                 : {}),
             },
           },
@@ -3520,7 +3525,7 @@ describe("CLI attempt execution", () => {
       if (typeof attempt.prompt !== "string") {
         throw new Error("Expected the fallback model to receive a text prompt");
       }
-      if (kind === "changed") {
+      if (kind === "changed" || kind === "changed-cwd") {
         expect(attempt.prompt).not.toContain("Native configured history");
         expect(reader).not.toHaveBeenCalled();
       } else {

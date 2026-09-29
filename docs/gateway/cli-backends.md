@@ -535,6 +535,9 @@ remains authorized by the currently effective Claude profile/root. A changed pro
 is rejected before native-history I/O. The check uses the current backend and skill
 environment selection, including cleared variables; a past per-turn override alone
 does not authorize a later read. Canonical OpenClaw history remains available.
+For relative or empty configuration directories, the current child working directory
+also determines the authorized root. A changed working directory cannot keep the
+former relative root authorized through the binding's historical directory.
 For paired-node sessions, the node owns native history: Gateway history imports,
 fallbacks, and resume checks do not read Gateway-local Claude files for that binding.
 

@@ -128,9 +128,9 @@ export function resolveAuthorizedClaudeCliBinding(params: {
   const currentRoot = resolveClaudeCliProjectsRoot({
     env: child.env,
     homeDir: params.homeDir,
-    // History callers (RPC and embedded TUI) share the same legacy cwd policy.
+    // Current child cwd authorizes relative roots. The binding's historical cwd
+    // only locates files after authorization; it must not keep a former root selected.
     cwd:
-      binding.cwd ??
       params.cwd ??
       (params.agentId && config
         ? (params.entry?.spawnedCwd ??
