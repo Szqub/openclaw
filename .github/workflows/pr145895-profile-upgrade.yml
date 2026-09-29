@@ -66,11 +66,11 @@ jobs:
           pnpm tsgo:core 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-core.log"
           pnpm tsgo:test:src 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/types-src.log"
           pnpm check:import-cycles 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/imports.log"
-          git fetch --depth=1 --no-tags https://github.com/openclaw/openclaw.git d70b7a4a40944800fd0aa87565ca8706bbb2ab68
-          git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src docs | xargs -0 node_modules/.bin/oxfmt --check
-          git diff --name-only -z d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
+          git fetch --depth=1 --no-tags https://github.com/openclaw/openclaw.git a5690b3072c9bb3b29723f6389cf9529474e2e92
+          git diff --name-only -z a5690b3072c9bb3b29723f6389cf9529474e2e92 HEAD -- src docs | xargs -0 node_modules/.bin/oxfmt --check
+          git diff --name-only -z a5690b3072c9bb3b29723f6389cf9529474e2e92 HEAD -- src | xargs -0 node scripts/run-oxlint.mjs --tsconfig tsconfig.core.json 2>&1 | tee "$RUNNER_TEMP/pr145895-evidence/lint.log"
           pnpm docs:list > "$RUNNER_TEMP/pr145895-evidence/docs-list.log"
-          git diff --check d70b7a4a40944800fd0aa87565ca8706bbb2ab68 HEAD
+          git diff --check a5690b3072c9bb3b29723f6389cf9529474e2e92 HEAD
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
