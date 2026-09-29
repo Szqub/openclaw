@@ -92,7 +92,6 @@ const DEFAULT_PROVIDER = "hetzner";
 const DEFAULT_DURATION = "180s";
 const DEFAULT_SETTLE_MS = 8000;
 const DEFAULT_VISION_TIMEOUT_MS = 120000;
-const CRABBOX_BIN_ENV = "OPENCLAW_MANTIS_CRABBOX_BIN";
 const CRABBOX_PROVIDER_ENV = "OPENCLAW_MANTIS_CRABBOX_PROVIDER";
 const CRABBOX_LEASE_ID_ENV = "OPENCLAW_MANTIS_CRABBOX_LEASE_ID";
 
@@ -391,7 +390,6 @@ export async function runMantisVisualDriver(
   const screenshotPath = path.join(outputDir, "visual-task.png");
   const crabboxBin = await resolveCrabboxBin({
     env,
-    envName: CRABBOX_BIN_ENV,
     explicit: opts.crabboxBin,
     repoRoot,
   });
@@ -413,7 +411,22 @@ export async function runMantisVisualDriver(
   const visionPrompt = buildVisionPrompt(opts.visionPrompt, expectText);
   const visionTimeoutMs = opts.visionTimeoutMs ?? DEFAULT_VISION_TIMEOUT_MS;
   const runner = opts.commandRunner ?? defaultCommandRunner;
-  let result: MantisVisualDriverResult;
+  const result: MantisVisualDriverResult = {
+    browserUrl,
+    expectText,
+    finishedAt: startedAt.toISOString(),
+    matched: false,
+    outputDir,
+    screenshotPath,
+    startedAt: startedAt.toISOString(),
+    status: "fail",
+    vision: {
+      mode: visionMode,
+      model: trimToValue(opts.visionModel),
+      prompt: visionPrompt,
+      timeoutMs: visionTimeoutMs,
+    },
+  };
 
   try {
     await runCommand({
@@ -492,43 +505,14 @@ export async function runMantisVisualDriver(
       visionText = parseImageDescribeText(described.stdout);
     }
     const { assertion, matched } = evaluateVisualExpectation(visionText, expectText);
-    result = {
-      browserUrl,
-      expectText,
-      finishedAt: new Date().toISOString(),
-      matched,
-      outputDir,
-      screenshotPath,
-      startedAt: startedAt.toISOString(),
-      status: matched ? "pass" : "fail",
-      vision: {
-        assertion,
-        mode: visionMode,
-        model: trimToValue(opts.visionModel),
-        prompt: visionPrompt,
-        text: visionText,
-        timeoutMs: visionTimeoutMs,
-      },
-    };
+    result.matched = matched;
+    result.status = matched ? "pass" : "fail";
+    result.vision.assertion = assertion;
+    result.vision.text = visionText;
   } catch (error) {
-    result = {
-      browserUrl,
-      error: formatErrorMessage(error),
-      expectText,
-      finishedAt: new Date().toISOString(),
-      matched: false,
-      outputDir,
-      screenshotPath,
-      startedAt: startedAt.toISOString(),
-      status: "fail",
-      vision: {
-        mode: visionMode,
-        model: trimToValue(opts.visionModel),
-        prompt: visionPrompt,
-        timeoutMs: visionTimeoutMs,
-      },
-    };
+    result.error = formatErrorMessage(error);
   }
+  result.finishedAt = new Date().toISOString();
   await fs.writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
   return result;
 }
@@ -552,7 +536,6 @@ export async function runMantisVisualTask(
   const videoPath = path.join(outputDir, "visual-task.mp4");
   const crabboxBin = await resolveCrabboxBin({
     env,
-    envName: CRABBOX_BIN_ENV,
     explicit: opts.crabboxBin,
     repoRoot,
   });

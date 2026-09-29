@@ -18,6 +18,7 @@ import {
   prepareSqliteReadOnlyLocationSyncInProcess,
   SqliteSourceChangedError,
 } from "./sqlite-readonly-location.js";
+import type { PreparedSqliteReadOnlyLocation } from "./sqlite-readonly-location.types.js";
 import {
   SQLITE_READONLY_WORKER_MAX_BUFFER,
   SQLITE_INSPECTION_CONTENTION_PREFIX,
@@ -31,7 +32,10 @@ import {
   reconcileSqliteSnapshotRetirement,
 } from "./sqlite-snapshot-staging.js";
 import type { SqliteStagingToken } from "./sqlite-staging-token.js";
-import { assertExistingDatabaseIdentity } from "./sqlite-worker-identity.js";
+import {
+  assertExistingDatabaseIdentity,
+  readDatabaseFileIdentity,
+} from "./sqlite-worker-identity.js";
 import { createSqliteWorkerTransferOwner } from "./sqlite-worker-transfer.js";
 
 const stagingTokens = new Map<string, SqliteStagingToken>();
@@ -41,7 +45,7 @@ const stagingTokens = new Map<string, SqliteStagingToken>();
 async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
   const mode = args[0];
   const pathname = args[1];
-  const stagingRoot = args[2];
+  const stagingRoot = args[2] || undefined;
   if (
     (mode !== "sync" &&
       mode !== "async" &&
@@ -56,6 +60,13 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
     };
   }
   try {
+    if (args.length > 4 || (args[3] !== undefined && mode !== "sync")) {
+      throw new Error(
+        "SQLite source identity is supported only for artifact-preserving sync copies",
+      );
+    }
+    const expectedSourceIdentity =
+      args[3] === undefined ? undefined : readDatabaseFileIdentity(JSON.parse(args[3]));
     if (mode === "staging-reconcile") {
       reconcileSqliteSnapshotRetirement(pathname);
       return { ok: true, location: pathname };
@@ -114,6 +125,7 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
       }
       return { ok: true, warnings };
     }
+    let prepared: PreparedSqliteReadOnlyLocation;
     if (mode === "consolidated") {
       if (!stagingRoot || path.dirname(path.resolve(pathname)) !== path.resolve(stagingRoot)) {
         throw new Error(
@@ -122,14 +134,17 @@ async function inspect(args: string[]): Promise<SqliteReadOnlyWorkerResult> {
       }
       // The backup owner admits a child staging token before reading the private
       // WAL family. Parent loss cannot let reclamation race its native backup.
-      const prepared = await createOnlineReadOnlyBackup(pathname, stagingRoot);
-      releaseSnapshotTempDirectory(prepared.cleanupRoot ?? path.dirname(prepared.location));
-      return { ok: true, location: prepared.location };
+      prepared = await createOnlineReadOnlyBackup(pathname, stagingRoot);
+    } else {
+      prepared =
+        mode === "sync"
+          ? prepareSqliteReadOnlyLocationSyncInProcess(
+              pathname,
+              stagingRoot,
+              expectedSourceIdentity,
+            )
+          : await prepareSqliteReadOnlyLocationInProcess(pathname, stagingRoot);
     }
-    const prepared =
-      mode === "sync"
-        ? prepareSqliteReadOnlyLocationSyncInProcess(pathname, stagingRoot)
-        : await prepareSqliteReadOnlyLocationInProcess(pathname, stagingRoot);
     releaseSnapshotTempDirectory(prepared.cleanupRoot ?? path.dirname(prepared.location));
     return { ok: true, location: prepared.location };
   } catch (error) {

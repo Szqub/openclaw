@@ -1,6 +1,3 @@
-/**
- * Sanitizes and validates replayed session history before model calls.
- */
 import { isDeepStrictEqual } from "node:util";
 import {
   hasOnlyAssistantReasoningContent,
@@ -188,23 +185,16 @@ function sanitizeUserReplayContent(message: AgentMessage): AgentMessage | null {
 
   let touched = false;
   const sanitizedContent = replayContent.filter((block) => {
-    if (!block || typeof block !== "object") {
-      return true;
-    }
-    if ((block as { type?: unknown }).type !== "text") {
-      return true;
-    }
-    const text = (block as { text?: unknown }).text;
-    if (typeof text !== "string" || text.trim().length > 0) {
-      return true;
-    }
-    touched = true;
-    return false;
+    const record = asOptionalObjectRecord(block);
+    const keep =
+      record?.type !== "text" || typeof record.text !== "string" || Boolean(record.text.trim());
+    touched ||= !keep;
+    return keep;
   });
   if (sanitizedContent.length === 0) {
-    return hasPersistedMedia(message) ? ({ ...message, content: "" } as AgentMessage) : null;
+    return hasPersistedMedia(message) ? { ...message, content: "" } : null;
   }
-  return touched ? ({ ...message, content: sanitizedContent } as AgentMessage) : message;
+  return touched ? { ...message, content: sanitizedContent } : message;
 }
 
 function normalizeAssistantReplayTextContent(
@@ -337,7 +327,7 @@ export function normalizeAssistantReplayContent(messages: AgentMessage[]): Agent
       continue;
     }
     let assistantMessage: AssistantReplayMessage = message;
-    let replayContent = (message as { content?: unknown }).content;
+    const replayContent = (message as { content?: unknown }).content;
     if (typeof replayContent === "string") {
       const normalized = normalizeAssistantReplayTextContent(message, replayContent);
       if (normalized) {
@@ -346,24 +336,25 @@ export function normalizeAssistantReplayContent(messages: AgentMessage[]): Agent
       touched = true;
       continue;
     }
-    if (!Array.isArray(replayContent)) {
-      replayContent =
-        replayContent != null && typeof replayContent === "object" ? [replayContent] : [];
+    const blockContent = Array.isArray(replayContent)
+      ? replayContent
+      : replayContent != null && typeof replayContent === "object"
+        ? [replayContent]
+        : [];
+    if (blockContent !== replayContent) {
       assistantMessage = replaceCompactionReplayOwnerContent(
         message,
-        replayContent as typeof message.content,
+        blockContent as typeof message.content,
       ) as AssistantReplayMessage;
       touched = true;
     }
-    if (Array.isArray(replayContent)) {
-      const normalized = normalizeAssistantReplayBlockContent(assistantMessage, replayContent);
-      if (normalized !== assistantMessage) {
-        touched = true;
-        if (!normalized) {
-          continue;
-        }
-        assistantMessage = normalized;
+    const normalized = normalizeAssistantReplayBlockContent(assistantMessage, blockContent);
+    if (normalized !== assistantMessage) {
+      touched = true;
+      if (!normalized) {
+        continue;
       }
+      assistantMessage = normalized;
     }
     if (isReasoningOnlyLengthAssistantTurn(assistantMessage)) {
       // Token-limited thinking is incomplete provider state. Replaying it can
@@ -407,34 +398,23 @@ function normalizeAssistantUsageSnapshot(usage: unknown) {
 }
 
 function normalizeAssistantUsageCost(usage: unknown): AssistantUsageSnapshot["cost"] | undefined {
-  const base = makeZeroUsageSnapshot().cost;
-  if (!usage || typeof usage !== "object") {
+  const cost = asOptionalObjectRecord(asOptionalObjectRecord(usage)?.cost);
+  if (!cost) {
     return undefined;
   }
-  const rawCost = (usage as { cost?: unknown }).cost;
-  if (!rawCost || typeof rawCost !== "object") {
+  const values = ["input", "output", "cacheRead", "cacheWrite", "total"].map((field) =>
+    toFiniteCostNumber(cost[field]),
+  );
+  if (values.every((value) => value === undefined)) {
     return undefined;
   }
-  const cost = rawCost as Record<string, unknown>;
-  const inputRaw = toFiniteCostNumber(cost.input);
-  const outputRaw = toFiniteCostNumber(cost.output);
-  const cacheReadRaw = toFiniteCostNumber(cost.cacheRead);
-  const cacheWriteRaw = toFiniteCostNumber(cost.cacheWrite);
-  const totalRaw = toFiniteCostNumber(cost.total);
-  if (
-    inputRaw === undefined &&
-    outputRaw === undefined &&
-    cacheReadRaw === undefined &&
-    cacheWriteRaw === undefined &&
-    totalRaw === undefined
-  ) {
-    return undefined;
-  }
-  const input = inputRaw ?? base.input;
-  const output = outputRaw ?? base.output;
-  const cacheRead = cacheReadRaw ?? base.cacheRead;
-  const cacheWrite = cacheWriteRaw ?? base.cacheWrite;
-  const total = totalRaw ?? input + output + cacheRead + cacheWrite;
+  const [
+    input = 0,
+    output = 0,
+    cacheRead = 0,
+    cacheWrite = 0,
+    total = input + output + cacheRead + cacheWrite,
+  ] = values;
   // Keep authoritative provider billing provenance through replay repair. Dropping it
   // turns a real zero-dollar total back into a local estimate during later accounting.
   const totalOrigin = cost.totalOrigin === "provider-billed" ? cost.totalOrigin : undefined;
@@ -497,22 +477,14 @@ function createProviderReplaySessionState(
   return {
     getCustomEntries() {
       try {
-        const customEntries: ProviderReplaySessionEntry[] = [];
-        for (const entry of sessionManager.getEntries()) {
+        return sessionManager.getEntries().flatMap((entry): ProviderReplaySessionEntry[] => {
           const candidate = entry as CustomEntryLike;
           if (candidate?.type !== "custom" || typeof candidate.customType !== "string") {
-            continue;
+            return [];
           }
           const customType = candidate.customType.trim();
-          if (!customType) {
-            continue;
-          }
-          customEntries.push({
-            customType,
-            data: candidate.data,
-          });
-        }
-        return customEntries;
+          return customType ? [{ customType, data: candidate.data }] : [];
+        });
       } catch {
         return [];
       }

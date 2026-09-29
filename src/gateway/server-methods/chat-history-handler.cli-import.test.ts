@@ -18,6 +18,7 @@ import {
   augmentChatHistoryWithCanvasBlocks,
   projectChatDisplayMessages,
 } from "../chat-display-projection.js";
+import * as nativeSnapshot from "../cli-session-history.claude-snapshot.js";
 import * as cliSessionHistory from "../cli-session-history.js";
 import { getMaxChatHistoryMessagesBytes } from "../server-constants.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
@@ -107,6 +108,7 @@ async function withImportedHistory(
       // The original local transcript and current config do not own the later native cwd.
       const context = buildPreparedCliRunContext({ provider: "claude-cli", ...scope });
       context.cwd = childCwd;
+      context.claudeTranscriptRoot = path.join(childCwd, "alternate-claude", "projects");
       const result = buildCliRunResult({
         context,
         output: { text: "Native turn completed" },
@@ -260,6 +262,22 @@ describe("CLI-imported history anchors", () => {
           expect.arrayContaining(importedIds),
         );
         expect(JSON.stringify(page.messages)).toContain("Configured Claude history");
+        if (configKind === "bound") {
+          // The real settlement result was persisted and its database closed above.
+          // A later profile switch must not send that retained root to native discovery.
+          const reader = vi.spyOn(nativeSnapshot, "readClaudeCliSessionMessagesAsync");
+          vi.stubEnv("CLAUDE_CONFIG_DIR", "different-profile");
+          try {
+            const changedProfile = await read({ limit: 20 });
+            expect(JSON.stringify(changedProfile.messages)).toContain("Local answer");
+            expect(JSON.stringify(changedProfile.messages)).not.toContain(
+              "Configured Claude history",
+            );
+            expect(reader).not.toHaveBeenCalled();
+          } finally {
+            reader.mockRestore();
+          }
+        }
       },
       configKind,
     );

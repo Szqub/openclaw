@@ -1,6 +1,10 @@
-import type { CronFailureNotificationDelivery } from "../types.js";
+import type { CronFailureNotificationDelivery, CronJob } from "../types.js";
 import type { CronJobFamilyIdentity } from "./row-codec.js";
-import type { CronRunReceiptHandle, CronRunReceiptStatus } from "./run-receipt.types.js";
+import type {
+  CronRunReceipt,
+  CronRunReceiptHandle,
+  CronRunReceiptStatus,
+} from "./run-receipt.types.js";
 import type { CronRunRecoveryProposal } from "./run-recovery-read.types.js";
 
 export type CronScheduleMaintenanceOptions = {
@@ -18,7 +22,29 @@ export type CronReceiptTerminal = {
   error?: string;
 };
 
+export type CronReceiptRevisionRefusal = {
+  receiptId: string;
+  message: string;
+  reason: "revision-changed" | "owner-unavailable";
+};
+
 export type CronRuntimeMutationInputs = {
+  "cron.reserveRuns": {
+    storeKey: string;
+    proposals: Array<{
+      jobId: string;
+      enabled: boolean;
+      configRevision: string;
+      nextRunAtMs?: number;
+      lastRunAtMs?: number;
+      lastRunStatus?: CronJob["state"]["lastRunStatus"];
+      immediate: boolean;
+    }>;
+    reservedAtMs: number;
+    preserveSchedule: boolean;
+    scheduleOwnershipAtMs: number;
+    onExit: boolean;
+  };
   "cron.maintainHistory": Record<string, never>;
   "cron.activateRun": {
     storeKey: string;
@@ -37,6 +63,14 @@ export type CronRuntimeMutationInputs = {
   "cron.finishReceipt": {
     storeKey: string;
     terminal: CronReceiptTerminal;
+  };
+  "cron.finalizeRuns": {
+    storeKey: string;
+    jobIds: string[];
+    receipts: Array<{
+      terminal: CronReceiptTerminal;
+      allowMissingJob: boolean;
+    }>;
   };
   "cron.removeStaleFamily": {
     storeKey: string;
@@ -65,6 +99,11 @@ export type CronRuntimeMutationType = keyof CronRuntimeMutationInputs;
 export type CronRuntimeWorkerOperations = {
   [Type in CronRuntimeMutationType]: {
     input: CronRuntimeMutationInputs[Type] & { nonce: string };
-    output: { nonce: string };
+    output:
+      | { nonce: string }
+      | (Type extends "cron.reserveRuns" ? { nonce: string; conflict: CronRunReceipt } : never)
+      | (Type extends "cron.finalizeRuns"
+          ? { nonce: string; receiptRevision: CronReceiptRevisionRefusal }
+          : never);
   };
 };

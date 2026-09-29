@@ -35,11 +35,11 @@ import type { LinkFaviconFetcher } from "../link-favicon-loader.ts";
 import { workspaceResultConflictFromTranscript } from "../workspace-conflict.ts";
 import { readAsyncQuestions, renderAsyncQuestionSummary } from "./chat-async-question.ts";
 import type { AsyncQuestionPresentation } from "./chat-async-question.types.ts";
+import { renderOmittedMedia } from "./chat-message-attachment-status.ts";
 import {
   hasUserFileAttachments,
   renderAssistantAttachments,
   renderMessageAttachment,
-  renderOmittedMedia,
 } from "./chat-message-attachments.ts";
 import { renderMessageWorkContext } from "./chat-message-context.ts";
 import { renderMessageImages } from "./chat-message-images.ts";
@@ -70,7 +70,6 @@ import {
   renderToolIcon,
   renderPluginToolResult,
   resolveCollapsedToolDetail,
-  shouldToggleSelectableDisclosure,
   syncToolDisclosureOverflow,
 } from "./chat-tool-cards.ts";
 import {
@@ -651,14 +650,11 @@ export function renderGroupedMessage(
                       aria-expanded=${String(toolMessageExpanded)}
                       @pointerenter=${syncToolDisclosureOverflow}
                       @focus=${syncToolDisclosureOverflow}
-                      @click=${(event: MouseEvent) => {
-                        if (shouldToggleSelectableDisclosure(event)) {
-                          opts.onToggleToolMessageExpanded?.(
-                            toolMessageDisclosureId,
-                            toolMessageExpanded,
-                          );
-                        }
-                      }}
+                      @click=${() =>
+                        opts.onToggleToolMessageExpanded?.(
+                          toolMessageDisclosureId,
+                          toolMessageExpanded,
+                        )}
                     >
                       <span class="chat-tool-msg-summary__icon">${toolMessageIcon}</span>
                       <span class="chat-tool-disclosure__content">

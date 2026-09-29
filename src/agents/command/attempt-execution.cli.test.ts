@@ -22,6 +22,7 @@ import { clearSessionStoreCacheForTest } from "../../config/sessions/store-write
 import { applyAssistantDeliveryDirectives } from "../../config/sessions/transcript-assistant-delivery.js";
 import type { ModelDefinitionConfig } from "../../config/types.models.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import * as nativeHistory from "../../gateway/cli-session-history.claude.js";
 import { resolveMcpLoopbackScopedTools } from "../../gateway/mcp-http.runtime.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
@@ -1974,6 +1975,31 @@ describe("CLI attempt execution", () => {
     expect(firstRunCliAgentArg().onBeforeFreshCliSessionRetry).toBeUndefined();
   });
 
+  it("preserves a node-placed binding when its native transcript is absent on the Gateway", async () => {
+    const sessionKey = "agent:main:direct:node-claude-history";
+    const cliSessionId = "node-owned-native-session";
+    const sessionEntry = {
+      ...makeClaudeCliSessionEntry("node-local-session", cliSessionId),
+      execHost: "node" as const,
+      execNode: "fixture-node",
+    };
+    const sessionStore = await seedSessionStore(sessionKey, sessionEntry);
+    runCliAgentMock.mockImplementationOnce(async () => {
+      expect(readSessionStore()[sessionKey]?.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(
+        cliSessionId,
+      );
+      return makeCliResult("node response");
+    });
+    await runClaudeCliAttempt({
+      sessionKey,
+      sessionEntry,
+      sessionStore,
+      body: "resume remotely",
+      runId: "node-resume",
+    });
+    expect(firstRunCliAgentArg().cliSessionId).toBe(cliSessionId);
+  });
+
   it("clears the persisted Claude CLI binding but still forwards the candidate when the stored transcript is missing", async () => {
     const sessionKey = "agent:main:direct:claude-missing-transcript";
     const homeDir = path.join(tmpDir, "home");
@@ -3445,7 +3471,7 @@ describe("CLI attempt execution", () => {
     });
   });
 
-  it.each(["absolute", "relative", "bound"] as const)(
+  it.each(["absolute", "relative", "bound", "changed"] as const)(
     "seeds the actual fallback prompt from the %s Claude config directory",
     async (kind) => {
       const homeDir = path.join(tmpDir, "fallback-home");
@@ -3471,6 +3497,10 @@ describe("CLI attempt execution", () => {
           }) + "\n",
         );
       }
+      if (kind === "changed") {
+        vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tmpDir, "new profile"));
+      }
+      const reader = vi.spyOn(nativeHistory, "readClaudeCliFallbackSeed");
       const attempt = await runOpenClawEmbeddedAttemptForTest({
         originalProvider: "claude-cli",
         isFallbackRetry: true,
@@ -3480,7 +3510,9 @@ describe("CLI attempt execution", () => {
           cliSessionBindings: {
             "claude-cli": {
               sessionId: cliSessionId,
-              ...(kind === "bound" ? { cwd: childCwd } : {}),
+              ...(kind === "bound" || kind === "changed"
+                ? { cwd: childCwd, transcriptRoot: path.join(childCwd, configDir, "projects") }
+                : {}),
             },
           },
         },
@@ -3488,9 +3520,16 @@ describe("CLI attempt execution", () => {
       if (typeof attempt.prompt !== "string") {
         throw new Error("Expected the fallback model to receive a text prompt");
       }
-      expect(attempt.prompt).toContain("Native configured history");
+      if (kind === "changed") {
+        expect(attempt.prompt).not.toContain("Native configured history");
+        expect(reader).not.toHaveBeenCalled();
+      } else {
+        expect(attempt.prompt).toContain("Native configured history");
+        expect(reader).toHaveBeenCalledOnce();
+      }
       expect(attempt.prompt).not.toContain("Wrong default history");
       expect(attempt.prompt.match(/Continue this task/g)).toHaveLength(1);
+      reader.mockRestore();
     },
   );
 

@@ -1,6 +1,6 @@
 import type { DeferredCronNotifications } from "../service/state.js";
 import type { CronJob } from "../types.js";
-import type { CronRunReceiptHandle } from "./run-receipt.types.js";
+import type { CronRunReceiptHandle, PreparedCronRunReceiptClaim } from "./run-receipt.types.js";
 import type { CronRunRecoveryOutcome, CronRunRecoveryPreparation } from "./run-recovery.types.js";
 import type { CronRuntimeMutationInputs } from "./runtime-worker.types.js";
 
@@ -11,6 +11,19 @@ type CronScheduleOwnershipFacts = {
 };
 
 export type CronRuntimeMutationContracts = {
+  "cron.reserveRuns": {
+    input: CronRuntimeMutationInputs["cron.reserveRuns"];
+    facts: { receipts: CronRunReceiptHandle[] };
+    preparation: {
+      defaultAgentId?: string;
+      claims: PreparedCronRunReceiptClaim[];
+      replacements: CronRunReceiptHandle[];
+    };
+    outcome: {
+      reservations: Array<{ job: CronJob; runReceipt: CronRunReceiptHandle }>;
+      replacedReceipts: CronRunReceiptHandle[];
+    };
+  };
   "cron.maintainHistory": {
     input: CronRuntimeMutationInputs["cron.maintainHistory"];
     facts: { jobIds: string[]; receipts: CronRunReceiptHandle[] };
@@ -50,6 +63,24 @@ export type CronRuntimeMutationContracts = {
     facts: Record<string, never>;
     preparation: Record<string, never>;
     outcome: Record<string, never>;
+  };
+  "cron.finalizeRuns": {
+    input: CronRuntimeMutationInputs["cron.finalizeRuns"];
+    facts: {
+      jobs: CronJob[];
+      receipts: Array<{
+        receiptId: string;
+        deletionBlocked: boolean;
+        triggerStateRetired: boolean;
+      }>;
+    };
+    preparation: {
+      defaultAgentId?: string;
+      jobs: CronJob[];
+      deletedJobIds: string[];
+      deferredReceiptIds: string[];
+    };
+    outcome: { changed: boolean };
   };
   "cron.removeStaleFamily": {
     input: CronRuntimeMutationInputs["cron.removeStaleFamily"];
