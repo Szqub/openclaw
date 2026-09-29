@@ -525,10 +525,18 @@ directory, and spaces are part of the path. Unset the variable to restore the
 `~/.claude` default.
 
 After a successful Claude CLI turn, OpenClaw retains that turn's working directory
-with the native session binding so fallback and chat history can resolve relative
+and selected transcript root with the native session binding so fallback and chat history can resolve relative
 paths after a restart. Existing bindings without this directory use the available
 session or agent configuration; an earlier ad-hoc directory cannot be recovered
 from its stored hash. A subsequent successful turn records the directory.
+
+Retained Claude native history is readable only while the retained transcript root
+remains authorized by the currently effective Claude profile/root. A changed profile
+is rejected before native-history I/O. The check uses the current backend and skill
+environment selection, including cleared variables; a past per-turn override alone
+does not authorize a later read. Canonical OpenClaw history remains available.
+For paired-node sessions, the node owns native history: Gateway history imports,
+fallbacks, and resume checks do not read Gateway-local Claude files for that binding.
 
 Explicit OpenClaw-managed API-key and token profiles continue to use the
 protected, per-invocation credential-forwarding CLI path.
