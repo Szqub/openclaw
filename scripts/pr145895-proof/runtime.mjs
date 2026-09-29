@@ -189,7 +189,7 @@ function commandPath() {
   for (const entry of ["dist/index.mjs", "dist/index.js"]) {
     const candidate = path.join(candidateRoot, entry);
     if (existsSync(candidate)) {
-      return path.join(candidateRoot, "scripts/run-node.mjs");
+      return path.join(candidateRoot, "openclaw.mjs");
     }
   }
   throw new Error("missing built candidate dist/index.(m)js; run pnpm build first");

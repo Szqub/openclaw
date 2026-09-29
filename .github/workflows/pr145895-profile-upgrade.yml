@@ -10,14 +10,14 @@ on:
         description: Verification scope
         type: choice
         default: all
-        options: [all, upgrade]
+        options: [all, runtime, upgrade]
 
 permissions:
   contents: read
 
 jobs:
   history:
-    if: github.repository == 'Szqub/openclaw' && inputs.lane != 'upgrade'
+    if: github.repository == 'Szqub/openclaw' && inputs.lane == 'all'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -93,9 +93,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/pr145895-evidence" "$RUNNER_TEMP/released-package"
           git rev-parse HEAD > "$RUNNER_TEMP/pr145895-evidence/head.txt"
-          npm pack openclaw@2026.9.6 --pack-destination "$RUNNER_TEMP/released-package" --json > "$RUNNER_TEMP/pr145895-evidence/npm-artifact.json"
+          (cd "$RUNNER_TEMP/released-package" && npm pack openclaw@2026.9.6 --json) > "$RUNNER_TEMP/pr145895-evidence/npm-artifact.json"
           node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; import {createHash} from "node:crypto"; const bytes=fs.readFileSync(process.argv[1]); assert.equal("sha512-"+createHash("sha512").update(bytes).digest("base64"), "sha512-Ie0kyQSCVfFqixsgVg39vevUDq01Ch5u3+7Yu5Y3qARczmdAe+lzp8bVnO9925rHiW/+CFp70zfORCyPmCH31g==");' "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
-          npm install --global --prefix "$RUNNER_TEMP/released-package" --no-audit --no-fund "$RUNNER_TEMP/released-package/openclaw-2026.9.6.tgz"
+          (cd "$RUNNER_TEMP/released-package" && npm install --global --prefix "$RUNNER_TEMP/released-package" --no-audit --no-fund ./openclaw-2026.9.6.tgz)
       - name: Published writer and updater, candidate write and fresh-process reopen
         run: |
           set -o pipefail
