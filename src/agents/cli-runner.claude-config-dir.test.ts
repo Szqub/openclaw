@@ -4,11 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../config/sessions.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import {
-  restoreCliRunnerTestDeps,
-  runPreparedCliAgent as runPreparedCliAgentCore,
-  setCliRunnerTestDeps,
-} from "./cli-runner.js";
+import { runPreparedCliAgent as runPreparedCliAgentCore } from "./cli-runner.js";
 import { buildPreparedCliRunContext } from "./cli-runner.test-helpers.js";
 import { createManagedRun, supervisorSpawnMock } from "./cli-runner.test-support.js";
 import {
@@ -16,12 +12,13 @@ import {
   wrapPreparedCliRunWithTestAdmission,
 } from "./cli-runner/execute.test-support.js";
 import { applyCliSessionBindingResult, getCliSessionBinding } from "./cli-session.js";
+import * as cliTranscript from "./command/attempt-execution.helpers.js";
 
 const runPreparedCliAgent = wrapPreparedCliRunWithTestAdmission(runPreparedCliAgentCore);
 
 afterEach(() => {
   supervisorSpawnMock.mockReset();
-  restoreCliRunnerTestDeps();
+  vi.restoreAllMocks();
 });
 
 describe("Claude CLI transcript root across a forked attempt", () => {
@@ -38,8 +35,9 @@ describe("Claude CLI transcript root across a forked attempt", () => {
     context.reusableCliSession = { mode: "reuse", sessionId: "resumed-session" };
     context.params.forkCliSessionOnResume = true;
     context.params.persistCliSessionForkSuccessor = vi.fn(async () => {});
-    const transcriptProbe = vi.fn(async () => true);
-    setCliRunnerTestDeps({ claudeCliSessionTranscriptHasContent: transcriptProbe });
+    const transcriptProbe = vi
+      .spyOn(cliTranscript, "claudeCliSessionTranscriptHasContent")
+      .mockResolvedValue(true);
     supervisorSpawnMock.mockResolvedValue(
       createManagedRun({
         ...createSuccessfulProcessExit(),

@@ -14,8 +14,8 @@ export function resolveSessionSearchScope(cfg: OpenClawConfig, params: SessionsS
     return invalidSessionRequest(`Unknown agent id "${params.agentId}"`);
   }
   const requestedAgentId = normalizedRequest?.value;
-  const resolvedSessionKeys: Array<{ sessionKey: string; agentId: string }> | undefined =
-    params.sessionKeys ? [] : undefined;
+  const sessionKeys: string[] | undefined = params.sessionKeys ? [] : undefined;
+  const agentIds = new Set<string>();
   for (const sessionKey of params.sessionKeys ?? []) {
     const requestedAgent =
       requestedAgentId &&
@@ -24,19 +24,17 @@ export function resolveSessionSearchScope(cfg: OpenClawConfig, params: SessionsS
         ? ({ ok: true, agentId: requestedAgentId } as const)
         : resolveRequestedSessionAgentId(cfg, sessionKey, requestedAgentId);
     if (!requestedAgent.ok) {
-      return { ok: false as const, error: requestedAgent.error };
+      return requestedAgent;
     }
-    resolvedSessionKeys?.push({
-      sessionKey: resolveStoredSessionKeyForAgentStore({
+    sessionKeys?.push(
+      resolveStoredSessionKeyForAgentStore({
         cfg,
         agentId: requestedAgent.agentId,
         sessionKey,
       }),
-      agentId: requestedAgent.agentId,
-    });
+    );
+    agentIds.add(requestedAgent.agentId);
   }
-  const sessionKeys = resolvedSessionKeys?.map((resolved) => resolved.sessionKey);
-  const agentIds = new Set(resolvedSessionKeys?.map((resolved) => resolved.agentId));
   if (
     agentIds.size > 1 ||
     (requestedAgentId && [...agentIds].some((agentId) => agentId !== requestedAgentId))
@@ -47,7 +45,7 @@ export function resolveSessionSearchScope(cfg: OpenClawConfig, params: SessionsS
   if (!agentId) {
     const fallbackAgent = resolveRequestedSessionAgentId(cfg, "main");
     if (!fallbackAgent.ok) {
-      return { ok: false as const, error: fallbackAgent.error };
+      return fallbackAgent;
     }
     agentId = fallbackAgent.agentId;
   }

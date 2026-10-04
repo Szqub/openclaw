@@ -1,8 +1,8 @@
 import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { createRetainedOperation } from "@openclaw/worker-runtime/lifecycle";
 import { afterEach, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
-import { createRetainedOperation } from "../infra/retained-operation.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { tableHasColumn } from "./openclaw-state-db-schema-helpers.js";
 import {
@@ -16,12 +16,12 @@ import {
   readUserProfileIdentity,
   retainUserProfileCatalog,
 } from "./user-profile-list.js";
+import { setUserProfileRole } from "./user-profile-writes.worker.js";
 import { getProfileAvatar } from "./user-profiles-avatar.test-support.js";
 import {
   adoptTailscaleProfileAvatar,
   ensureProfileForEmail,
   UserProfileNotFoundError,
-  setUserProfileRole,
 } from "./user-profiles.js";
 
 const boundary = vi.hoisted(() => ({
@@ -77,10 +77,10 @@ vi.mock("./user-profile-list.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./user-profile-list.js")>();
   return {
     ...actual,
-    retainUserProfilePublication: (
-      ...args: Parameters<typeof actual.retainUserProfilePublication>
+    retainUserProfileMutationPublication: (
+      ...args: Parameters<typeof actual.retainUserProfileMutationPublication>
     ) => {
-      const publication = actual.retainUserProfilePublication(...args);
+      const publication = actual.retainUserProfileMutationPublication(...args);
       try {
         boundary.duringGrant?.();
       } catch (error) {

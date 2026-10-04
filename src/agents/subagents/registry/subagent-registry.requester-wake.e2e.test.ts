@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { getRuntimeConfig } from "../../../config/config.js";
 import { replaceSessionEntry } from "../../../config/sessions/session-accessor.js";
+import { readDescendantSubagentFallbackReply } from "../../../cron/isolated-agent/subagent-followup.js";
 import { callGateway } from "../../../gateway/call.js";
 import type { GatewayRequestContext } from "../../../gateway/server-methods/types.js";
 import { getAgentEventLifecycleGeneration, onAgentEvent } from "../../../infra/agent-events.js";
@@ -32,6 +33,8 @@ import { announceTesting as subagentAnnounceTesting } from "../announce/subagent
 import { maybeWakeRequesterAfterAllChildrenSettled } from "../announce/subagent-announce.requester-settle-wake.js";
 import * as completionStore from "../completion/subagent-completion-admission.store.js";
 import { registerRequesterFinalAttachment } from "../requester-final-attachment.js";
+import { subagentRuns } from "./subagent-registry-memory.js";
+import { countActiveDescendantRunsFromRuns } from "./subagent-registry-queries.js";
 import { observeRootWork } from "./subagent-registry.browser-cleanup.test-support.js";
 import type {
   GatewayRequest,
@@ -216,7 +219,7 @@ describe("requester settle wake product flow", () => {
     loadConfigMock.mockReset().mockReturnValue({
       agents: {
         defaults: { subagents: { archiveAfterMinutes: 0 } },
-        list: [{ id: "main" }, { id: "research" }],
+        entries: { main: {}, research: {} },
       },
       session: { mainKey: "main", scope: "per-sender" },
     });
@@ -312,7 +315,7 @@ describe("requester settle wake product flow", () => {
       subagentAnnounceDeliveryTesting.setDepsForTest();
       subagentAnnounceOutputTesting.setDepsForTest();
       subagentAnnounceTesting.setDepsForTest();
-      registry.resetSubagentRegistryForTests({ persist: false });
+      await registry.resetSubagentRegistryForTests({ persist: false });
       vi.useRealTimers();
       vi.restoreAllMocks();
       if (previousFastTestEnv === undefined) {
@@ -357,7 +360,7 @@ describe("requester settle wake product flow", () => {
         requesterTurnRunId: params.requesterTurnRunId,
         requesterAgentIdOverride: "main",
         config: {
-          agents: { list: [{ id: "main" }] },
+          agents: { entries: { main: {} } },
           session: { mainKey: "main", scope: "per-sender" },
         },
         callGateway: vi.fn(async () => ({
@@ -623,7 +626,7 @@ describe("requester settle wake product flow", () => {
           onYield: () => {},
         }).execute(`yield-${requesterTurnRunId}`, {});
         expect(result).toMatchObject({
-          details: { status: accepted.length > 0 ? "yielded" : "error" },
+          details: { status: accepted.length > 0 ? "yielded" : "nothing_pending" },
         });
         if (runtime === "native") {
           const harnessSelection = await import("../../harness/selection.js");
@@ -815,9 +818,9 @@ describe("requester settle wake product flow", () => {
             expect(visibleFinals).toBe(0);
             expect(append).not.toHaveBeenCalled();
             if (acceptNextChild) {
-              expect(registry.countActiveDescendantRuns(MAIN_REQUESTER_SESSION_KEY, "main")).toBe(
-                1,
-              );
+              expect(
+                countActiveDescendantRunsFromRuns(subagentRuns, MAIN_REQUESTER_SESSION_KEY, "main"),
+              ).toBe(1);
               expect(registry.getSubagentRunByRunId(beta.runId)).toMatchObject({
                 requesterTurnRunId: undefined,
                 requesterSettleWake: {
@@ -868,7 +871,9 @@ describe("requester settle wake product flow", () => {
             ]);
             expect(visibleFinals).toBe(1);
             expect(sendMessageMock).not.toHaveBeenCalled();
-            expect(registry.countActiveDescendantRuns(MAIN_REQUESTER_SESSION_KEY, "main")).toBe(0);
+            expect(
+              countActiveDescendantRunsFromRuns(subagentRuns, MAIN_REQUESTER_SESSION_KEY, "main"),
+            ).toBe(0);
             if (attachRequesterFinal) {
               expect(append).toHaveBeenCalledExactlyOnceWith("completion delivered");
             }
@@ -877,6 +882,72 @@ describe("requester settle wake product flow", () => {
       } finally {
         attachment?.revoke();
       }
+    },
+  );
+
+  it.each([
+    { archiveAfterMinutes: 1, retiredAfterMs: 60_000, restart: false },
+    // Without an archive deadline, settled delete rows fall back to the five-minute run TTL.
+    { archiveAfterMinutes: 0, retiredAfterMs: 5 * 60_000 + 1, restart: true },
+  ])(
+    "keeps a cron run's delete-cleanup child readable after its settle wake (archive=$archiveAfterMinutes, restart=$restart)",
+    async ({ archiveAfterMinutes, retiredAfterMs, restart }) => {
+      vi.setSystemTime(100_000);
+      const cronRunSessionKey = "agent:main:cron:job-spawn-only:run:sess-cron";
+      const child = { runId: "run-cron-child", childSessionKey: "agent:main:subagent:cron-child" };
+      const cfg = loadConfigMock();
+      loadConfigMock.mockReturnValue({
+        ...cfg,
+        agents: { ...cfg.agents, defaults: { subagents: { archiveAfterMinutes } } },
+      });
+      sessionStore[cronRunSessionKey] = { sessionId: "sess-cron", updatedAt: 1 };
+      await replaceSessionEntry(
+        { storePath: sessionStorePath, sessionKey: cronRunSessionKey },
+        sessionStore[cronRunSessionKey],
+      );
+      const context = createGatewayContext();
+      await registry.initSubagentRegistry();
+      await registry.activateSubagentRegistry(() => context);
+      await registry.registerSubagentRun(
+        createSubagentRunParams({
+          ...child,
+          requesterSessionKey: cronRunSessionKey,
+          requesterDisplayKey: "cron",
+          cleanup: "delete",
+          expectsCompletionMessage: true,
+        }),
+      );
+
+      emitCompleted(child.runId, child.childSessionKey, "CRON CHILD ANSWER");
+      await flushOwnedWork();
+      await vi.waitFor(() => {
+        expect(maybeWakeRequesterAfterAllChildrenSettled).toHaveBeenCalledWith(
+          expect.objectContaining({
+            settledEntry: expect.objectContaining({ runId: child.runId }),
+          }),
+        );
+        expect(registry.getSubagentRunByRunId(child.runId)?.requesterSettleWake).toBeUndefined();
+      });
+      await flushOwnedWork();
+      // Delete cleanup removed the child session; the cron run reads the captured result.
+      chatHistoryBySessionKey.delete(child.childSessionKey);
+      if (restart) {
+        await registry.resetSubagentRegistryForTests({ persist: false });
+        await registry.initSubagentRegistry();
+        await registry.activateSubagentRegistry(() => context);
+        await flushOwnedWork();
+      }
+
+      await expect(
+        readDescendantSubagentFallbackReply({ sessionKey: cronRunSessionKey, runStartedAt: 0 }),
+      ).resolves.toBe("CRON CHILD ANSWER");
+      expect(getAgentCalls()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(retiredAfterMs);
+      await registry.testing.sweepOnceForTests();
+      await flushOwnedWork();
+      expect(registry.getSubagentRunByRunId(child.runId)).toBeUndefined();
+      expect(getAgentCalls()).toHaveLength(0);
     },
   );
 

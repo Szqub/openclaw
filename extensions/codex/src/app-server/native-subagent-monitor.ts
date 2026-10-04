@@ -114,7 +114,6 @@ class Monitor {
   private readonly knownChildren = new Map<string, KnownChild>();
   private readonly childThreadIdsByAgentPath = new Map<string, string>();
   private readonly interruptModelExecution?: MonitorOptions["interruptModelExecution"];
-  private readonly now: () => number;
   private readonly removeNotificationHandler: () => void;
   private readonly removeCloseHandler: () => void;
   private readonly retainClient?: () => (() => void) | undefined;
@@ -133,7 +132,6 @@ class Monitor {
     private readonly runtime: NativeSubagentMonitorRuntime = defaultNativeSubagentMonitorRuntime,
     options: MonitorOptions = {},
   ) {
-    this.now = options.now ?? Date.now;
     this.interruptModelExecution = options.interruptModelExecution;
     this.admissionCustody = new CodexNativeSubagentAdmissionCustody({
       parentState: (id) => this.parentStates.get(id),
@@ -173,7 +171,6 @@ class Monitor {
     });
     this.completionDelivery = new CodexNativeSubagentCompletionDelivery({
       deliver: (params) => runtime.deliverAgentHarnessCompletion(params),
-      now: this.now,
       retryDelaysMs: options.completionDeliveryRetryDelaysMs,
       maxRetries: options.completionDeliveryMaxRetries,
       isCurrentChild: (child) => this.childStates.get(child.runId) === child,
@@ -206,11 +203,9 @@ class Monitor {
       isRegisteredChild: (child) => this.childStates.get(child.runId) === child,
       currentChild: (id) => this.currentChild(id),
       parentState: (id) => this.parentStates.get(id),
-      isRetiredParent: (state) => this.retiredParentStates.has(state),
       reconcileChildState: (child) => this.reconcileChildState(child),
       processCompletion: (state, child, completion, eventAt) =>
         this.processCompletion(state, child, completion, eventAt),
-      now: this.now,
       recoveryPollDelaysMs: options.recoveryPollDelaysMs,
     });
     this.removeNotificationHandler = client.addNotificationHandler(async (notification) => {
@@ -486,14 +481,12 @@ class Monitor {
   registerParent(params: NativeParentRegistration): Promise<ParentRegistrationHandle> {
     return registerNativeSubagentParent(params, {
       states: this.parentStates,
-      children: this.childStates,
       isClosed: () => this.disposed,
       isRetired: (state) => this.retiredParentStates.has(state),
       runtime: this.runtime,
       submissions: this.submissions,
       assignments: this.assignments,
       closes: this.childCloses,
-      deliverPending: (state, child) => this.completionDelivery.deliverPending(state, child),
       deliverDetached: (state) =>
         this.completionDelivery.deliverDetached(state, this.childStates.values()),
       drainAdmissions: (state, owner, turnId) =>
@@ -836,7 +829,7 @@ class Monitor {
           this.recovery.setRecoveryFallback(
             childState,
             systemErrorFallbackCompletion(childState.childThreadId),
-            this.now(),
+            Date.now(),
           );
         }
         void this.reconcileChildThread(threadId)
@@ -997,7 +990,7 @@ class Monitor {
       return;
     }
     this.resumeChild(childState, { scheduleRecovery: false });
-    this.recovery.setRecoveryFallback(childState, completion, this.now());
+    this.recovery.setRecoveryFallback(childState, completion, Date.now());
     await this.recovery.reconcileRegisteredChild(childState).catch((error: unknown) => {
       logRecoveryFailure(childState.childThreadId, error);
       return false;
@@ -1075,7 +1068,7 @@ class Monitor {
     }
     const fallback = completion ?? recovery.fallbackCompletion;
     if (fallback) {
-      this.recovery.setRecoveryFallback(child, fallback, fallback.completedAt ?? this.now());
+      this.recovery.setRecoveryFallback(child, fallback, fallback.completedAt ?? Date.now());
     }
     return undefined;
   }
@@ -1145,7 +1138,7 @@ class Monitor {
     state: ParentState,
     childState: ChildState,
     completion: CodexNativeSubagentCompletion,
-    eventAt: number = this.now(),
+    eventAt: number = Date.now(),
   ): Promise<void> {
     if (childState.terminal) {
       return;

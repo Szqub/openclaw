@@ -14,7 +14,6 @@ import {
 } from "../talk/agent-consult-tool.js";
 import type { RealtimeVoiceTool } from "../talk/provider-types.js";
 import type { RealtimeVoiceBridgeSession } from "../talk/session-runtime.js";
-import type { TalkEventInput } from "../talk/talk-events.js";
 import type {
   MeetingAgentConsultSurface,
   MeetingPlatformRuntimeMetadata,
@@ -25,17 +24,6 @@ import type {
   MeetingRuntimePlatform,
 } from "./realtime-engine.js";
 import { readMeetingRealtimeToolAbortSignal } from "./realtime-tool-continuity.js";
-
-function resolveMeetingAgentConsultSurface(
-  platform: MeetingPlatformRuntimeMetadata,
-): MeetingAgentConsultSurface {
-  return {
-    id: platform.id,
-    provider: platform.id,
-    lane: platform.id,
-    ...platform.agentConsult,
-  };
-}
 
 export function createMeetingRealtimeEngineBindings(params: {
   platform: MeetingPlatformRuntimeMetadata;
@@ -54,7 +42,12 @@ export function createMeetingRealtimeEngineBindings(params: {
   tools: RealtimeVoiceTool[];
   handleToolCall: (call: MeetingRealtimeToolCallParams) => Promise<void>;
 } {
-  const surface = resolveMeetingAgentConsultSurface(params.platform);
+  const surface: MeetingAgentConsultSurface = {
+    id: params.platform.id,
+    provider: params.platform.id,
+    lane: params.platform.id,
+    ...params.platform.agentConsult,
+  };
   return {
     platform: {
       displayName: params.platform.displayName,
@@ -147,15 +140,25 @@ async function consultMeetingAgent(
 
 async function handleMeetingRealtimeConsultToolCall(
   params: MeetingAgentConsultContext &
-    Omit<MeetingRealtimeToolCallParams, "onTalkEvent"> & {
+    MeetingRealtimeToolCallParams & {
       abortSignal?: AbortSignal;
-      onTalkEvent?: (event: TalkEventInput) => void;
     },
 ): Promise<void> {
   const callId = params.event.callId || params.event.itemId;
   if (params.abortSignal?.aborted) {
     return;
   }
+  const submitError = async (message: string) => {
+    await params.session.submitToolResult(callId, { error: message });
+    if (!params.abortSignal?.aborted) {
+      params.onTalkEvent({
+        type: "tool.error",
+        callId,
+        payload: { name: params.event.name, error: message },
+        final: true,
+      });
+    }
+  };
   const unavailableToolError =
     params.strategy !== "bidi"
       ? `Tool "${params.event.name}" is only available in bidi realtime strategy`
@@ -163,16 +166,7 @@ async function handleMeetingRealtimeConsultToolCall(
         ? `Tool "${params.event.name}" not available`
         : undefined;
   if (unavailableToolError) {
-    await params.session.submitToolResult(callId, { error: unavailableToolError });
-    if (params.abortSignal?.aborted) {
-      return;
-    }
-    params.onTalkEvent?.({
-      type: "tool.error",
-      callId,
-      payload: { name: params.event.name, error: unavailableToolError },
-      final: true,
-    });
+    await submitError(unavailableToolError);
     return;
   }
   await submitMeetingConsultWorkingResponse({
@@ -184,7 +178,7 @@ async function handleMeetingRealtimeConsultToolCall(
   if (params.abortSignal?.aborted) {
     return;
   }
-  params.onTalkEvent?.({
+  params.onTalkEvent({
     type: "tool.progress",
     callId,
     payload: { name: params.event.name, status: "working" },
@@ -196,17 +190,7 @@ async function handleMeetingRealtimeConsultToolCall(
     if (params.abortSignal?.aborted) {
       return;
     }
-    const message = formatErrorMessage(error);
-    await params.session.submitToolResult(callId, { error: message });
-    if (params.abortSignal?.aborted) {
-      return;
-    }
-    params.onTalkEvent?.({
-      type: "tool.error",
-      callId,
-      payload: { name: params.event.name, error: message },
-      final: true,
-    });
+    await submitError(formatErrorMessage(error));
     return;
   }
   if (params.abortSignal?.aborted) {
@@ -216,7 +200,7 @@ async function handleMeetingRealtimeConsultToolCall(
   if (params.abortSignal?.aborted) {
     return;
   }
-  params.onTalkEvent?.({
+  params.onTalkEvent({
     type: "tool.result",
     callId,
     payload: { name: params.event.name, result },

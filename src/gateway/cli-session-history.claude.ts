@@ -19,12 +19,7 @@ import {
 } from "../agents/command/claude-cli-project-dir.js";
 import type { AgentMessage } from "../agents/runtime/index.js";
 import { redactTranscriptMessage } from "../agents/transcript-redact.js";
-import {
-  isToolCallBlock,
-  isToolResultBlock,
-  resolveToolUseId,
-  type ToolContentBlock,
-} from "../chat/tool-content.js";
+import { isToolCallBlock, isToolResultBlock, resolveToolUseId } from "../chat/tool-content.js";
 import type { CliSessionReseedReceipt, SessionEntry } from "../config/sessions.js";
 import {
   getCliSessionBinding,
@@ -32,7 +27,7 @@ import {
 } from "../config/sessions/cli-session-binding.js";
 import { attachOpenClawTranscriptMeta } from "./session-transcript-readers.js";
 
-export const CLAUDE_CLI_PROVIDER = "claude-cli";
+const CLAUDE_CLI_PROVIDER = "claude-cli";
 
 export type ClaudeCliProjectEntry = {
   type?: unknown;
@@ -130,10 +125,6 @@ export function resolveClaudeCliBindingSessionId(
   return getCliSessionBinding(entry, CLAUDE_CLI_PROVIDER)?.sessionId;
 }
 
-export function resolveClaudeCliTimestampMs(value: unknown): number | undefined {
-  return parseDateStringTimestampMs(value);
-}
-
 function resolveClaudeCliUsage(raw: ClaudeCliUsage) {
   if (!raw || typeof raw !== "object") {
     return undefined;
@@ -159,9 +150,8 @@ function resolveClaudeCliUsage(raw: ClaudeCliUsage) {
 }
 
 function removeContentBlock<T>(content: T[], blockIndex: number): T[] | null {
-  const nextContent = structuredClone(content);
-  nextContent.splice(blockIndex, 1);
-  return nextContent.length > 0 ? nextContent : null;
+  content.splice(blockIndex, 1);
+  return content.length > 0 ? content : null;
 }
 
 function normalizeClaudeCliContent(
@@ -172,13 +162,12 @@ function normalizeClaudeCliContent(
     return content;
   }
 
-  const normalized: ToolContentBlock[] = [];
-  for (const item of content) {
-    if (!item || typeof item !== "object") {
-      normalized.push(structuredClone(item as ToolContentBlock));
-      continue;
+  return content.map((item) => {
+    if (!isRecord(item)) {
+      return item;
     }
-    const block = structuredClone(item as ToolContentBlock);
+    // Import owns decoded payloads; only normalization's top-level edits need a copy.
+    const block = { ...item };
     const type = typeof block.type === "string" ? block.type : "";
     if (type === "tool_use") {
       // Claude stores tool calls as `tool_use` with `input`; OpenClaw history
@@ -189,7 +178,7 @@ function normalizeClaudeCliContent(
         toolNameRegistry.set(id, name);
       }
       if (block.input !== undefined && block.arguments === undefined) {
-        block.arguments = structuredClone(block.input);
+        block.arguments = block.input;
       }
       block.type = "toolcall";
       delete block.input;
@@ -202,9 +191,8 @@ function normalizeClaudeCliContent(
         }
       }
     }
-    normalized.push(block);
-  }
-  return normalized;
+    return block;
+  });
 }
 
 function coalesceClaudeCliToolMessages(messages: TranscriptLikeMessage[]): TranscriptLikeMessage[] {
@@ -240,7 +228,7 @@ export function appendCoalescedClaudeCliToolMessage(
     if (allResultsMatch) {
       messages[messages.length - 1] = {
         ...prior,
-        content: [...callBlocks, ...resultBlocks].map((block) => structuredClone(block)),
+        content: [...callBlocks, ...resultBlocks],
       };
       return;
     }
@@ -327,7 +315,7 @@ export function parseClaudeCliHistoryEntry(
     return null;
   }
 
-  const timestamp = resolveClaudeCliTimestampMs(entry.timestamp);
+  const timestamp = parseDateStringTimestampMs(entry.timestamp);
   const externalId = normalizeOptionalString(entry.uuid);
   const baseMeta = {
     id: externalId ?? `${CLAUDE_CLI_PROVIDER}:${cliSessionId}:line:${sourceLineNumber}`,
@@ -388,12 +376,10 @@ export function parseClaudeCliHistoryEntry(
                 content = contentWithoutReseed;
                 break;
               }
-              const nextContent = structuredClone(content);
-              const block = nextContent[candidate.blockIndex];
+              const block = content[candidate.blockIndex];
               if (block && typeof block === "object") {
                 (block as Record<string, unknown>).text = reseedPrompt.userMessage;
               }
-              content = nextContent;
             }
             break;
           }
@@ -517,59 +503,6 @@ export async function resolveClaudeCliSessionFilePathAsync(
     }
   }
   return undefined;
-}
-
-/** Reads visible messages for a bound Claude CLI session. */
-export function readClaudeCliSessionMessages(
-  params: ClaudeCliHistoryLookupParams & {
-    localSessionId?: string;
-    reseedReceipt?: CliSessionReseedReceipt;
-  },
-): TranscriptLikeMessage[] {
-  const filePath = resolveClaudeCliSessionFilePath(params);
-  if (!filePath) {
-    return [];
-  }
-
-  let content: string;
-  try {
-    content = fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return [];
-  }
-
-  const messages: TranscriptLikeMessage[] = [];
-  const toolNameRegistry: ToolNameRegistry = new Map();
-  const reseedState = createClaudeReseedImportState(params);
-  const lines = content.split(/\r?\n/);
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    const line = lines[lineIndex] ?? "";
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const parsed = decodeClaudeCliProjectEntry(line);
-      const message = parseClaudeCliHistoryEntry(
-        parsed,
-        params.cliSessionId,
-        lineIndex + 1,
-        toolNameRegistry,
-        {
-          reseedMode: "recover",
-          reseedState,
-        },
-      );
-      if (message) {
-        messages.push(message);
-      }
-    } catch {
-      // Ignore malformed external history entries.
-    }
-  }
-  const visibleMessages = coalesceClaudeCliToolMessages(messages);
-  // Match local transcript persistence before dedupe so imported secrets cannot
-  // bypass exact-text matching or reach chat history through the external copy.
-  return visibleMessages.map(redactClaudeCliHistoryMessage);
 }
 
 export type ClaudeCliFallbackSeed = {

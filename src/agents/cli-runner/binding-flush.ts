@@ -1,5 +1,7 @@
 /** Probes whether a Claude CLI session binding reached its native transcript file. */
-import { cliRunSettlementDeps, isClaudeCliBackend } from "./cli-run-settlement.js";
+import { sleep } from "../../utils/sleep.js";
+import { claudeCliSessionTranscriptHasContent } from "../command/attempt-execution.helpers.js";
+import { isClaudeCliBackend } from "./cli-run-settlement.js";
 
 export async function isCliBindingFlushed(
   sessionId: string | undefined,
@@ -21,9 +23,9 @@ export async function isCliBindingFlushed(
   const probe = { sessionId, workspaceDir, projectsRoot: options?.projectsRoot };
   for (const delayMs of [0, 50, 150]) {
     if (delayMs > 0) {
-      await cliRunSettlementDeps.delay(delayMs);
+      await sleep(delayMs);
     }
-    if (await cliRunSettlementDeps.claudeCliSessionTranscriptHasContent(probe)) {
+    if (await claudeCliSessionTranscriptHasContent(probe)) {
       return true;
     }
   }

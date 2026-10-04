@@ -30,6 +30,7 @@ const RESERVED_NAMESPACE_GLOBALS = new Set([
   "Date",
   "Error",
   "globalThis",
+  "load",
   "log",
   "json",
   "JSON",
@@ -45,6 +46,7 @@ const RESERVED_NAMESPACE_GLOBALS = new Set([
   "Set",
   "setTimeout",
   "skills",
+  "store",
   "String",
   "text",
   "tools",
@@ -417,7 +419,7 @@ interface AgentRunOptions {
   label?: string;
   model?: string;
   thinking?: string;
-  fastMode?: boolean | "auto";
+  fastMode?: boolean | "auto" | "ultrafast";
   agentId?: string;
   schema?: AgentJsonSchema;
   phase?: string;

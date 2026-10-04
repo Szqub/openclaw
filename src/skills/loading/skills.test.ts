@@ -191,12 +191,18 @@ afterEach(() => {
 });
 
 describe("buildWorkspaceSkillCommandSpecs", () => {
-  it("moves a colliding dashboard skill to the documented generated alias", async () => {
+  it.each([
+    ["dashboard", "dashboard_2"],
+    ["export-session", "export_session_2"],
+    ["export_session", "export_session_2"],
+    ["export-trajectory", "export_trajectory_2"],
+    ["export_trajectory", "export_trajectory_2"],
+  ])("moves a colliding %s skill to the generated alias %s", async (skillName, commandName) => {
     const workspaceDir = await makeWorkspace();
     await writeSkill({
-      dir: path.join(workspaceDir, "skills", "dashboard"),
-      name: "dashboard",
-      description: "Custom dashboard skill",
+      dir: path.join(workspaceDir, "skills", skillName),
+      name: skillName,
+      description: "Custom command skill",
     });
 
     const [command] = withWorkspaceHome(workspaceDir, () =>
@@ -206,7 +212,24 @@ describe("buildWorkspaceSkillCommandSpecs", () => {
       }),
     );
 
-    expect(command).toMatchObject({ name: "dashboard_2", skillName: "dashboard" });
+    expect(command).toMatchObject({ name: commandName, skillName });
+  });
+
+  it("preserves reserved generated names ending in a truncated underscore", async () => {
+    const workspaceDir = await makeWorkspace();
+    const skillName = `${"a".repeat(31)}-more`;
+    await writeSkill({
+      dir: path.join(workspaceDir, "skills", "long-name"),
+      name: skillName,
+      description: "Long command skill",
+    });
+    const [command] = withWorkspaceHome(workspaceDir, () =>
+      buildWorkspaceSkillCommandSpecs(workspaceDir, {
+        ...resolveTestSkillDirs(workspaceDir),
+        reservedNames: new Set([`${"a".repeat(31)}_`]),
+      }),
+    );
+    expect(command).toMatchObject({ name: `${"a".repeat(30)}_2`, skillName });
   });
 
   it("sanitizes and de-duplicates command names", async () => {
@@ -303,7 +326,7 @@ describe("buildWorkspaceSkillCommandSpecs", () => {
           defaults: {
             skills: ["alpha-skill"],
           },
-          list: [{ id: "writer", workspace: workspaceDir }],
+          entries: { writer: { workspace: workspaceDir } },
         },
       },
       agentId: "writer",
@@ -416,15 +439,14 @@ describe("buildWorkspaceSkillsPrompt", () => {
               },
             },
             agents: {
-              list: [
-                {
-                  id: "writer",
+              entries: {
+                writer: {
                   workspace: workspaceDir,
                   skillsLimits: {
                     maxSkillsPromptChars: 220,
                   },
                 },
-              ],
+              },
             },
           },
           agentId: "writer",
@@ -434,7 +456,7 @@ describe("buildWorkspaceSkillsPrompt", () => {
     expect(prompt).toContain("Skills truncated: included 0 of 3");
   });
 
-  it("does not apply agents.list[].skillsLimits without an explicit agent id", async () => {
+  it("does not apply agents.entries.<id>.skillsLimits without an explicit agent id", async () => {
     const workspaceDir = await makeWorkspace();
     await writePromptLimitSkills(workspaceDir);
 
@@ -450,15 +472,14 @@ describe("buildWorkspaceSkillsPrompt", () => {
               },
             },
             agents: {
-              list: [
-                {
-                  id: "main",
+              entries: {
+                main: {
                   workspace: workspaceDir,
                   skillsLimits: {
                     maxSkillsPromptChars: 220,
                   },
                 },
-              ],
+              },
             },
           },
         }),
