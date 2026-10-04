@@ -24,6 +24,7 @@ import { SerializedJsonArray } from "../serialized-json.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
 import { readSessionMessageByIdAsync } from "../session-transcript-readers.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
+import * as historyPages from "./chat-history-pages.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
 import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
 
@@ -190,11 +191,22 @@ describe("CLI-imported history pages", () => {
             });
             return result;
           };
+          const retainAuthorization = vi.fn<(isCurrent: () => boolean) => void>();
+          const readMessage = historyPages.readChatHistoryMessageById;
+          vi.spyOn(historyPages, "readChatHistoryMessageById").mockImplementationOnce(
+            (input, retain) =>
+              readMessage(input, (isCurrent) => {
+                retainAuthorization(isCurrent);
+                retain?.(isCurrent);
+              }),
+          );
           const nativeId = expectDefined(importedIds[0], "native message ID");
           expect(await getMessage(nativeId)).toMatchObject({
             ok: true,
             message: { content: "Imported 0: native-only message" },
           });
+          expect(retainAuthorization).toHaveBeenCalledOnce();
+          expect(retainAuthorization.mock.calls[0]?.[0]()).toBe(true);
           const revoke = () =>
             vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(path.dirname(sourcePath), "new-profile"));
           const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;

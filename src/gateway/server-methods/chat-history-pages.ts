@@ -88,7 +88,14 @@ async function withNativeHistoryAuthorizationFallback<T>(
   }
 }
 
-export async function readChatHistoryMessageById(input: ChatHistoryMessageParams) {
+// Kept outside worker params: the consumer retains this guard until publication,
+// without serializing callbacks or attaching native authority to canonical fallbacks.
+type RetainNativeHistoryAuthorization = (isCurrent: () => boolean) => void;
+
+export async function readChatHistoryMessageById(
+  input: ChatHistoryMessageParams,
+  retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
+) {
   const {
     params,
     sameAuthorization,
@@ -125,7 +132,14 @@ export async function readChatHistoryMessageById(input: ChatHistoryMessageParams
       readCanonical,
       () => readProcessHeldCliHistoryMessage(params, assertNativeHistoryAuthorized),
     );
-    return outcome.usedFallback || sameAuthorization() ? outcome.result : readCanonical();
+    if (outcome.usedFallback) {
+      return outcome.result;
+    }
+    if (!sameAuthorization()) {
+      return readCanonical();
+    }
+    retainNativeHistoryAuthorization?.(sameAuthorization);
+    return outcome.result;
   }
   const { readSessionHistoryPageInWorker } =
     await import("../../config/sessions/session-history-worker-runtime.js");
@@ -145,12 +159,20 @@ export async function readChatHistoryMessageById(input: ChatHistoryMessageParams
         onNativeHistoryAuthorizationRequest,
       ),
   );
-  return outcome.usedFallback || sameAuthorization() ? outcome.result : readCanonical();
+  if (outcome.usedFallback) {
+    return outcome.result;
+  }
+  if (!sameAuthorization()) {
+    return readCanonical();
+  }
+  retainNativeHistoryAuthorization?.(sameAuthorization);
+  return outcome.result;
 }
 
 export async function readChatHistoryPage(
   input: ChatHistoryPageParams,
   signal?: AbortSignal,
+  retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
 ): Promise<ChatHistoryPage> {
   signal?.throwIfAborted();
   const {
@@ -187,6 +209,7 @@ export async function readChatHistoryPage(
       if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
         return readPage({ ...input, ignoreCliSessionImports: true });
       }
+      retainNativeHistoryAuthorization?.(sameAuthorization);
       return refreshed;
     }
     if (
@@ -232,6 +255,9 @@ export async function readChatHistoryPage(
     const page = outcome.result;
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
       return readPage({ ...input, ignoreCliSessionImports: true });
+    }
+    if (!pageParams.ignoreCliSessionImports) {
+      retainNativeHistoryAuthorization?.(sameAuthorization);
     }
     return page;
   };

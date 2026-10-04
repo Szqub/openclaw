@@ -114,22 +114,33 @@ async function createFixture(
   };
 }
 
-async function readFixture(fixture: Fixture, options?: { cwd?: string; omitCwd?: true }) {
+async function readFixture(
+  fixture: Fixture,
+  options?: {
+    cwd?: string;
+    omitCwd?: true;
+    retainAuthorization?: Parameters<typeof readChatHistoryPage>[2];
+  },
+) {
   const requestedCwd = options?.omitCwd ? undefined : (options?.cwd ?? fixture.cwd);
-  return await readChatHistoryPage({
-    entry: fixture.entry,
-    provider: "claude-cli",
-    sessionId: fixture.sessionId,
-    storePath: fixture.storePath,
-    sessionAgentId: "main",
-    canonicalKey: fixture.sessionKey,
-    max: 20,
-    maxHistoryBytes: 100_000,
-    effectiveMaxChars: 100_000,
-    offset: undefined,
-    messageId: undefined,
-    ...(requestedCwd ? { cwd: requestedCwd } : {}),
-  });
+  return await readChatHistoryPage(
+    {
+      entry: fixture.entry,
+      provider: "claude-cli",
+      sessionId: fixture.sessionId,
+      storePath: fixture.storePath,
+      sessionAgentId: "main",
+      canonicalKey: fixture.sessionKey,
+      max: 20,
+      maxHistoryBytes: 100_000,
+      effectiveMaxChars: 100_000,
+      offset: undefined,
+      messageId: undefined,
+      ...(requestedCwd ? { cwd: requestedCwd } : {}),
+    },
+    undefined,
+    options?.retainAuthorization,
+  );
 }
 
 async function withConfig<T>(config: OpenClawConfig, run: () => Promise<T>): Promise<T> {
@@ -177,7 +188,10 @@ describe("Claude CLI history config directory", () => {
       const fixture = await createFixture(state, { configDir });
       const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
 
-      const page = await readFixture(fixture);
+      const retainAuthorization = vi.fn<(isCurrent: () => boolean) => void>();
+      const page = await readFixture(fixture, { retainAuthorization });
+      expect(retainAuthorization).toHaveBeenCalledOnce();
+      expect(retainAuthorization.mock.calls[0]?.[0]()).toBe(true);
 
       expect(page.messages).toEqual(
         expect.arrayContaining([expect.objectContaining({ content: "Imported answer" })]),
