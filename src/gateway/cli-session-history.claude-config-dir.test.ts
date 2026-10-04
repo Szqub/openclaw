@@ -20,6 +20,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
 import {
   withOpenClawTestState,
@@ -466,6 +467,10 @@ describe("Claude CLI history config directory", () => {
   it("keeps legacy rootless bindings compatible when the current root is authorized", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const fixture = await createFixture(state);
+      const originalNativeSessionId = fixture.entry.cliSessionBindings?.["claude-cli"]?.sessionId;
+      if (!originalNativeSessionId) {
+        throw new Error("Expected the fixture's Claude binding to exist");
+      }
       delete fixture.entry.cliSessionBindings?.["claude-cli"]?.transcriptRoot;
 
       await upsertSessionEntryCore(
@@ -486,11 +491,73 @@ describe("Claude CLI history config directory", () => {
         throw new Error("Expected the persisted Claude binding to reload");
       }
       expect(reloaded.cliSessionBindings?.["claude-cli"]?.transcriptRoot).toBeUndefined();
+      expect(reloaded.sessionId).toBe(fixture.sessionId);
+      expect(reloaded.cliSessionBindings?.["claude-cli"]?.sessionId).toBe(originalNativeSessionId);
       const page = await readFixture({ ...fixture, entry: reloaded });
 
       expect(page.messages).toEqual(
         expect.arrayContaining([expect.objectContaining({ content: "Imported answer" })]),
       );
+      expect(page.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ content: "Canonical question" }),
+          expect.objectContaining({ content: "Canonical answer" }),
+        ]),
+      );
+
+      const scope = {
+        agentId: "main",
+        sessionKey: fixture.sessionKey,
+        sessionId: fixture.sessionId,
+      };
+      const legacyBinding = reloaded.cliSessionBindings?.["claude-cli"];
+      if (!legacyBinding) {
+        throw new Error("Expected the reloaded Claude binding to exist");
+      }
+      await upsertSessionEntryCore(scope, {
+        cliSessionBindings: {
+          "claude-cli": {
+            ...legacyBinding,
+            cwd: fixture.cwd,
+            transcriptRoot: fixture.projectsRoot,
+          },
+        },
+      });
+      await appendTranscriptMessage(scope, {
+        message: { role: "assistant", content: "Canonical append after upgrade" },
+      });
+      await closeOpenClawAgentDatabasesAsync(state.stateDir);
+      closeOpenClawAgentDatabasesForTest(state.stateDir);
+
+      const upgraded = loadSessionEntry({
+        agentId: "main",
+        sessionKey: fixture.sessionKey,
+        storePath: fixture.storePath,
+      });
+      if (!upgraded) {
+        throw new Error("Expected the upgraded Claude binding to reload");
+      }
+      expect(upgraded.sessionId).toBe(fixture.sessionId);
+      expect(upgraded.cliSessionBindings?.["claude-cli"]).toMatchObject({
+        sessionId: originalNativeSessionId,
+        cwd: fixture.cwd,
+        transcriptRoot: fixture.projectsRoot,
+      });
+      const upgradedPage = await readFixture({ ...fixture, entry: upgraded });
+      expect(upgradedPage.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ content: "Canonical question" }),
+          expect.objectContaining({ content: "Canonical answer" }),
+          expect.objectContaining({ content: "Canonical append after upgrade" }),
+          expect.objectContaining({ content: "Imported answer" }),
+        ]),
+      );
+
+      const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+      expect(database.db.prepare("PRAGMA integrity_check").get()).toEqual({
+        integrity_check: "ok",
+      });
+      expect(database.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     });
   });
 

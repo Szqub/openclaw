@@ -6,6 +6,7 @@ import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appendTranscriptMessage,
+  replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import type { ChatHistoryPage } from "../../config/sessions/session-history-types.js";
@@ -15,10 +16,13 @@ import { applyLoggingConfig } from "../../logging/logger.js";
 import { registerSecretValueForRedaction } from "../../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../../logging/secret-redaction-registry.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import * as processHeldCliHistory from "../cli-session-history.process-held.js";
 import { SerializedJsonArray } from "../serialized-json.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
+import { readSessionMessageByIdAsync } from "../session-transcript-readers.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
+import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
 
 type HistoryPage = {
   messages: unknown[];
@@ -78,6 +82,7 @@ async function withImportedHistory(
     read: (params: HistoryRequest, options?: HistoryReadOptions) => Promise<HistoryPage>;
     importedIds: string[];
     sourcePath: string;
+    sessionsDir: string;
     scope: { agentId: string; sessionId: string; sessionKey: string };
   }) => Promise<void>,
   incognito = false,
@@ -129,6 +134,7 @@ async function withImportedHistory(
       read: await historyReader(scope.sessionKey, method),
       importedIds,
       sourcePath: path.join(projectDir, `${cliSessionId}.jsonl`),
+      sessionsDir: state.sessionsDir(),
       scope,
     });
   });
@@ -142,6 +148,280 @@ function expectMissingAnchor(page: HistoryPage) {
 }
 
 describe("CLI-imported history pages", () => {
+  it.each([false, true])(
+    "rechecks native message authority and retains canonical access (incognito: %s)",
+    async (incognito) => {
+      await withImportedHistory(
+        "chat.history",
+        1,
+        "native-only message",
+        async ({ scope, sourcePath, importedIds }) => {
+          await upsertSessionEntryCore(scope, {
+            cliSessionBindings: {
+              "claude-cli": {
+                sessionId: path.basename(sourcePath, ".jsonl"),
+                transcriptRoot: path.dirname(path.dirname(sourcePath)),
+              },
+            },
+          });
+          const canonical = await appendTranscriptMessage(scope, {
+            message: { role: "assistant", content: "Canonical-only message" },
+          });
+          const context = await createHistoryReadContext();
+          const getMessage = async (messageId: string) => {
+            let result: unknown;
+            await expectDefined(
+              chatMessageGetHandlers["chat.message.get"],
+              "message handler",
+            )({
+              params: { sessionKey: scope.sessionKey, messageId },
+              context,
+              req: { type: "req", id: randomUUID(), method: "chat.message.get" },
+              client: null,
+              isWebchatConnect: () => false,
+              respond: (ok, payload, error) => {
+                expect(error).toBeUndefined();
+                expect(ok).toBe(true);
+                result = payload;
+              },
+            });
+            return result;
+          };
+          const nativeId = expectDefined(importedIds[0], "native message ID");
+          expect(await getMessage(nativeId)).toMatchObject({
+            ok: true,
+            message: { content: "Imported 0: native-only message" },
+          });
+          const revoke = () =>
+            vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(path.dirname(sourcePath), "new-profile"));
+          const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;
+          const heldRead = processHeldCliHistory.readProcessHeldCliHistoryMessage;
+          const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
+          const held = vi.spyOn(processHeldCliHistory, "readProcessHeldCliHistoryMessage");
+          if (incognito) {
+            held.mockImplementationOnce(async (...args) => {
+              const result = await heldRead(...args);
+              revoke();
+              return result;
+            });
+          } else {
+            worker.mockImplementationOnce(async (...args) => {
+              const result = await workerRead(...args);
+              revoke();
+              return result;
+            });
+          }
+          expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
+          worker.mockClear();
+          held.mockClear();
+          expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
+          expect(await getMessage(canonical.messageId)).toMatchObject({
+            ok: true,
+            message: { content: "Canonical-only message" },
+          });
+          expect(
+            worker.mock.calls.filter(([request]) => request.kind === "rpc-message"),
+          ).toHaveLength(0);
+          expect(held).not.toHaveBeenCalled();
+        },
+        incognito,
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "opens imported-only full messages through the history index (incognito: %s)",
+    async (incognito) => {
+      const text = "Imported full-message content. ".repeat(350);
+      await withImportedHistory(
+        "chat.history",
+        1,
+        text,
+        async ({ read, importedIds, scope }) => {
+          const messageId = importedIds[0]!;
+          const page = await read({ limit: 10 });
+          expect(page.messages.map(readChatHistoryMessageId)).toContain(messageId);
+          expect(await readSessionMessageByIdAsync(scope, messageId)).toMatchObject({
+            found: false,
+          });
+          const context = await createHistoryReadContext();
+          let message: unknown;
+          await expectDefined(
+            chatMessageGetHandlers["chat.message.get"],
+            "message handler",
+          )({
+            params: { sessionKey: scope.sessionKey, messageId },
+            context,
+            req: { type: "req", id: randomUUID(), method: "chat.message.get" },
+            client: null,
+            isWebchatConnect: () => false,
+            respond: (ok, payload, error) => {
+              expect(error).toBeUndefined();
+              expect(ok).toBe(true);
+              expect(payload).toMatchObject({ ok: true });
+              message = asOptionalRecord(payload)?.message;
+            },
+          });
+          expect(message).toMatchObject({
+            role: "user",
+            content: `Imported 0: ${text}`,
+            __openclaw: { id: messageId, importedFrom: "claude-cli" },
+          });
+        },
+        incognito,
+      );
+    },
+  );
+
+  it("shares canonical archive and visibility outcomes between CLI reply previews and full messages", async () => {
+    await withImportedHistory(
+      "chat.history",
+      1,
+      "seed",
+      async ({ read, sourcePath, sessionsDir, scope }) => {
+        await upsertSessionEntryCore(scope, { sessionStartedAt: 2000 });
+        await replaceTranscriptEvents(scope, [
+          { type: "session", version: 3, id: scope.sessionId },
+          {
+            type: "message",
+            id: "canonical-announce",
+            parentId: null,
+            message: {
+              role: "user",
+              timestamp: 1000,
+              content: "Old canonical completion",
+              provenance: { kind: "inter_session", sourceTool: "subagent_announce" },
+            },
+          },
+          {
+            type: "message",
+            id: "reused-hidden",
+            parentId: "canonical-announce",
+            message: { role: "assistant", timestamp: 1100, content: "Hidden canonical reply" },
+          },
+          ...["archived-original", "reused-hidden"].map((replyToId, index) => ({
+            type: "message",
+            id: `quote-${replyToId}`,
+            parentId: index === 0 ? "reused-hidden" : "quote-archived-original",
+            message: {
+              role: "user",
+              timestamp: 5000 + index,
+              content: `Quote ${replyToId}`,
+              __openclaw: { replyToId },
+            },
+          })),
+        ]);
+        await fs.mkdir(sessionsDir, { recursive: true });
+        await fs.writeFile(
+          path.join(sessionsDir, `${scope.sessionId}.jsonl.reset.2026-09-30T00-00-00.000Z`),
+          [
+            { type: "session", version: 3, id: scope.sessionId },
+            {
+              type: "message",
+              id: "archived-original",
+              parentId: null,
+              message: { role: "assistant", timestamp: 100, content: "Retained archive original" },
+            },
+          ]
+            .map((event) => JSON.stringify(event))
+            .join("\n") + "\n",
+        );
+        await fs.writeFile(
+          sourcePath,
+          [
+            {
+              id: "native-announce",
+              role: "user",
+              timestamp: 500,
+              content:
+                "[Inter-session message] sourceTool=subagent_announce\nOld native completion",
+            },
+            { id: "native-pair", role: "assistant", timestamp: 600, content: "Hidden native pair" },
+            {
+              id: "native-visible",
+              role: "assistant",
+              timestamp: 3000,
+              content: "Visible native original",
+            },
+            // Missing native announce context must not revive an ID rejected by canonical history.
+            {
+              id: "reused-hidden",
+              role: "assistant",
+              timestamp: 4000,
+              content: "Native copy of hidden ID",
+            },
+          ]
+            .map(({ id, role, timestamp, content }) =>
+              JSON.stringify({
+                type: role,
+                uuid: id,
+                timestamp: new Date(timestamp).toISOString(),
+                message: { role, content },
+              }),
+            )
+            .join("\n") + "\n",
+        );
+        const page = await read({ limit: 10 });
+        expect(page.messages.map(readChatHistoryMessageId)).not.toContain("native-pair");
+        expect(
+          page.messages.find(
+            (message) => readChatHistoryMessageId(message) === "quote-archived-original",
+          ),
+        ).toHaveProperty("__openclaw.replyToMessage", {
+          ok: true,
+          message: expect.objectContaining({ content: "Retained archive original" }),
+        });
+        expect(
+          page.messages.find(
+            (message) => readChatHistoryMessageId(message) === "quote-reused-hidden",
+          ),
+        ).toHaveProperty("__openclaw.replyToMessage", {
+          ok: false,
+          unavailableReason: "not_found",
+        });
+        const context = await createHistoryReadContext();
+        const results: unknown[] = [];
+        for (const messageId of [
+          "archived-original",
+          "native-pair",
+          "reused-hidden",
+          "native-visible",
+        ]) {
+          await expectDefined(
+            chatMessageGetHandlers["chat.message.get"],
+            "message handler",
+          )({
+            params: { sessionKey: scope.sessionKey, messageId },
+            context,
+            req: { type: "req", id: randomUUID(), method: "chat.message.get" },
+            client: null,
+            isWebchatConnect: () => false,
+            respond: (ok, payload, error) => {
+              expect(error).toBeUndefined();
+              expect(ok).toBe(true);
+              results.push([messageId, payload]);
+            },
+          });
+        }
+        expect(results).toEqual([
+          [
+            "archived-original",
+            {
+              ok: true,
+              message: expect.objectContaining({ content: "Retained archive original" }),
+            },
+          ],
+          ["native-pair", { ok: false, unavailableReason: "not_found" }],
+          ["reused-hidden", { ok: false, unavailableReason: "not_found" }],
+          [
+            "native-visible",
+            { ok: true, message: expect.objectContaining({ content: "Visible native original" }) },
+          ],
+        ]);
+      },
+    );
+  });
+
   it("retains metadata-only imports on anchored history reads", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const scope = {
