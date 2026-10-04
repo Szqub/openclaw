@@ -196,14 +196,6 @@ function normalizeClaudeCliContent(
   });
 }
 
-function coalesceClaudeCliToolMessages(messages: TranscriptLikeMessage[]): TranscriptLikeMessage[] {
-  const coalesced: TranscriptLikeMessage[] = [];
-  for (const message of messages) {
-    appendCoalescedClaudeCliToolMessage(coalesced, message);
-  }
-  return coalesced;
-}
-
 export function appendCoalescedClaudeCliToolMessage(
   messages: TranscriptLikeMessage[],
   message: TranscriptLikeMessage,
@@ -574,17 +566,16 @@ export function readClaudeCliFallbackSeed(
       },
     );
     if (message) {
-      windowedTurns.push(message);
+      appendCoalescedClaudeCliToolMessage(windowedTurns, message);
     }
   }
 
-  const recentTurns = coalesceClaudeCliToolMessages(windowedTurns);
   const resolvedSummaryText = lastSummary ?? pendingSummary ?? lastBoundaryFallback;
-  if (!resolvedSummaryText && recentTurns.length === 0) {
+  if (!resolvedSummaryText && windowedTurns.length === 0) {
     return undefined;
   }
   return {
     ...(resolvedSummaryText ? { summaryText: resolvedSummaryText } : {}),
-    recentTurns,
+    recentTurns: windowedTurns,
   };
 }
