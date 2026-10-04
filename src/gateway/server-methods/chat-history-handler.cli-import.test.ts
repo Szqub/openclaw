@@ -9,14 +9,17 @@ import {
   replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
-import type { ChatHistoryPage } from "../../config/sessions/session-history-types.js";
+import {
+  NATIVE_HISTORY_AUTHORIZATION_REQUEST,
+  isNativeHistoryAuthorizationRequest,
+} from "../../config/sessions/session-history-types.js";
 import * as sessionHistoryWorkerRuntime from "../../config/sessions/session-history-worker-runtime.js";
+import * as sessionTranscriptWorkerRuntime from "../../config/sessions/session-transcript-worker-runtime.js";
 import { readLoggingConfig } from "../../logging/config.js";
 import { applyLoggingConfig } from "../../logging/logger.js";
 import { registerSecretValueForRedaction } from "../../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../../logging/secret-redaction-registry.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import * as processHeldCliHistory from "../cli-session-history.process-held.js";
 import { SerializedJsonArray } from "../serialized-json.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
 import { readSessionMessageByIdAsync } from "../session-transcript-readers.js";
@@ -195,25 +198,43 @@ describe("CLI-imported history pages", () => {
           const revoke = () =>
             vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(path.dirname(sourcePath), "new-profile"));
           const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;
-          const heldRead = processHeldCliHistory.readProcessHeldCliHistoryMessage;
+          const runProcessHeldHistoryTask =
+            sessionTranscriptWorkerRuntime.runProcessHeldHistoryTask;
           const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
-          const held = vi.spyOn(processHeldCliHistory, "readProcessHeldCliHistoryMessage");
+          const heldTask = vi.spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask");
+          let nativeAuthorizationRequests = 0;
           if (incognito) {
-            held.mockImplementationOnce(async (...args) => {
-              const result = await heldRead(...args);
-              revoke();
-              return result;
-            });
+            heldTask.mockImplementationOnce(async (history, onRequest, signal) =>
+              runProcessHeldHistoryTask(
+                history,
+                async (value, requestContext) => {
+                  if (isNativeHistoryAuthorizationRequest(value)) {
+                    nativeAuthorizationRequests += 1;
+                    revoke();
+                  }
+                  return onRequest(value, requestContext);
+                },
+                signal,
+              ),
+            );
           } else {
             worker.mockImplementationOnce(async (...args) => {
-              const result = await workerRead(...args);
-              revoke();
-              return result;
+              const [request, signal, onRequest] = args;
+              return workerRead(request, signal, async (value) => {
+                expect(value).toEqual(NATIVE_HISTORY_AUTHORIZATION_REQUEST);
+                nativeAuthorizationRequests += 1;
+                revoke();
+                await onRequest?.(value);
+              });
             });
           }
           expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
+          expect(nativeAuthorizationRequests).toBe(1);
+          if (!incognito) {
+            expect(heldTask).not.toHaveBeenCalled();
+          }
           worker.mockClear();
-          held.mockClear();
+          heldTask.mockClear();
           expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
           expect(await getMessage(canonical.messageId)).toMatchObject({
             ok: true,
@@ -222,7 +243,6 @@ describe("CLI-imported history pages", () => {
           expect(
             worker.mock.calls.filter(([request]) => request.kind === "rpc-message"),
           ).toHaveLength(0);
-          expect(held).not.toHaveBeenCalled();
         },
         incognito,
       );
@@ -747,52 +767,87 @@ describe("CLI-imported history pages", () => {
     );
   });
 
-  it("discards an imported page when authorization changes during the worker read", async () => {
+  it.each([false, true])(
+    "fails closed at the native-history worker boundary (incognito: %s)",
+    async (incognito) => {
+      await withImportedHistory(
+        "chat.history",
+        1,
+        "revoked imported response",
+        async ({ read, sourcePath, importedIds }) => {
+          const revoke = () =>
+            vi.stubEnv(
+              "CLAUDE_CONFIG_DIR",
+              path.join(path.dirname(path.dirname(path.dirname(sourcePath))), "changed-claude"),
+            );
+          const runProcessHeldHistoryTask =
+            sessionTranscriptWorkerRuntime.runProcessHeldHistoryTask;
+          const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;
+          const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
+          const heldTask = vi.spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask");
+          let nativeAuthorizationRequests = 0;
+          if (incognito) {
+            heldTask.mockImplementationOnce(async (history, onRequest, signal) =>
+              runProcessHeldHistoryTask(
+                history,
+                async (value, context) => {
+                  if (isNativeHistoryAuthorizationRequest(value)) {
+                    nativeAuthorizationRequests += 1;
+                    revoke();
+                  }
+                  return onRequest(value, context);
+                },
+                signal,
+              ),
+            );
+          } else {
+            worker.mockImplementationOnce(async (...args) => {
+              const [request, signal, onRequest] = args;
+              return workerRead(request, signal, async (value) => {
+                expect(value).toEqual(NATIVE_HISTORY_AUTHORIZATION_REQUEST);
+                nativeAuthorizationRequests += 1;
+                revoke();
+                await onRequest?.(value);
+              });
+            });
+          }
+          const page = await read({ limit: 10 });
+          const messages =
+            page.messages instanceof SerializedJsonArray
+              ? page.messages.materialize()
+              : page.messages;
+          expect(nativeAuthorizationRequests).toBe(1);
+          expect(messages.map(readChatHistoryMessageId)).not.toContain(importedIds[0]);
+          expect(JSON.stringify(messages)).toContain("Local answer");
+          expect(JSON.stringify(messages)).not.toContain("revoked imported response");
+        },
+        incognito,
+      );
+    },
+  );
+
+  it("rejects unknown process-held history host requests", async () => {
     await withImportedHistory(
       "chat.history",
       1,
-      "stale imported response",
-      async ({ read, sourcePath }) => {
-        const readWorker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
-        readWorker.mockImplementationOnce(async () => {
-          vi.stubEnv(
-            "CLAUDE_CONFIG_DIR",
-            path.join(path.dirname(path.dirname(path.dirname(sourcePath))), "changed-claude"),
-          );
-          const encodedMessages = new TextEncoder().encode(
-            JSON.stringify([{ role: "assistant", content: "stale imported response" }]),
-          );
-          return {
-            messages: [{ role: "assistant", content: "stale imported response" }],
-            encodedResponse: {
-              messages: encodedMessages,
-              messagesBytes: encodedMessages.byteLength,
-              responseHistoryBytes: encodedMessages.byteLength,
-            },
-          } satisfies ChatHistoryPage;
-        });
-
-        const page = await read({ limit: 10 }, { acceptsSerializedJson: true });
-        expect(readWorker).toHaveBeenCalledTimes(2);
-        expect(readWorker.mock.calls[0]?.[0]).toMatchObject({
-          kind: "rpc",
-          params: { cliHistoryProjectsRoot: expect.any(String) },
-        });
-        expect(readWorker.mock.calls[1]?.[0]).toMatchObject({
-          kind: "rpc",
-          params: { ignoreCliSessionImports: true },
-        });
-        expect(readWorker.mock.calls[1]?.[0]).not.toMatchObject({
-          params: { cliHistoryProjectsRoot: expect.anything() },
-        });
-        const messages =
-          page.messages instanceof SerializedJsonArray
-            ? page.messages.materialize()
-            : page.messages;
-        expect(JSON.stringify(messages)).toContain("Local answer");
-        expect(JSON.stringify(messages)).not.toContain("stale imported response");
-        expect(page).not.toHaveProperty("encodedResponse");
+      "protocol",
+      async ({ read }) => {
+        const task = vi
+          .spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask")
+          .mockImplementationOnce(async (_history, onRequest) => {
+            const controller = new AbortController();
+            await expect(
+              onRequest(
+                { kind: "unknown", options: {} },
+                { signal: controller.signal, yieldSignal: controller.signal },
+              ),
+            ).rejects.toThrow("Unsupported process-held history request");
+            throw new Error("process-held protocol rejection");
+          });
+        await expect(read({ limit: 1 })).rejects.toThrow("process-held protocol rejection");
+        expect(task).toHaveBeenCalledTimes(1);
       },
+      true,
     );
   });
 

@@ -8,6 +8,11 @@ import type {
   ChatHistoryPageParams,
   ChatHistoryMessageParams,
 } from "../../config/sessions/session-history-types.js";
+import {
+  NATIVE_HISTORY_AUTHORIZATION_DENIED,
+  isNativeHistoryAuthorizationDenied,
+  isNativeHistoryAuthorizationRequest,
+} from "../../config/sessions/session-history-types.js";
 import { isIncognitoSessionKey } from "../../shared/incognito-session-key.js";
 import {
   prepareForwardedMessageCronJobNameResolver,
@@ -49,11 +54,47 @@ function prepareChatHistoryParams<Params extends ChatHistoryPageParams>(input: P
     });
     return JSON.stringify(current) === JSON.stringify(authorization);
   };
-  return { params, sameAuthorization };
+  const assertNativeHistoryAuthorized = async () => {
+    if (!authorization || !sameAuthorization()) {
+      throw new Error(NATIVE_HISTORY_AUTHORIZATION_DENIED);
+    }
+  };
+  const onNativeHistoryAuthorizationRequest = async (value: unknown) => {
+    if (!isNativeHistoryAuthorizationRequest(value)) {
+      throw new Error("Unsupported native history authorization request");
+    }
+    await assertNativeHistoryAuthorized();
+  };
+  return {
+    params,
+    sameAuthorization,
+    assertNativeHistoryAuthorized,
+    onNativeHistoryAuthorizationRequest,
+  };
+}
+
+async function withNativeHistoryAuthorizationFallback<T>(
+  sameAuthorization: () => boolean,
+  fallback: () => Promise<T>,
+  read: () => Promise<T>,
+): Promise<{ result: T; usedFallback: boolean }> {
+  try {
+    return { result: await read(), usedFallback: false };
+  } catch (error) {
+    if (isNativeHistoryAuthorizationDenied(error) && !sameAuthorization()) {
+      return { result: await fallback(), usedFallback: true };
+    }
+    throw error;
+  }
 }
 
 export async function readChatHistoryMessageById(input: ChatHistoryMessageParams) {
-  const { params, sameAuthorization } = prepareChatHistoryParams(input);
+  const {
+    params,
+    sameAuthorization,
+    assertNativeHistoryAuthorized,
+    onNativeHistoryAuthorizationRequest,
+  } = prepareChatHistoryParams(input);
   const readCanonical = () =>
     sessionTranscriptReaders.readSessionMessageByIdAsync(
       {
@@ -69,7 +110,8 @@ export async function readChatHistoryMessageById(input: ChatHistoryMessageParams
         historyVisibility: { sessionStartedAt: input.entry?.sessionStartedAt },
       },
     );
-  if (params.ignoreCliSessionImports || !input.storePath) {
+  const storePath = input.storePath;
+  if (params.ignoreCliSessionImports || !storePath) {
     return readCanonical();
   }
   if (params.entry?.incognito || isIncognitoSessionKey(params.canonicalKey)) {
@@ -78,19 +120,32 @@ export async function readChatHistoryMessageById(input: ChatHistoryMessageParams
     if (!sameAuthorization()) {
       return readCanonical();
     }
-    const result = await readProcessHeldCliHistoryMessage(params);
-    return sameAuthorization() ? result : readCanonical();
+    const outcome = await withNativeHistoryAuthorizationFallback(
+      sameAuthorization,
+      readCanonical,
+      () => readProcessHeldCliHistoryMessage(params, assertNativeHistoryAuthorized),
+    );
+    return outcome.usedFallback || sameAuthorization() ? outcome.result : readCanonical();
   }
   const { readSessionHistoryPageInWorker } =
     await import("../../config/sessions/session-history-worker-runtime.js");
   if (!sameAuthorization()) {
     return readCanonical();
   }
-  const result = await readSessionHistoryPageInWorker({
-    kind: "rpc-message",
-    params: { ...params, storePath: input.storePath },
-  });
-  return sameAuthorization() ? result : readCanonical();
+  const outcome = await withNativeHistoryAuthorizationFallback(
+    sameAuthorization,
+    readCanonical,
+    () =>
+      readSessionHistoryPageInWorker(
+        {
+          kind: "rpc-message",
+          params: { ...params, storePath },
+        },
+        undefined,
+        onNativeHistoryAuthorizationRequest,
+      ),
+  );
+  return outcome.usedFallback || sameAuthorization() ? outcome.result : readCanonical();
 }
 
 export async function readChatHistoryPage(
@@ -98,7 +153,12 @@ export async function readChatHistoryPage(
   signal?: AbortSignal,
 ): Promise<ChatHistoryPage> {
   signal?.throwIfAborted();
-  const { params, sameAuthorization } = prepareChatHistoryParams(input);
+  const {
+    params,
+    sameAuthorization,
+    assertNativeHistoryAuthorized,
+    onNativeHistoryAuthorizationRequest,
+  } = prepareChatHistoryParams(input);
   const readPage = async (pageParams: ChatHistoryPageParams): Promise<ChatHistoryPage> => {
     signal?.throwIfAborted();
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
@@ -114,7 +174,15 @@ export async function readChatHistoryPage(
       if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
         return readPage({ ...input, ignoreCliSessionImports: true });
       }
-      const page = await readProcessHeldCliHistory(pageParams, signal);
+      const outcome = await withNativeHistoryAuthorizationFallback(
+        sameAuthorization,
+        () => readPage({ ...input, ignoreCliSessionImports: true }),
+        () => readProcessHeldCliHistory(pageParams, signal, assertNativeHistoryAuthorized),
+      );
+      if (outcome.usedFallback) {
+        return outcome.result;
+      }
+      const page = outcome.result;
       const refreshed = { ...page, messages: await refreshForwardedLabels(page.messages) };
       if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
         return readPage({ ...input, ignoreCliSessionImports: true });
@@ -134,23 +202,34 @@ export async function readChatHistoryPage(
       });
       return { ...page, messages: await refreshForwardedLabels(page.messages) };
     }
+    const { sessionId, storePath } = pageParams;
     const { readSessionHistoryPageInWorker } =
       await import("../../config/sessions/session-history-worker-runtime.js");
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
       return readPage({ ...input, ignoreCliSessionImports: true });
     }
-    const page = await readSessionHistoryPageInWorker(
-      {
-        kind: "rpc",
-        params: {
-          ...pageParams,
-          compactionMetrics: readLegacyCompactionMetrics(pageParams.entry),
-          sessionId: pageParams.sessionId,
-          storePath: pageParams.storePath,
-        },
-      },
-      signal,
+    const outcome = await withNativeHistoryAuthorizationFallback(
+      sameAuthorization,
+      () => readPage({ ...input, ignoreCliSessionImports: true }),
+      () =>
+        readSessionHistoryPageInWorker(
+          {
+            kind: "rpc",
+            params: {
+              ...pageParams,
+              compactionMetrics: readLegacyCompactionMetrics(pageParams.entry),
+              sessionId,
+              storePath,
+            },
+          },
+          signal,
+          onNativeHistoryAuthorizationRequest,
+        ),
     );
+    if (outcome.usedFallback) {
+      return outcome.result;
+    }
+    const page = outcome.result;
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
       return readPage({ ...input, ignoreCliSessionImports: true });
     }

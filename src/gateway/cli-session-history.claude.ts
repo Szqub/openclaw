@@ -85,6 +85,7 @@ type ClaudeCliHistoryLookupParams = {
   homeDir?: string;
   cwd?: string;
   projectsRoot?: string;
+  assertNativeHistoryAuthorized?: () => Promise<void>;
 };
 
 function normalizeClaudeCliSessionId(value: string): string | undefined {
@@ -467,6 +468,7 @@ export async function resolveClaudeCliSessionFilePathAsync(
   if (!projectsDir) {
     return undefined;
   }
+  await params.assertNativeHistoryAuthorized?.();
   let projectEntries: fs.Dirent[];
   try {
     projectEntries = await fs.promises.readdir(projectsDir, { withFileTypes: true });
@@ -474,7 +476,6 @@ export async function resolveClaudeCliSessionFilePathAsync(
     return undefined;
   }
 
-  // Bound filesystem work while preserving the first match in directory order.
   const batchSize = 16;
   for (let offset = 0; offset < projectEntries.length; offset += batchSize) {
     const candidates = await Promise.all(
@@ -489,6 +490,7 @@ export async function resolveClaudeCliSessionFilePathAsync(
         if (!candidate) {
           return undefined;
         }
+        await params.assertNativeHistoryAuthorized?.();
         try {
           await fs.promises.access(candidate);
           return candidate;

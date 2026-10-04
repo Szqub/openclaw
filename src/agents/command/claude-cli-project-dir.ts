@@ -43,6 +43,7 @@ type ClaudeCliProjectsRootParams = {
   cwd?: string;
   /** Root already selected from the Claude child's effective environment and cwd. */
   projectsRoot?: string;
+  assertNativeHistoryAuthorized?: () => Promise<void>;
 };
 
 // A retained root records the environment the child actually ran with, which the
@@ -112,6 +113,7 @@ export async function resolveClaudeCliProjectsRootAsync(
     return undefined;
   }
   let cwd = path.resolve(params.cwd).normalize("NFC");
+  await params.assertNativeHistoryAuthorized?.();
   try {
     cwd = (await fs.promises.realpath(cwd)).normalize("NFC");
   } catch {
