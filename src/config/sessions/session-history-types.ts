@@ -175,6 +175,7 @@ export function isNativeHistoryAuthorizationRequest(
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }
+  // SAFETY: the checks above narrow the input to a non-array object before reading its fields.
   const record = value as Record<string, unknown>;
   return (
     record.kind === NATIVE_HISTORY_AUTHORIZATION_REQUEST.kind && Object.keys(record).length === 1

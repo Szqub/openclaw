@@ -47,7 +47,7 @@ export type CliHistoryRevision = {
   leafEventId: string | null;
 };
 export type CliHistoryReaders = SessionTranscriptPageReader & {
-  assertNativeHistoryAuthorized: () => Promise<void>;
+  assertNativeHistoryAuthorized?: () => Promise<void>;
   // Durable cache admission supplies a revision; uncached process-held reads use page fences.
   readHistoryRevision?: () => CliHistoryRevision | Promise<CliHistoryRevision>;
 };
@@ -133,7 +133,7 @@ export async function prepareCliSessionHistoryReader(
     assertNativeHistoryAuthorized: readers.assertNativeHistoryAuthorized,
   };
   const identity = JSON.stringify([params.storePath, params.sessionAgentId, params.sessionId]);
-  await readers.assertNativeHistoryAuthorized();
+  await readers.assertNativeHistoryAuthorized?.();
   const source = await resolveClaudeCliHistorySource(native);
   if (!source) {
     retire(identity);

@@ -218,9 +218,11 @@ function decodeProcessHeldHistoryRequest(
     throw new Error("Unsupported process-held history request");
   }
   if (record.kind === "by-id" && typeof record.messageId === "string") {
+    // SAFETY: the closed worker request has validated this variant and its required fields.
     return record as Exclude<Request, NativeHistoryAuthorizationRequest>;
   }
   if (record.kind === "page" || record.kind === "around") {
+    // SAFETY: the closed worker request has validated this variant and its options record.
     return record as Exclude<Request, NativeHistoryAuthorizationRequest>;
   }
   throw new Error("Unsupported process-held history request");

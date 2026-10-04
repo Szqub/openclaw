@@ -190,6 +190,7 @@ describe("Claude CLI history config directory", () => {
           }),
         }),
         undefined,
+        expect.any(Function),
       );
     });
   });
@@ -250,6 +251,7 @@ describe("Claude CLI history config directory", () => {
             params: expect.objectContaining({ ignoreCliSessionImports: true }),
           }),
           undefined,
+          expect.any(Function),
         );
         expect(worker.mock.calls[0]?.[0]).not.toMatchObject({
           params: { cliHistoryProjectsRoot: expect.anything() },
@@ -309,6 +311,7 @@ describe("Claude CLI history config directory", () => {
             params: expect.objectContaining({ ignoreCliSessionImports: true }),
           }),
           undefined,
+          expect.any(Function),
         );
         expect(worker.mock.calls[0]?.[0]).not.toMatchObject({
           params: { cliHistoryProjectsRoot: expect.anything() },
@@ -409,6 +412,7 @@ describe("Claude CLI history config directory", () => {
           params: expect.objectContaining({ ignoreCliSessionImports: true }),
         }),
         undefined,
+        expect.any(Function),
       );
     });
   });
@@ -438,6 +442,7 @@ describe("Claude CLI history config directory", () => {
           params: expect.objectContaining({ ignoreCliSessionImports: true }),
         }),
         undefined,
+        expect.any(Function),
       );
     });
   });
@@ -460,6 +465,7 @@ describe("Claude CLI history config directory", () => {
           params: expect.objectContaining({ ignoreCliSessionImports: true }),
         }),
         undefined,
+        expect.any(Function),
       );
     });
   });
