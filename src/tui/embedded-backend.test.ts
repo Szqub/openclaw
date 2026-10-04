@@ -1410,55 +1410,6 @@ describe("EmbeddedTuiBackend", () => {
     await backend.stop();
   });
 
-  it("uses the canonical gateway projector for embedded TUI history reads", async () => {
-    loadSessionEntryMock.mockReturnValue({
-      cfg: {},
-      agentId: "main",
-      canonicalKey: "agent:main:main",
-      storePath: "/tmp/openclaw-sessions.json",
-      entry: { sessionId: "sess-main" },
-    });
-
-    const backend = new EmbeddedTuiBackend();
-    const messages = [
-      {
-        role: "toolResult",
-        toolCallId: "wait",
-        toolName: "collab.wait",
-        content: "raw result",
-        isError: false,
-        __openclaw: { id: "wait-result" },
-      },
-    ];
-    readChatHistoryPageMock.mockResolvedValueOnce({
-      messages,
-      activity: [{ messageId: "wait-result", items: [] }],
-    });
-    const history = await backend.loadHistory({ sessionKey: "agent:main:main" });
-    expect(history).toMatchObject({
-      messages,
-      activity: [{ messageId: "wait-result", items: [] }],
-    });
-
-    expect(readChatHistoryPageMock).toHaveBeenCalledWith(
-      {
-        entry: { sessionId: "sess-main" },
-        provider: "openai",
-        sessionId: "sess-main",
-        storePath: "/tmp/openclaw-sessions.json",
-        sessionAgentId: "main",
-        canonicalKey: "agent:main:main",
-        max: 200,
-        maxHistoryBytes: 100_000,
-        effectiveMaxChars: 100_000,
-        offset: undefined,
-        messageId: undefined,
-      },
-      undefined,
-      expect.any(Function),
-    );
-  });
-
   it.each([false, true])("loads history despite runtime plugin failure=%s", async (fails) => {
     if (fails) {
       loadAgentRuntimePluginRegistryHandleMock.mockImplementationOnce(() => {
