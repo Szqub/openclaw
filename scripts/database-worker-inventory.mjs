@@ -923,6 +923,12 @@ const reviewedOperations = new Map([
     [
       {
         tier: "W",
+        operations: ["lookupCronStandingGrantInDatabase", "consumeCronStandingGrantInDatabase"],
+        evidence:
+          "Only openclaw-state-read.worker.ts validates and operator-approval-store.operations.ts consumes through the existing workers; bash-tools.exec-cron-grant.ts awaits operator-approval-store.ts while retaining the Gateway authority interval. No native lookup/consume facade remains.",
+      },
+      {
+        tier: "W",
         operations: ["listCronStandingGrantsInDatabase"],
         evidence:
           "Only state/openclaw-state-read.worker.ts:495; server-methods/exec-approval.ts:462 -> operator-approval-store.ts:273 uses readApprovalStore -> executeExistingOpenClawStateRead at :248 even when a guard exists.",
@@ -1741,6 +1747,12 @@ const reviewedOperations = new Map([
   [
     "src/state/user-model-accounts.ts",
     [
+      {
+        tier: "W",
+        operations: ["connectUserModelAccount"],
+        evidence:
+          "Personal sign-in persistence executes only through userProfiles.modelAccount.connect in user-profiles.worker.ts. Inventory/link/unlink kernels retain T1 for deprecated v2026.9.8 Gateway SDK methods; bundled callers use the Async replacements. Shared credential/OAuth kernels and the live account pin guard also retain T1.",
+      },
       {
         tier: "T3",
         operations: ["renameUserProfileAuthLinks"],

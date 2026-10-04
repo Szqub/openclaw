@@ -74,7 +74,7 @@ import {
 } from "../gateway/session-row-projection.js";
 import { projectSessionPatchResult } from "../gateway/session-utils-model.js";
 import { buildGatewaySessionRow } from "../gateway/session-utils-row.js";
-import { createGatewaySessionEntryReader } from "../gateway/session-utils-store-lookup.js";
+import { createGatewaySessionEntryReader } from "../gateway/session-utils-store-lineage.js";
 import {
   getSessionDefaults,
   listAgentsForGateway,

@@ -218,6 +218,8 @@ export async function runCliFallbackCandidate(
           turn.followupRun.run.agentId,
         );
         let droppedCliSessionReplacement = false;
+        await params.prepareAgentRunStart();
+        assertSettlementCurrent();
         const candidateResult = await runCliAgentWithLifecycle({
           runId: params.runId,
           lifecycleGeneration: params.lifecycleGeneration,
@@ -354,6 +356,7 @@ export async function runCliFallbackCandidate(
                   })
               : undefined,
           runParams: {
+            preparedTtsPreferences: turn.opts?.preparedTtsPreferences,
             preparedRunAdmission: params.preparedRunAdmission,
             messageActionTurnCapability: params.messageActionTurnCapability,
             diagnosticOwner,
@@ -369,6 +372,7 @@ export async function runCliFallbackCandidate(
               turn.followupRun.run.runtimePolicySessionKey ?? turn.runtimePolicySessionKey,
             agentId: turn.followupRun.run.agentId,
             trigger: turn.isHeartbeat ? "heartbeat" : "user",
+            continuesConversation: turn.opts?.continuesConversation,
             sessionFile: turn.followupRun.run.sessionFile,
             workspaceDir: turn.followupRun.run.workspaceDir,
             cwd: turn.followupRun.run.cwd,

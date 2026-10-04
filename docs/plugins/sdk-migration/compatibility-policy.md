@@ -175,6 +175,23 @@ Core and bundled callers use these worker-backed methods. Legacy calls emit one
 once-per-method warning for unscoped calls. Schemas, retained data, and update
 behavior are unchanged.
 
+### Personal model-account control plane
+
+The October 3, 2026 `model-account-connect-sync-persistence` record retains the
+seven synchronous `modelAccountConnectService` methods shipped in 2026.9.8:
+`listLinks`, `link`, `unlink`, `list`, `select`, `status`, and `cancel`. They remain
+available through the Gateway Plugin SDK context with their existing arguments,
+return envelopes, and immediate completion until the next Plugin SDK major and
+explicit breaking-release approval. In particular, the released action shape
+`{ owner: string; assertCurrent: () => void }` remains source-compatible.
+
+Core and bundled callers use the corresponding `Async` methods; see
+[awaited personal model-account operations](/plugins/sdk-migration/how-to-migrate#await-personal-model-account-operations).
+Synchronous calls emit one `DEP_SESSION_PERSISTENCE` warning per plugin and
+method per process; unscoped callers warn once per method. The compatibility
+adapters retain native database access during this window. RPC schemas,
+credential storage, retention, and update behavior are unchanged.
+
 ### Awaited session persistence
 
 The October 1, 2026 records `session-manager-sync-persistence`,
@@ -191,6 +208,39 @@ types. Bundled code uses the awaited contracts. File-backed writes reuse the
 canonical worker writer; incognito retains its process-local owner until its
 separate cutover. Schemas, persisted bytes, and supported update paths are
 unchanged. Removal still requires explicit breaking-release approval.
+
+### Reply run-start transcript facts
+
+`GetReplyOptions.onAgentRunStart` from `openclaw/plugin-sdk/reply-runtime`, also
+provided to `reply_dispatch` hooks, retains the callback shipped in OpenClaw
+2026.9.8: `(runId, executionIdentityToken?, options?) => unknown`. Existing
+callbacks and producers that omit later arguments remain supported. Completion
+ownership still requires returning `"reply-dispatch"` synchronously.
+
+Current runtime helpers supply prepared transcript facts in an optional fourth
+argument. Wrappers should forward every argument and the callback's return value;
+see [message hooks](/plugins/hooks/messages). The facts describe the transcript
+boundary and do not grant session or write authority. When a released producer
+omits them, the Gateway retains its synchronous transcript-read fallback.
+
+Only that omitted-facts fallback is deprecated as of October 4, 2026; the callback
+itself remains supported. The fallback stays until the next Plugin SDK major and
+explicit breaking-release approval. The compatibility registry records the
+migration without runtime warnings. Schemas, retained data, and update behavior
+are unchanged.
+
+### ACP metadata binding compatibility
+
+`openclaw/plugin-sdk/acp-runtime` retains the one-argument
+`readAcpSessionEntryAsync` callable published in `v2026.9.8`. The returned ACP
+manager's `loadSessionEntryAsync` and `upsertSessionMeta` injection callbacks also
+keep their released one-argument signatures and Promise results. Plugins do not
+supply internal incognito actor bindings.
+
+The `acp-session-metadata-released-signatures` compatibility record is active:
+these APIs remain supported, with no deprecation warning or required migration.
+Worker activation must preserve them; changing these released contracts requires
+an explicitly approved Plugin SDK major release.
 
 ### Native session generation authority
 
@@ -560,6 +610,23 @@ displays either the date or named gate, counts local code/doc references, lists
 `removal-pending` records with their blockers and surface-token reader
 references, and summarizes the private memory-host SDK bridge. Those reader
 references are triage signals, not published-artifact proof.
+
+### TTS preference resolution
+
+Host reply dispatch now prepares the machine-owned TTS preference path through
+the shared-state reader and carries that fact through prompt and delivery work.
+The released `resolveTtsPrefsPath(config)` call in
+`openclaw/plugin-sdk/agent-runtime` and `openclaw/plugin-sdk/tts-runtime` still
+returns a `string` synchronously. `buildTtsSystemPromptHint(config, agentId,
+options)` also keeps its synchronous return value, and the existing asynchronous
+`maybeApplyTtsToPayload` call does not require prepared preferences.
+
+The `tts-preferences-sync-resolution` compatibility record retains the legacy
+synchronous resolution path. Removal requires a public preparation contract,
+migration of published plugin readers, and explicit approval for a breaking
+Plugin SDK release at the next major-version gate. No removal date or runtime
+warning is introduced. Existing plugins need no change for this host update;
+preference-file reads, stored data, and update behavior stay the same.
 
 ### Media legacy projection
 
