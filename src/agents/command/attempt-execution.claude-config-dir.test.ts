@@ -8,6 +8,7 @@ import {
   claudeCliSessionTranscriptHasOrphanedToolUse,
 } from "./attempt-execution.helpers.js";
 
+// mock-isolation: transcript misses are expected; keep their warnings out of the real CLI logger.
 vi.mock("../cli-runner/log.js", () => ({ cliBackendLog: { warn: vi.fn() } }));
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.unstubAllEnvs());
