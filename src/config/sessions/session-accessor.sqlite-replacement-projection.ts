@@ -46,11 +46,10 @@ import type {
   SessionEntryCreateWithTranscriptOptions,
   SessionEntryReplacement,
 } from "./session-accessor.types.js";
+import { maintenanceLane, projectionLane } from "./session-transcript-worker-resources.js";
 import { withSessionHistoryWorkerDatabase } from "./session-transcript-worker-runtime.js";
-import {
-  captureSessionMaintenancePreservation,
-  prepareSessionMaintenancePreservation,
-} from "./store-maintenance-preserve.js";
+import { MAX_SESSION_ROW_FACTS_KEYS } from "./session-transcript-worker.types.js";
+import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 
 export type SessionEntryCanonicalReplacement = SessionEntryReplacement & {
@@ -135,35 +134,44 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
           databaseIdentity: readOpenClawAgentDatabaseIdentity(database).identity,
         }));
       const snapshot = useWorker
-        ? await withSessionHistoryWorkerDatabase(databaseOptions, async (owner) => {
-            const read = () =>
-              owner.readExactEntries({
-                sessionKeys: params.sessionKeys ?? [],
-                projection: "replacement",
-                replacementSelection: {
-                  sessionKeys: params.sessionKeys,
-                  statuses: params.statuses,
-                  includeLabelOwners: params.includeLabelOwners,
-                },
-                env: { ...resolved.env },
-              });
-            let result = await read();
-            if (!result.replacement) {
-              await prepareSessionEntryReplacementDatabase(
-                databaseOptions,
-                () => {
-                  owner.assertCurrent();
-                  params.assertCommitAllowed?.();
-                },
-                params.retainedExecution,
-              );
-              result = await read();
-            }
-            if (!result.replacement) {
-              throw new Error("Session replacement snapshot lost its initialized database");
-            }
-            return result.replacement;
-          })
+        ? await withSessionHistoryWorkerDatabase(
+            databaseOptions,
+            async (owner) => {
+              const read = () =>
+                owner.readExactEntries({
+                  sessionKeys: params.sessionKeys ?? [],
+                  projection: "replacement",
+                  replacementSelection: {
+                    sessionKeys: params.sessionKeys,
+                    statuses: params.statuses,
+                    includeLabelOwners: params.includeLabelOwners,
+                  },
+                  env: { ...resolved.env },
+                });
+              let result = await read();
+              if (!result.replacement) {
+                await prepareSessionEntryReplacementDatabase(
+                  databaseOptions,
+                  () => {
+                    owner.assertCurrent();
+                    params.assertCommitAllowed?.();
+                  },
+                  params.retainedExecution,
+                );
+                result = await read();
+              }
+              if (!result.replacement) {
+                throw new Error("Session replacement snapshot lost its initialized database");
+              }
+              return result.replacement;
+            },
+            // Label owners can expand a keyed selection beyond the foreground read budget.
+            params.sessionKeys &&
+              params.sessionKeys.length <= MAX_SESSION_ROW_FACTS_KEYS &&
+              params.includeLabelOwners === undefined
+              ? projectionLane
+              : maintenanceLane,
+          )
         : await readNative();
       const { entries, expectedRows, labelOwnerKeys } = snapshot;
       const selectedKeys = params.sessionKeys ? new Set(params.sessionKeys) : undefined;
@@ -250,30 +258,27 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
           // Native companions and process-held stores retain their synchronous transaction view.
           const workerCommit = useWorker && !hasPreparedNativeSessionDeletion();
           const preparedPreservation =
-            params.skipMaintenance === false && workerCommit
-              ? await prepareSessionMaintenancePreservation(params.storePath)
+            params.skipMaintenance === false
+              ? await prepareSessionMaintenancePreservation(params.storePath, {
+                  native: !workerCommit,
+                })
               : undefined;
           try {
-            const capturePreservation = () =>
-              preparedPreservation
-                ? preparedPreservation.capture()
-                : captureSessionMaintenancePreservation(params.storePath);
-            const maintenance =
-              params.skipMaintenance === false
-                ? {
-                    activeSessionKey: params.activeSessionKey ?? "",
-                    archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
-                    maintenance: resolveMaintenanceConfig(),
-                    preservation: capturePreservation(),
-                    storePath: params.storePath,
-                  }
-                : undefined;
+            const maintenance = preparedPreservation
+              ? {
+                  activeSessionKey: params.activeSessionKey ?? "",
+                  archiveDirectory: resolveSqliteTranscriptArchiveDirectory(resolved),
+                  maintenance: resolveMaintenanceConfig(),
+                  preservation: preparedPreservation.capture(),
+                  storePath: params.storePath,
+                }
+              : undefined;
             const assertCurrent = () => {
               assertSourceCurrent?.();
               params.assertCommitAllowed?.();
               if (
                 maintenance &&
-                !isDeepStrictEqual(maintenance.preservation, capturePreservation())
+                !isDeepStrictEqual(maintenance.preservation, preparedPreservation?.capture())
               ) {
                 throw new Error("Session maintenance protection changed before replacement");
               }
@@ -314,6 +319,7 @@ async function applySqliteSessionEntryReplacementProjection<T, TReplacement>(
                               assertCurrent();
                               source?.assertCurrent();
                             },
+                            preparedPreservation?.refreshCandidates,
                           );
                           return {
                             ...result,

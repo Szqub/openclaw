@@ -1,5 +1,11 @@
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+import type { PreparedQuestionCallerRead } from "../../agents/harness/host-private-capabilities.js";
 import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { withSessionPendingInputAuthorityGuard } from "../../config/sessions/session-pending-input-authority.js";
+import {
+  captureExternalSessionCommitGuard,
+  composeSessionSourceAssertion,
+} from "../../config/sessions/session-source-authority.js";
 import { operatorScopeSatisfied } from "../../shared/operator-scope-compat.js";
 import type { SessionOperatorScope } from "../../shared/session-method-scopes-base.js";
 import { isGatewayAuthPolicyCurrent } from "../auth-policy.js";
@@ -29,6 +35,7 @@ type RequestMutationOptions = Pick<
 type RequestMutationAuthorityBase = {
   /** Preparation checks cannot consume an opaque SDK commit callback. */
   assertPreparationCurrent: () => void;
+  questionCallerRead?: PreparedQuestionCallerRead;
   assertCurrent: () => void;
   /** Original transport/SDK lifetime; prepared-profile methods check selection separately. */
   assertLifetimeCurrent: () => void;
@@ -93,6 +100,14 @@ function assertRequestAuthorityCurrent(options: RequestMutationOptions): void {
   options.sessionMutationCommitGuard?.();
 }
 
+function captureRequestAuthorityAssertion(options: RequestMutationOptions) {
+  const source = captureExternalSessionCommitGuard(options.sessionMutationCommitGuard);
+  return composeSessionSourceAssertion([source], (assertSource) => {
+    assertRequestTransportCurrent(options);
+    assertSource();
+  });
+}
+
 /** Opaque SDK guards retain their synchronous commit boundary from v2026.9.4. */
 export function readGatewayRequestMutationAuthority(
   options: RequestMutationOptions,
@@ -107,7 +122,7 @@ export function readGatewayRequestMutationAuthority(
   }
   const { req, client, signal, hasCurrentClientAuthority, sessionMutationCommitGuard } = options;
   const captured = { req, client, signal, hasCurrentClientAuthority, sessionMutationCommitGuard };
-  const assertLifetimeCurrent = () => assertRequestAuthorityCurrent(captured);
+  const assertLifetimeCurrent = captureRequestAuthorityAssertion(captured);
   const compatibility: GatewayRequestMutationAuthority = {
     family: "native-compatibility",
     assertPreparationCurrent: () => assertRequestTransportCurrent(captured),
@@ -123,8 +138,9 @@ export function bindInProcessRequestMutationAuthority<T extends GatewayRequestOp
   options: T,
   assertSourceCurrent: (() => void) | undefined,
   assertPreparationCurrent: (() => void) | undefined,
+  questionCallerRead?: PreparedQuestionCallerRead,
 ): T {
-  if (!assertSourceCurrent && !assertPreparationCurrent) {
+  if (!assertSourceCurrent && !assertPreparationCurrent && !questionCallerRead) {
     return options;
   }
   const source = readGatewayRequestMutationAuthority(options);
@@ -132,6 +148,7 @@ export function bindInProcessRequestMutationAuthority<T extends GatewayRequestOp
     options;
   bindRequestMutationAuthority(options, {
     ...source,
+    questionCallerRead,
     assertPreparationCurrent: () => {
       source.assertPreparationCurrent();
       assertPreparationCurrent?.();
@@ -256,24 +273,26 @@ export function bindGatewayRequestHandlerMutationAuthority<T extends GatewayRequ
       throw new Error("Gateway requester authority changed");
     }
   };
-  const assertCurrent = () => {
-    assertHandlerCurrent();
-    source.assertOperatorCurrent?.();
-    if (source.family === "worker") {
-      source.assertWorkerCurrent();
-    }
-    assertRequestAuthorityCurrent(handler);
-  };
-  const assertLifetimeCurrent = () => {
-    assertHandlerCurrent();
-    // Keep the pre-router owner; the handler guard also contains native profile selection.
-    source.assertLifetimeCurrent();
-  };
+  const assertCurrent = composeSessionSourceAssertion([
+    assertHandlerCurrent,
+    source.assertOperatorCurrent,
+    source.family === "worker" ? source.assertWorkerCurrent : undefined,
+    captureRequestAuthorityAssertion(handler),
+  ]);
+  const assertLifetimeCurrent = composeSessionSourceAssertion(
+    [source.assertLifetimeCurrent],
+    (assertSource) => {
+      assertHandlerCurrent();
+      // Keep the pre-router owner; the handler guard also contains native profile selection.
+      assertSource();
+    },
+  );
   const authority: GatewayRequestMutationAuthority = {
     assertPreparationCurrent: () => {
       assertHandlerCurrent();
       source.assertPreparationCurrent();
     },
+    questionCallerRead: source.questionCallerRead,
     assertCurrent,
     assertLifetimeCurrent,
     expectedProfileBinding: retainedProfileBinding,
@@ -307,8 +326,17 @@ export function bindGatewayRequestHandlerMutationAuthority<T extends GatewayRequ
     };
     const authorization = handler.sessionMutationAuthorization;
     if (authorization) {
+      const admitted = authorization.admittedInputAuthority;
       handler.sessionMutationAuthorization = {
         ...authorization,
+        ...(admitted
+          ? {
+              admittedInputAuthority: withSessionPendingInputAuthorityGuard(
+                admitted,
+                assertTransferredHandlerCurrent,
+              ),
+            }
+          : {}),
         assertAdmittedInputCurrent: () => {
           assertTransferredHandlerCurrent();
           (authorization.assertAdmittedInputCurrent ?? authorization.assertCurrent)();
@@ -374,13 +402,21 @@ export function withSessionMutationCommitGuard(
   }
   // Committed input keeps its original host and session authority. A later
   // account selection change cannot revoke custody already transferred to it.
-  const assertAdmittedInputCurrent = () => {
-    (assertAdmittedSourceCurrent ?? assertCommitAllowed)?.();
-    authorization?.assertCurrent();
-  };
+  const assertAdmittedInputCurrent = composeSessionSourceAssertion([
+    assertAdmittedSourceCurrent ?? assertCommitAllowed,
+    authorization?.assertCurrent,
+  ]);
+  const admitted = authorization?.admittedInputAuthority;
   return {
     ...authorization,
     assertAdmittedInputCurrent,
+    ...(admitted
+      ? {
+          admittedInputAuthority: withSessionPendingInputAuthorityGuard(admitted, () =>
+            (assertAdmittedSourceCurrent ?? assertCommitAllowed)?.(),
+          ),
+        }
+      : {}),
     ...(authorization?.withCurrent
       ? {
           withCurrent: <T>(consume: () => T) =>
@@ -409,11 +445,11 @@ export function withSessionMutationCommitGuard(
             ),
         }
       : {}),
-    assertCurrent: () => {
-      assertExpectedProfile?.();
-      assertCommitAllowed?.();
-      authorization?.assertCurrent();
-    },
+    assertCurrent: composeSessionSourceAssertion([
+      assertExpectedProfile,
+      assertCommitAllowed,
+      authorization?.assertCurrent,
+    ]),
     assertTargetCurrent: (target) => {
       assertExpectedProfile?.();
       assertCommitAllowed?.();

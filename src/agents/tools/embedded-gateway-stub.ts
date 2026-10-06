@@ -221,6 +221,7 @@ async function handleChatHistory(params: Record<string, unknown>) {
       messageId,
     },
     undefined,
+    undefined,
     (isCurrent) => {
       isNativeHistoryCurrent = isCurrent;
     },

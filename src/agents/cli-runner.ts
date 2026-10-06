@@ -38,7 +38,6 @@ import {
   formatCliTerminalInterruption,
   isClaudeCliBackend,
   resolveCliSourceReplyMirror,
-  settleCliBackendOutcome,
   settleCliPreparationError,
   settlePreparedCliRun,
 } from "./cli-runner/cli-run-settlement.js";
@@ -69,7 +68,7 @@ import {
 import type { PreparedCliRunContext, RunCliAgentParams } from "./cli-runner/types.js";
 import type { EmbeddedAgentRunResult } from "./embedded-agent-runner.js";
 import { resolveSourceReplyDelivery } from "./embedded-agent-runner/delivery-evidence.js";
-import { recordModelFallbackStop } from "./failover-error.js";
+import { coerceToFailoverError, recordModelFallbackStop } from "./failover-error.js";
 import { runBeforeAgentRunGate } from "./harness/before-agent-run.js";
 import { bootstrapHarnessContextEngine } from "./harness/context-engine-lifecycle.js";
 import { buildAgentHookContext } from "./harness/hook-context.js";
@@ -79,6 +78,7 @@ import {
   runAgentHarnessLlmOutputHook,
 } from "./harness/lifecycle-hook-helpers.js";
 import { resolveReplyExpectation } from "./reply-completion.js";
+import { recordAgentCleanupFailure } from "./run-cleanup-timeout.js";
 
 export { isCliBindingFlushed };
 
@@ -630,13 +630,24 @@ async function runPreparedCliAgentOwned(
     cleanupError = error as Error;
   }
   params.assertCurrent?.();
-  return settleCliBackendOutcome({
-    runResult,
-    runError,
-    runFailed,
-    cleanupError,
-    deliveredMessagingSideEffect,
-    diagnosticLifecycle,
-    failoverContext: cliFailoverContext,
-  });
+  if (cleanupError) {
+    recordAgentCleanupFailure();
+    if (!deliveredMessagingSideEffect) {
+      if (runFailed) {
+        log.warn(`CLI run also failed before backend cleanup: ${formatErrorMessage(runError)}`);
+      }
+      diagnosticLifecycle?.setPhase("cleanup");
+      throw cleanupError;
+    }
+    log.warn(
+      `CLI backend cleanup failed after confirmed message delivery: ${formatErrorMessage(cleanupError)}`,
+    );
+  }
+  if (runFailed) {
+    throw coerceToFailoverError(runError, cliFailoverContext) ?? runError;
+  }
+  if (!runResult) {
+    throw new Error("CLI run completed without a result");
+  }
+  return runResult;
 }

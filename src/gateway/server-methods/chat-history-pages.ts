@@ -19,9 +19,11 @@ import {
   projectForwardedMessages,
 } from "../chat-display-projection.history.js";
 import { resolveCurrentUserProfileDisplay } from "../current-user-profile-display.js";
+import type { IncognitoSessionHistoryReader } from "../session-history-snapshot.js";
 import * as sessionTranscriptReaders from "../session-transcript-readers.js";
 import { readChatHistoryPageKernel } from "./chat-history-page-kernel.js";
 import { projectChatHistoryWithReplies } from "./chat-history-reply-messages.js";
+import { encodeChatHistoryResponsePage } from "./chat-history-response-page.js";
 
 function prepareChatHistoryParams<Params extends ChatHistoryPageParams>(input: Params) {
   const homeDir = process.env.HOME || os.homedir();
@@ -73,16 +75,17 @@ function prepareChatHistoryParams<Params extends ChatHistoryPageParams>(input: P
   };
 }
 
-async function withNativeHistoryAuthorizationFallback<T>(
+// A native read denied after the effective profile changed falls back to
+// canonical history; any other failure surfaces unchanged.
+async function readNativeHistory<T>(
   sameAuthorization: () => boolean,
-  fallback: () => Promise<T>,
   read: () => Promise<T>,
-): Promise<{ result: T; usedFallback: boolean }> {
+): Promise<{ result: T } | undefined> {
   try {
-    return { result: await read(), usedFallback: false };
+    return { result: await read() };
   } catch (error) {
     if (isNativeHistoryAuthorizationDenied(error) && !sameAuthorization()) {
-      return { result: await fallback(), usedFallback: true };
+      return undefined;
     }
     throw error;
   }
@@ -92,16 +95,70 @@ async function withNativeHistoryAuthorizationFallback<T>(
 // without serializing callbacks or attaching native authority to canonical fallbacks.
 type RetainNativeHistoryAuthorization = (isCurrent: () => boolean) => void;
 
+function historyReadScope(input: ChatHistoryPageParams) {
+  return {
+    agentId: input.sessionAgentId,
+    sessionId: input.sessionId ?? "",
+    sessionKey: input.canonicalKey,
+    storePath: input.storePath,
+    sessionEntry: input.entry,
+  };
+}
+
 export async function readChatHistoryMessageById(
   input: ChatHistoryMessageParams,
+  suppliedIncognito?: IncognitoSessionHistoryReader,
   retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
 ) {
+  const incognito =
+    suppliedIncognito ??
+    sessionTranscriptReaders.captureIncognitoSessionHistoryReader({
+      agentId: input.sessionAgentId,
+      sessionId: input.sessionId,
+      sessionKey: input.canonicalKey,
+      storePath: input.storePath,
+      sessionEntry: input.entry,
+    });
+  const source = incognito ? structuredClone(input) : input;
   const {
     params,
     sameAuthorization,
     assertNativeHistoryAuthorized,
     onNativeHistoryAuthorizationRequest,
-  } = prepareChatHistoryParams(input);
+  } = prepareChatHistoryParams(source);
+  const messageOptions = {
+    allowResetArchiveFallback: true,
+    historyVisibility: { sessionStartedAt: source.entry?.sessionStartedAt },
+  };
+  if (incognito) {
+    const scope = {
+      agentId: source.sessionAgentId,
+      sessionId: source.sessionId,
+      sessionKey: source.canonicalKey,
+      storePath: source.storePath,
+      sessionEntry: source.entry,
+    };
+    const outcome = await incognito.consume(scope, async (readers) => {
+      const readCanonical = () =>
+        readers.readSessionMessageByIdAsync(scope, source.messageId, messageOptions);
+      if (params.ignoreCliSessionImports || !sameAuthorization()) {
+        return { result: await readCanonical(), native: false };
+      }
+      const { readProcessHeldCliHistoryMessage } =
+        await import("../cli-session-history.process-held.js");
+      const native = await readNativeHistory(sameAuthorization, () =>
+        readProcessHeldCliHistoryMessage(params, incognito, assertNativeHistoryAuthorized),
+      );
+      if (!native || !sameAuthorization()) {
+        return { result: await readCanonical(), native: false };
+      }
+      return { result: native.result, native: true };
+    });
+    if (outcome.native) {
+      retainNativeHistoryAuthorization?.(sameAuthorization);
+    }
+    return outcome.result;
+  }
   const readCanonical = () =>
     sessionTranscriptReaders.readSessionMessageByIdAsync(
       {
@@ -112,10 +169,7 @@ export async function readChatHistoryMessageById(
         sessionEntry: input.entry,
       },
       input.messageId,
-      {
-        allowResetArchiveFallback: true,
-        historyVisibility: { sessionStartedAt: input.entry?.sessionStartedAt },
-      },
+      messageOptions,
     );
   const storePath = input.storePath;
   if (params.ignoreCliSessionImports || !storePath) {
@@ -127,64 +181,100 @@ export async function readChatHistoryMessageById(
     if (!sameAuthorization()) {
       return readCanonical();
     }
-    const outcome = await withNativeHistoryAuthorizationFallback(
-      sameAuthorization,
-      readCanonical,
-      () => readProcessHeldCliHistoryMessage(params, assertNativeHistoryAuthorized),
+    const native = await readNativeHistory(sameAuthorization, () =>
+      readProcessHeldCliHistoryMessage(params, undefined, assertNativeHistoryAuthorized),
     );
-    if (outcome.usedFallback) {
-      return outcome.result;
-    }
-    if (!sameAuthorization()) {
+    if (!native || !sameAuthorization()) {
       return readCanonical();
     }
     retainNativeHistoryAuthorization?.(sameAuthorization);
-    return outcome.result;
+    return native.result;
   }
   const { readSessionHistoryPageInWorker } =
     await import("../../config/sessions/session-history-worker-runtime.js");
   if (!sameAuthorization()) {
     return readCanonical();
   }
-  const outcome = await withNativeHistoryAuthorizationFallback(
-    sameAuthorization,
-    readCanonical,
-    () =>
-      readSessionHistoryPageInWorker(
-        {
-          kind: "rpc-message",
-          params: { ...params, storePath },
-        },
-        undefined,
-        onNativeHistoryAuthorizationRequest,
-      ),
+  const native = await readNativeHistory(sameAuthorization, () =>
+    readSessionHistoryPageInWorker(
+      {
+        kind: "rpc-message",
+        params: { ...params, storePath },
+      },
+      undefined,
+      onNativeHistoryAuthorizationRequest,
+    ),
   );
-  if (outcome.usedFallback) {
-    return outcome.result;
-  }
-  if (!sameAuthorization()) {
+  if (!native || !sameAuthorization()) {
     return readCanonical();
   }
   retainNativeHistoryAuthorization?.(sameAuthorization);
-  return outcome.result;
+  return native.result;
 }
 
 export async function readChatHistoryPage(
   input: ChatHistoryPageParams,
   signal?: AbortSignal,
+  suppliedIncognito?: IncognitoSessionHistoryReader,
   retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
 ): Promise<ChatHistoryPage> {
   signal?.throwIfAborted();
+  const incognito =
+    suppliedIncognito ??
+    (input.sessionId && input.storePath
+      ? sessionTranscriptReaders.captureIncognitoSessionHistoryReader(
+          {
+            agentId: input.sessionAgentId,
+            sessionId: input.sessionId,
+            sessionKey: input.canonicalKey,
+            storePath: input.storePath,
+            sessionEntry: input.entry,
+          },
+          signal,
+        )
+      : undefined);
+  const source = incognito ? structuredClone(input) : input;
   const {
     params,
     sameAuthorization,
     assertNativeHistoryAuthorized,
     onNativeHistoryAuthorizationRequest,
-  } = prepareChatHistoryParams(input);
+  } = prepareChatHistoryParams(source);
   const readPage = async (pageParams: ChatHistoryPageParams): Promise<ChatHistoryPage> => {
     signal?.throwIfAborted();
+    const readCanonicalFallback = () => readPage({ ...source, ignoreCliSessionImports: true });
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-      return readPage({ ...input, ignoreCliSessionImports: true });
+      return readCanonicalFallback();
+    }
+    if (incognito) {
+      const scope = historyReadScope(pageParams);
+      if (!pageParams.ignoreCliSessionImports) {
+        const page = await incognito.consume(scope, async () => {
+          const { readProcessHeldCliHistory } =
+            await import("../cli-session-history.process-held.js");
+          const native = await readNativeHistory(sameAuthorization, () =>
+            readProcessHeldCliHistory(pageParams, signal, incognito, assertNativeHistoryAuthorized),
+          );
+          if (!native) {
+            return undefined;
+          }
+          const messages = await refreshForwardedLabels(native.result.messages);
+          signal?.throwIfAborted();
+          return { ...native.result, messages };
+        });
+        if (!page || !sameAuthorization()) {
+          return readCanonicalFallback();
+        }
+        retainNativeHistoryAuthorization?.(sameAuthorization);
+        return page;
+      }
+      const reader = incognito;
+      return reader.consume(scope, async () => {
+        const page = await reader.rpc({ ...pageParams, encodeResponse: false });
+        const messages = await refreshForwardedLabels(page.messages);
+        signal?.throwIfAborted();
+        return encodeChatHistoryResponsePage({ ...page, messages }, pageParams);
+      });
     }
     if (
       pageParams.sessionId &&
@@ -193,21 +283,19 @@ export async function readChatHistoryPage(
       !pageParams.ignoreCliSessionImports
     ) {
       const { readProcessHeldCliHistory } = await import("../cli-session-history.process-held.js");
-      if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-        return readPage({ ...input, ignoreCliSessionImports: true });
+      if (!sameAuthorization()) {
+        return readCanonicalFallback();
       }
-      const outcome = await withNativeHistoryAuthorizationFallback(
-        sameAuthorization,
-        () => readPage({ ...input, ignoreCliSessionImports: true }),
-        () => readProcessHeldCliHistory(pageParams, signal, assertNativeHistoryAuthorized),
+      const native = await readNativeHistory(sameAuthorization, () =>
+        readProcessHeldCliHistory(pageParams, signal, undefined, assertNativeHistoryAuthorized),
       );
-      if (outcome.usedFallback) {
-        return outcome.result;
+      if (!native) {
+        return readCanonicalFallback();
       }
-      const page = outcome.result;
+      const page = native.result;
       const refreshed = { ...page, messages: await refreshForwardedLabels(page.messages) };
-      if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-        return readPage({ ...input, ignoreCliSessionImports: true });
+      if (!sameAuthorization()) {
+        return readCanonicalFallback();
       }
       retainNativeHistoryAuthorization?.(sameAuthorization);
       return refreshed;
@@ -229,37 +317,33 @@ export async function readChatHistoryPage(
     const { readSessionHistoryPageInWorker } =
       await import("../../config/sessions/session-history-worker-runtime.js");
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-      return readPage({ ...input, ignoreCliSessionImports: true });
+      return readCanonicalFallback();
     }
-    const outcome = await withNativeHistoryAuthorizationFallback(
-      sameAuthorization,
-      () => readPage({ ...input, ignoreCliSessionImports: true }),
-      () =>
-        readSessionHistoryPageInWorker(
-          {
-            kind: "rpc",
-            params: {
-              ...pageParams,
-              compactionMetrics: readLegacyCompactionMetrics(pageParams.entry),
-              sessionId,
-              storePath,
-            },
+    const native = await readNativeHistory(sameAuthorization, () =>
+      readSessionHistoryPageInWorker(
+        {
+          kind: "rpc",
+          params: {
+            ...pageParams,
+            compactionMetrics: readLegacyCompactionMetrics(pageParams.entry),
+            sessionId,
+            storePath,
           },
-          signal,
-          onNativeHistoryAuthorizationRequest,
-        ),
+        },
+        signal,
+        onNativeHistoryAuthorizationRequest,
+      ),
     );
-    if (outcome.usedFallback) {
-      return outcome.result;
+    if (!native) {
+      return readCanonicalFallback();
     }
-    const page = outcome.result;
     if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-      return readPage({ ...input, ignoreCliSessionImports: true });
+      return readCanonicalFallback();
     }
     if (!pageParams.ignoreCliSessionImports) {
       retainNativeHistoryAuthorization?.(sameAuthorization);
     }
-    return page;
+    return native.result;
   };
   return readPage(params);
 }

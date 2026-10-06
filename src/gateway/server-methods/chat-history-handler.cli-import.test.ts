@@ -194,8 +194,8 @@ describe("CLI-imported history pages", () => {
           const retainAuthorization = vi.fn<(isCurrent: () => boolean) => void>();
           const readMessage = historyPages.readChatHistoryMessageById;
           vi.spyOn(historyPages, "readChatHistoryMessageById").mockImplementationOnce(
-            (input, retain) =>
-              readMessage(input, (isCurrent) => {
+            (input, incognito, retain) =>
+              readMessage(input, incognito, (isCurrent) => {
                 retainAuthorization(isCurrent);
                 retain?.(isCurrent);
               }),

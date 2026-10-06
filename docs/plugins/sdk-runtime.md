@@ -28,6 +28,18 @@ register(api) {
 
 `api.runtime.version` is the current OpenClaw product version, sourced from the shared version resolver so plugins see the same value the CLI reports.
 
+`api.runtime.capabilities` is an optional, read-only list of host behavior
+guarantees. Older hosts may omit it. Check a documented capability ID before
+enabling behavior that depends on it; equal product versions and tool names do
+not establish support. These process-stable facts do not grant caller authority,
+and they remain unavailable during metadata-only registration.
+
+`sender-restricted-hidden-helpers-v1` guarantees that sender-restricted requesters
+can start only hidden helpers of the same agent, retaining their restricted tool
+surface and session root. Channels may use this capability to enable helper
+tools for restricted senders. Core remains responsible for authorization and
+containment. The same ID is advertised in Gateway `hello-ok.features.capabilities`.
+
 ## What each page covers
 
 - [Config and utilities](/plugins/sdk-runtime/config-and-utilities) — runtime config reads and writes, plus the shared process, error, and model-picker utilities.
@@ -160,8 +172,10 @@ resumption acquires a new lease through the original owner and scope. A retained
 iterator cannot acquire fresh authority after its owner closes.
 
 Native plugins execute in the Gateway process and are not sandboxed. Provenance
-diagnostics and capability-specific trust requirements still apply;
-`plugins.allow` permits loading without verifying source provenance. These
+diagnostics and capability-specific trust requirements, such as hook agent turns
+and Gateway scope elevation, still apply. Every loaded plugin can
+use its own [state and ingress queues](/plugins/sdk-runtime/state-and-system#api-runtime-state),
+regardless of provenance. `plugins.allow` permits loading without verifying source provenance. These
 load-time facts belong to the instance until the plugin owner replaces it through
 restart or an explicit reload or installation operation.
 
@@ -263,6 +277,15 @@ close that store when the sequence settles, including on failure. This retains
 the existing executor between commands without holding a writer turn across
 preparation. Each command keeps its own live authority checks. Omit the option
 for cached stores whose lifetime can outlast accepted work.
+
+First-party runtime callers can use `withOpenClawAgentDatabaseRuntime` from the
+same subpath to admit cold agent storage in its existing executor before
+receiving a native handle. The operation callback still runs on the caller;
+dispatch its database work through the existing store worker. Its authority
+callback runs inside worker grants and must not read the same database or do
+blocking work. Put same-database predicates in the worker transaction. The
+released `withOpenClawAgentDatabaseAsync` retains native admission for arbitrary
+synchronous SDK guards, including its post-integrity, pre-repair checkpoint.
 
 ### Memory runtime replacement
 

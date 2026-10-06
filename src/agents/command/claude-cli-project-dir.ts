@@ -1,6 +1,3 @@
-/**
- * Resolves Claude CLI project storage directories for OpenClaw workspaces.
- */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -67,7 +64,6 @@ function isFullyQualifiedProjectsDir(projectsDir: string): boolean {
   return path.isAbsolute(projectsDir) && path.parse(projectsDir).root !== "\\";
 }
 
-/** Resolves Claude CLI's per-workspace project directory. */
 export function resolveClaudeCliProjectDirForWorkspace(params: {
   workspaceDir: string;
   homeDir?: string;

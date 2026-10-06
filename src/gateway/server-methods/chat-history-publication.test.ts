@@ -49,7 +49,7 @@ describe("history publication authority", () => {
         for (const retained of [false, true]) {
           for (const allowed of [false, true]) {
             let current = true;
-            read.mockImplementationOnce(async (_params, _signal, retainAuthorization) => {
+            read.mockImplementationOnce(async (_params, _signal, _incognito, retainAuthorization) => {
               retainAuthorization?.(() => current);
               return { messages: [message] };
             });
@@ -99,7 +99,7 @@ describe("history publication authority", () => {
       for (const native of [false, true]) {
         for (const allowed of [false, true]) {
           let current = true;
-          read.mockImplementationOnce(async (_params, retainAuthorization) => {
+          read.mockImplementationOnce(async (_params, _incognito, retainAuthorization) => {
             if (native) {
               retainAuthorization?.(() => current);
             }

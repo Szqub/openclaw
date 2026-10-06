@@ -168,7 +168,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
   // Abort-signal attachment for queued followups:
   // - room_event: always inherit (source admission fence / ambient cancel).
   // - Gateway-owned lifecycle (chat.send / turnAdoptionLifecycle): always inherit
-  //   so Esc can cancel a turn after chat.send terminalizes while still queued.
+  //   so Esc can cancel an input while it waits for its followup execution.
   // - plain user_request without lifecycle: deliberately detach from the
   //   source/active-lane signal so a superseded parent abort does not cancel a
   //   still-valid queued user turn.
@@ -404,6 +404,13 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     ...(queuedFollowupAbortSignal ? { abortSignal: queuedFollowupAbortSignal } : {}),
     deliveryCorrelations: opts?.queuedDeliveryCorrelations,
     turnAdoptionLifecycle: opts?.turnAdoptionLifecycle,
+    runObservers: {
+      onAgentRunStart: opts?.onAgentRunStart,
+      onAgentRunTerminalOutcome: opts?.onAgentRunTerminalOutcome,
+      onModelSelected: opts?.onModelSelected,
+      prepareAssistantTranscriptMessage: opts?.prepareAssistantTranscriptMessage,
+      resolveReplyDelivery: opts?.resolveReplyDelivery,
+    },
     ...(opts?.onFollowupQueueDisposition
       ? { onQueueDisposition: opts.onFollowupQueueDisposition }
       : {}),

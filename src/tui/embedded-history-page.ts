@@ -11,7 +11,7 @@ import { capArrayByJsonBytes } from "../gateway/session-transcript-readers.js";
 
 export async function readEmbeddedHistoryPage(params: ChatHistoryPageParams) {
   let isNativeHistoryCurrent: (() => boolean) | undefined;
-  const historyPage = await readChatHistoryPage(params, undefined, (isCurrent) => {
+  const historyPage = await readChatHistoryPage(params, undefined, undefined, (isCurrent) => {
     isNativeHistoryCurrent = isCurrent;
   });
   const normalized = enrichChatHistoryCompactionMarkers(historyPage.messages, params.entry);

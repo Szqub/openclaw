@@ -15,6 +15,7 @@ import {
 import type { WorkerTaskChannel } from "../infra/worker-task-server.js";
 import type { CliHistoryReaders } from "./cli-session-history.js";
 import { projectChatHistoryWithReplies } from "./server-methods/chat-history-reply-messages.js";
+import type { IncognitoSessionHistoryReader } from "./session-history-snapshot.js";
 import type {
   SessionTranscriptPageOptions,
   SessionTranscriptPageReader,
@@ -41,11 +42,13 @@ type NativeHistoryAuthorityAssertion = () => Promise<void>;
 export async function readProcessHeldCliHistory(
   params: ChatHistoryPageParams,
   signal?: AbortSignal,
+  incognito?: IncognitoSessionHistoryReader,
   assertNativeHistoryAuthorized?: NativeHistoryAuthorityAssertion,
 ): Promise<ChatHistoryPage> {
   const result = await readProcessHeldCliHistoryQuery(
     { kind: "rpc", params },
     signal,
+    incognito,
     assertNativeHistoryAuthorized,
   );
   if (result.kind !== "rpc") {
@@ -56,11 +59,13 @@ export async function readProcessHeldCliHistory(
 
 export async function readProcessHeldCliHistoryMessage(
   params: ChatHistoryMessageParams,
+  incognito?: IncognitoSessionHistoryReader,
   assertNativeHistoryAuthorized?: NativeHistoryAuthorityAssertion,
 ) {
   const result = await readProcessHeldCliHistoryQuery(
     { kind: "rpc-message", params },
     undefined,
+    incognito,
     assertNativeHistoryAuthorized,
   );
   if (result.kind !== "rpc-message") {
@@ -72,6 +77,7 @@ export async function readProcessHeldCliHistoryMessage(
 async function readProcessHeldCliHistoryQuery(
   input: ChatHistoryDisplayRequest,
   signal?: AbortSignal,
+  incognito?: IncognitoSessionHistoryReader,
   assertNativeHistoryAuthorized?: NativeHistoryAuthorityAssertion,
 ): Promise<ChatHistoryDisplayResult> {
   const history = structuredClone(input);
@@ -79,7 +85,7 @@ async function readProcessHeldCliHistoryQuery(
   params.encodeResponse = false;
   const [{ runProcessHeldHistoryTask }, readers] = await Promise.all([
     import("../config/sessions/session-transcript-worker-runtime.js"),
-    import("./session-transcript-readers.js"),
+    incognito?.readers ?? import("./session-transcript-readers.js"),
   ]);
   const scope = {
     agentId: params.sessionAgentId,
@@ -88,21 +94,26 @@ async function readProcessHeldCliHistoryQuery(
     storePath: params.storePath,
     sessionEntry: params.entry,
   };
-  const current = captureNativeSessionEntryCurrentRead(scope);
-  const initial = current.readCurrent();
+  const current = incognito ? undefined : captureNativeSessionEntryCurrentRead(scope);
+  const initial = current?.readCurrent();
   if (
-    !initial ||
-    initial.sessionId !== scope.sessionId ||
-    initial.lifecycleRevision !== params.entry?.lifecycleRevision
+    !incognito &&
+    (!initial ||
+      initial.sessionId !== scope.sessionId ||
+      initial.lifecycleRevision !== params.entry?.lifecycleRevision)
   ) {
     throw new Error("Incognito history session is no longer current");
   }
   const assertCurrent = () => {
     signal?.throwIfAborted();
-    const entry = current.readCurrent();
+    if (incognito) {
+      incognito.assertCurrent();
+      return;
+    }
+    const entry = current?.readCurrent();
     if (
-      entry?.sessionId !== initial.sessionId ||
-      entry?.lifecycleRevision !== initial.lifecycleRevision
+      entry?.sessionId !== initial?.sessionId ||
+      entry?.lifecycleRevision !== initial?.lifecycleRevision
     ) {
       throw new Error("Incognito history session generation is no longer current");
     }

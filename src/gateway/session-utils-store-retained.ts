@@ -5,7 +5,6 @@ import { withSessionEntriesFromStoresInWorker } from "../config/sessions/session
 import type { CapturedSessionEntryReadSource } from "../config/sessions/session-entry-read-source.types.js";
 import { listSessionMembers } from "../config/sessions/session-sharing-store.js";
 import type { SessionMember } from "../config/sessions/session-sharing-store.kernel.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 import {
   prepareSessionRowPublicationScope,
@@ -87,10 +86,10 @@ export async function withQualifiedGatewaySessionStoreTarget<T>(params: {
           selected.result.databaseIdentity,
         );
         const assertCurrent = () => {
-          selected.assertCurrent();
           if (changed) {
             throw new GatewaySessionFactsChangedDuringReadError();
           }
+          selected.assertCurrent();
           if (
             params.target.readSource &&
             !isDeepStrictEqual(capturedReadSource, params.target.readSource)
@@ -116,7 +115,14 @@ export async function withQualifiedGatewaySessionStoreTarget<T>(params: {
           assertCurrent,
         );
       },
-      { prepareSource: (_input, ...source) => publication.prepareSource(...source) },
+      {
+        ordered: true,
+        onReadAdmitted: () => {
+          // The snapshot includes every write that settled before this FIFO turn.
+          changed = false;
+        },
+        prepareSource: (_input, ...source) => publication.prepareSource(...source),
+      },
     );
   } finally {
     stop();
@@ -125,11 +131,7 @@ export async function withQualifiedGatewaySessionStoreTarget<T>(params: {
 
 /** Process-held incognito state cannot be reopened by the durable read worker. */
 export function withIncognitoGatewaySessionStoreTarget<T>(params: {
-  cfg: OpenClawConfig;
-  key: string;
-  agentId?: string;
   env?: NodeJS.ProcessEnv;
-  projection?: "list" | "full";
   includeMembership?: boolean;
   identity: { agentId: string; canonicalKey: string };
   resolve: () => GatewaySessionStoreTargetWithStore;
