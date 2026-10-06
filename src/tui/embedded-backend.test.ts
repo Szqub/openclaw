@@ -119,6 +119,7 @@ const readChatHistoryPageMock = vi.fn(
   async (
     _params?: unknown,
     _signal?: AbortSignal,
+    _incognito?: unknown,
     _retainNativeHistoryAuthorization?: (isCurrent: () => boolean) => void,
   ): Promise<import("../config/sessions/session-history-types.js").ChatHistoryPage> => ({
     messages: [],
@@ -1278,6 +1279,7 @@ describe("EmbeddedTuiBackend", () => {
       });
       expect(readChatHistoryPageMock).toHaveBeenCalledWith(
         expect.objectContaining({ canonicalKey: "global", sessionAgentId: owner, entry }),
+        undefined,
         undefined,
         expect.any(Function),
       );

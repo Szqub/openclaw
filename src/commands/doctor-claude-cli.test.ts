@@ -12,6 +12,7 @@ import { clearHealthChecksForTest } from "../flows/health-check-registry.js";
 import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
 import { loadBundledPluginPublicArtifactModuleSync } from "../plugins/public-surface-loader.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { shortenHomePath } from "../utils.js";
 import { noteClaudeCliHealth } from "./doctor-claude-cli.js";
 import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
@@ -262,8 +263,10 @@ describe("noteClaudeCliHealth", () => {
         fs.writeFileSync(selectedDir, "selected-root problem");
         noteClaudeCliHealth(cfg, deps);
         expect(noteFn).toHaveBeenCalledTimes(1);
-        expect(noteBody(noteFn)).toContain(`${selectedDir} exists but is not a directory.`);
-        expect(noteBody(noteFn)).not.toContain(defaultDir);
+        expect(noteBody(noteFn)).toContain(
+          `${shortenHomePath(selectedDir)} exists but is not a directory.`,
+        );
+        expect(noteBody(noteFn)).not.toContain(shortenHomePath(defaultDir));
       });
     },
   );
