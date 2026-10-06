@@ -119,7 +119,7 @@ async function readFixture(
   options?: {
     cwd?: string;
     omitCwd?: true;
-    retainAuthorization?: Parameters<typeof readChatHistoryPage>[2];
+    retainAuthorization?: Parameters<typeof readChatHistoryPage>[3];
   },
 ) {
   const requestedCwd = options?.omitCwd ? undefined : (options?.cwd ?? fixture.cwd);
@@ -138,6 +138,7 @@ async function readFixture(
       messageId: undefined,
       ...(requestedCwd ? { cwd: requestedCwd } : {}),
     },
+    undefined,
     undefined,
     options?.retainAuthorization,
   );

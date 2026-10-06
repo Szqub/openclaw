@@ -368,10 +368,12 @@ describe("embedded gateway stub", () => {
     async (current) => {
       const messages = [{ role: "assistant", content: "prepared history" }];
       const isCurrent = vi.fn(() => current);
-      runtime.readChatHistoryPage.mockImplementationOnce(async (_params, _signal, _incognito, retain) => {
-        retain?.(isCurrent);
-        return { messages, pagination: { offset: 0, totalMessages: 1, rawPageMessages: 1 } };
-      });
+      runtime.readChatHistoryPage.mockImplementationOnce(
+        async (_params, _signal, _incognito, retain) => {
+          retain?.(isCurrent);
+          return { messages, pagination: { offset: 0, totalMessages: 1, rawPageMessages: 1 } };
+        },
+      );
       const result = createEmbeddedCallGateway()({
         method: "chat.history",
         params: { sessionKey: "agent:main:main" },

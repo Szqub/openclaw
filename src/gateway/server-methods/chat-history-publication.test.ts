@@ -49,10 +49,12 @@ describe("history publication authority", () => {
         for (const retained of [false, true]) {
           for (const allowed of [false, true]) {
             let current = true;
-            read.mockImplementationOnce(async (_params, _signal, _incognito, retainAuthorization) => {
-              retainAuthorization?.(() => current);
-              return { messages: [message] };
-            });
+            read.mockImplementationOnce(
+              async (_params, _signal, _incognito, retainAuthorization) => {
+                retainAuthorization?.(() => current);
+                return { messages: [message] };
+              },
+            );
             context.readChatStartupProjection = async () => {
               if (!retained) {
                 current = allowed;
