@@ -1,148 +1,31 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { STREAM_ERROR_FALLBACK_TEXT } from "@openclaw/ai/internal/shared";
 import { expectDefined } from "@openclaw/normalization-core";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
+  appendTranscriptEvent,
   appendTranscriptMessage,
   replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
-import {
-  NATIVE_HISTORY_AUTHORIZATION_REQUEST,
-  isNativeHistoryAuthorizationRequest,
-} from "../../config/sessions/session-history-types.js";
-import * as sessionHistoryWorkerRuntime from "../../config/sessions/session-history-worker-runtime.js";
-import * as sessionTranscriptWorkerRuntime from "../../config/sessions/session-transcript-worker-runtime.js";
 import { readLoggingConfig } from "../../logging/config.js";
 import { applyLoggingConfig } from "../../logging/logger.js";
 import { registerSecretValueForRedaction } from "../../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../../logging/secret-redaction-registry.test-support.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { SerializedJsonArray } from "../serialized-json.js";
 import { readChatHistoryMessageId } from "../session-history-tail.js";
 import { readSessionMessageByIdAsync } from "../session-transcript-readers.js";
-import { chatHistoryHandlers } from "./chat-history-handler.js";
-import * as historyPages from "./chat-history-pages.js";
+import {
+  historyReader,
+  withImportedHistory,
+  type HistoryPage,
+  type HistoryRequest,
+} from "./chat-history-handler.cli-import.test-support.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
 import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
-
-type HistoryPage = {
-  messages: unknown[];
-  completeSnapshot?: boolean;
-  hasMore?: boolean;
-  nextOffset?: number;
-  offset?: number;
-  totalMessages?: number;
-};
-
-type HistoryRequest = {
-  limit?: number;
-  maxBytes?: number;
-  messageId?: string;
-  offset?: number;
-};
-
-type HistoryReadOptions = {
-  acceptsSerializedJson?: boolean;
-};
-
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllEnvs();
-});
-
-async function historyReader(
-  sessionKey: string,
-  method: "chat.history" | "chat.startup" = "chat.history",
-) {
-  const context = await createHistoryReadContext();
-  const handler = expectDefined(chatHistoryHandlers[method], "history handler");
-  return async (params: HistoryRequest, options: HistoryReadOptions = {}): Promise<HistoryPage> => {
-    let result: HistoryPage | undefined;
-    await handler({
-      params: { sessionKey, ...params },
-      context,
-      req: { type: "req", id: randomUUID(), method },
-      client: null,
-      ...(options.acceptsSerializedJson ? { acceptsSerializedJson: true } : {}),
-      isWebchatConnect: () => false,
-      respond: (ok, payload, error) => {
-        expect(error).toBeUndefined();
-        expect(ok).toBe(true);
-        result = payload as HistoryPage;
-      },
-    });
-    return expectDefined(result, "history response");
-  };
-}
-
-async function withImportedHistory(
-  method: "chat.history" | "chat.startup",
-  importedCount: number,
-  text: string,
-  run: (fixture: {
-    read: (params: HistoryRequest, options?: HistoryReadOptions) => Promise<HistoryPage>;
-    importedIds: string[];
-    sourcePath: string;
-    sessionsDir: string;
-    scope: { agentId: string; sessionId: string; sessionKey: string };
-  }) => Promise<void>,
-  incognito = false,
-) {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const scope = {
-      agentId: "main",
-      sessionKey: incognito
-        ? "agent:main:dashboard:incognito-cli-history"
-        : "agent:main:cli-history-anchor",
-      sessionId: randomUUID(),
-    };
-    const cliSessionId = randomUUID();
-    const timestamp = Date.parse("2026-09-01T10:00:00Z");
-    await upsertSessionEntryCore(scope, {
-      sessionId: scope.sessionId,
-      updatedAt: incognito ? Date.now() : timestamp,
-      ...(incognito ? { incognito: true as const } : {}),
-      providerOverride: "claude-cli",
-      modelOverride: "claude-sonnet-4-6",
-      cliSessionBindings: { "claude-cli": { sessionId: cliSessionId } },
-    });
-    await appendTranscriptMessage(scope, {
-      message: { role: "user", content: "Local question", timestamp },
-    });
-    await appendTranscriptMessage(scope, {
-      message: { role: "assistant", content: "Local answer", timestamp: timestamp + 1 },
-    });
-    const importedIds = Array.from({ length: importedCount }, () => randomUUID());
-    const projectDir = path.join(state.home, ".claude", "projects", "synthetic-history");
-    await fs.mkdir(projectDir, { recursive: true });
-    await fs.writeFile(
-      path.join(projectDir, `${cliSessionId}.jsonl`),
-      importedIds
-        .map((uuid, index) => {
-          const role = index % 2 === 0 ? "user" : "assistant";
-          return JSON.stringify({
-            type: role,
-            uuid,
-            parentUuid: importedIds[index - 1] ?? null,
-            sessionId: cliSessionId,
-            timestamp: new Date(timestamp + index + 2).toISOString(),
-            message: { role, content: `Imported ${index}: ${text}` },
-          });
-        })
-        .join("\n") + "\n",
-    );
-    await run({
-      read: await historyReader(scope.sessionKey, method),
-      importedIds,
-      sourcePath: path.join(projectDir, `${cliSessionId}.jsonl`),
-      sessionsDir: state.sessionsDir(),
-      scope,
-    });
-  });
-}
 
 function expectMissingAnchor(page: HistoryPage) {
   expect(page.messages).toEqual([]);
@@ -152,115 +35,6 @@ function expectMissingAnchor(page: HistoryPage) {
 }
 
 describe("CLI-imported history pages", () => {
-  it.each([false, true])(
-    "rechecks native message authority and retains canonical access (incognito: %s)",
-    async (incognito) => {
-      await withImportedHistory(
-        "chat.history",
-        1,
-        "native-only message",
-        async ({ scope, sourcePath, importedIds }) => {
-          await upsertSessionEntryCore(scope, {
-            cliSessionBindings: {
-              "claude-cli": {
-                sessionId: path.basename(sourcePath, ".jsonl"),
-                transcriptRoot: path.dirname(path.dirname(sourcePath)),
-              },
-            },
-          });
-          const canonical = await appendTranscriptMessage(scope, {
-            message: { role: "assistant", content: "Canonical-only message" },
-          });
-          const context = await createHistoryReadContext();
-          const getMessage = async (messageId: string) => {
-            let result: unknown;
-            await expectDefined(
-              chatMessageGetHandlers["chat.message.get"],
-              "message handler",
-            )({
-              params: { sessionKey: scope.sessionKey, messageId },
-              context,
-              req: { type: "req", id: randomUUID(), method: "chat.message.get" },
-              client: null,
-              isWebchatConnect: () => false,
-              respond: (ok, payload, error) => {
-                expect(error).toBeUndefined();
-                expect(ok).toBe(true);
-                result = payload;
-              },
-            });
-            return result;
-          };
-          const retainAuthorization = vi.fn<(isCurrent: () => boolean) => void>();
-          const readMessage = historyPages.readChatHistoryMessageById;
-          vi.spyOn(historyPages, "readChatHistoryMessageById").mockImplementationOnce(
-            (input, suppliedIncognito, retain) =>
-              readMessage(input, suppliedIncognito, (isCurrent) => {
-                retainAuthorization(isCurrent);
-                retain?.(isCurrent);
-              }),
-          );
-          const nativeId = expectDefined(importedIds[0], "native message ID");
-          expect(await getMessage(nativeId)).toMatchObject({
-            ok: true,
-            message: { content: "Imported 0: native-only message" },
-          });
-          expect(retainAuthorization).toHaveBeenCalledOnce();
-          expect(retainAuthorization.mock.calls[0]?.[0]()).toBe(true);
-          const revoke = () =>
-            vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(path.dirname(sourcePath), "new-profile"));
-          const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;
-          const runProcessHeldHistoryTask =
-            sessionTranscriptWorkerRuntime.runProcessHeldHistoryTask;
-          const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
-          const heldTask = vi.spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask");
-          let nativeAuthorizationRequests = 0;
-          if (incognito) {
-            heldTask.mockImplementationOnce(async (history, onRequest, signal) =>
-              runProcessHeldHistoryTask(
-                history,
-                async (value, requestContext) => {
-                  if (isNativeHistoryAuthorizationRequest(value)) {
-                    nativeAuthorizationRequests += 1;
-                    revoke();
-                  }
-                  return onRequest(value, requestContext);
-                },
-                signal,
-              ),
-            );
-          } else {
-            worker.mockImplementationOnce(async (...args) => {
-              const [request, signal, onRequest] = args;
-              return workerRead(request, signal, async (value) => {
-                expect(value).toEqual(NATIVE_HISTORY_AUTHORIZATION_REQUEST);
-                nativeAuthorizationRequests += 1;
-                revoke();
-                await onRequest?.(value);
-              });
-            });
-          }
-          expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
-          expect(nativeAuthorizationRequests).toBe(1);
-          if (!incognito) {
-            expect(heldTask).not.toHaveBeenCalled();
-          }
-          worker.mockClear();
-          heldTask.mockClear();
-          expect(await getMessage(nativeId)).toEqual({ ok: false, unavailableReason: "not_found" });
-          expect(await getMessage(canonical.messageId)).toMatchObject({
-            ok: true,
-            message: { content: "Canonical-only message" },
-          });
-          expect(
-            worker.mock.calls.filter(([request]) => request.kind === "rpc-message"),
-          ).toHaveLength(0);
-        },
-        incognito,
-      );
-    },
-  );
-
   it.each([false, true])(
     "opens imported-only full messages through the history index (incognito: %s)",
     async (incognito) => {
@@ -779,88 +553,189 @@ describe("CLI-imported history pages", () => {
     );
   });
 
-  it.each([false, true])(
-    "fails closed at the native-history worker boundary (incognito: %s)",
-    async (incognito) => {
-      await withImportedHistory(
-        "chat.history",
-        1,
-        "revoked imported response",
-        async ({ read, sourcePath, importedIds }) => {
-          const revoke = () =>
-            vi.stubEnv(
-              "CLAUDE_CONFIG_DIR",
-              path.join(path.dirname(path.dirname(path.dirname(sourcePath))), "changed-claude"),
-            );
-          const runProcessHeldHistoryTask =
-            sessionTranscriptWorkerRuntime.runProcessHeldHistoryTask;
-          const workerRead = sessionHistoryWorkerRuntime.readSessionHistoryPageInWorker;
-          const worker = vi.spyOn(sessionHistoryWorkerRuntime, "readSessionHistoryPageInWorker");
-          const heldTask = vi.spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask");
-          let nativeAuthorizationRequests = 0;
-          if (incognito) {
-            heldTask.mockImplementationOnce(async (history, onRequest, signal) =>
-              runProcessHeldHistoryTask(
-                history,
-                async (value, context) => {
-                  if (isNativeHistoryAuthorizationRequest(value)) {
-                    nativeAuthorizationRequests += 1;
-                    revoke();
-                  }
-                  return onRequest(value, context);
-                },
-                signal,
-              ),
-            );
-          } else {
-            worker.mockImplementationOnce(async (...args) => {
-              const [request, signal, onRequest] = args;
-              return workerRead(request, signal, async (value) => {
-                expect(value).toEqual(NATIVE_HISTORY_AUTHORIZATION_REQUEST);
-                nativeAuthorizationRequests += 1;
-                revoke();
-                await onRequest?.(value);
-              });
-            });
-          }
-          const page = await read({ limit: 10 });
-          const messages =
-            page.messages instanceof SerializedJsonArray
-              ? page.messages.materialize()
-              : page.messages;
-          expect(nativeAuthorizationRequests).toBe(1);
-          expect(messages.map(readChatHistoryMessageId)).not.toContain(importedIds[0]);
-          expect(JSON.stringify(messages)).toContain("Local answer");
-          expect(JSON.stringify(messages)).not.toContain("revoked imported response");
-        },
-        incognito,
+  // Closed interval: old-question, old-answer, reset. The latest window starts at
+  // fresh-question (or at a retained old-answer), and the bound Claude CLI
+  // transcript adds a post-reset CLI-only answer.
+  async function withPreResetCliHistory(
+    keepOldAnswer: boolean,
+    bindCli: boolean,
+    run: (read: (params: HistoryRequest) => Promise<HistoryPage>) => Promise<void>,
+  ) {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const scope = {
+        agentId: "main",
+        sessionKey: `agent:main:cli-history-pre-reset-${randomUUID()}`,
+        sessionId: randomUUID(),
+      };
+      const cliSessionId = randomUUID();
+      const timestamp = Date.parse("2026-09-06T22:00:00Z");
+      const resetAt = Date.parse("2026-10-06T20:29:44Z");
+      await upsertSessionEntryCore(scope, {
+        sessionId: scope.sessionId,
+        updatedAt: resetAt + 10,
+        sessionStartedAt: resetAt,
+        providerOverride: "claude-cli",
+        modelOverride: "claude-opus-5-5",
+        ...(bindCli ? { cliSessionBindings: { "claude-cli": { sessionId: cliSessionId } } } : {}),
+      });
+      await appendTranscriptMessage(scope, {
+        eventId: "old-question",
+        message: { role: "user", content: "Old question", timestamp },
+      });
+      await appendTranscriptMessage(scope, {
+        eventId: "old-answer",
+        message: { role: "assistant", content: "Old answer", timestamp: timestamp + 1 },
+      });
+      await appendTranscriptEvent(scope, {
+        type: "reset",
+        id: "reset",
+        parentId: "old-answer",
+        timestamp: new Date(resetAt).toISOString(),
+        reason: "new",
+        ...(keepOldAnswer ? { firstKeptEntryId: "old-answer" } : {}),
+      });
+      await appendTranscriptMessage(scope, {
+        eventId: "fresh-question",
+        message: { role: "user", content: "Fresh question", timestamp: resetAt + 1 },
+      });
+      // Reset clears CLI bindings, so the bound Claude transcript only knows
+      // post-reset rows; this CLI-only row makes the merge expand.
+      const projectDir = path.join(state.home, ".claude", "projects", "synthetic-history");
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, `${cliSessionId}.jsonl`),
+        `${JSON.stringify({
+          type: "assistant",
+          uuid: "cli-only-answer",
+          parentUuid: null,
+          sessionId: cliSessionId,
+          timestamp: new Date(resetAt + 2).toISOString(),
+          message: { role: "assistant", content: "CLI-only answer" },
+        })}\n`,
       );
-    },
-  );
+      await run(await historyReader(scope.sessionKey));
+    });
+  }
 
-  it("rejects unknown process-held history host requests", async () => {
-    await withImportedHistory(
-      "chat.history",
-      1,
-      "protocol",
-      async ({ read }) => {
-        const task = vi
-          .spyOn(sessionTranscriptWorkerRuntime, "runProcessHeldHistoryTask")
-          .mockImplementationOnce(async (_history, onRequest) => {
-            const controller = new AbortController();
-            await expect(
-              onRequest(
-                { kind: "unknown", options: {} },
-                { signal: controller.signal, yieldSignal: controller.signal },
-              ),
-            ).rejects.toThrow("Unsupported process-held history request");
-            throw new Error("process-held protocol rejection");
-          });
-        await expect(read({ limit: 1 })).rejects.toThrow("process-held protocol rejection");
-        expect(task).toHaveBeenCalledTimes(1);
-      },
-      true,
-    );
+  const ids = (page: HistoryPage) => page.messages.map(readChatHistoryMessageId);
+
+  it("reopens a pre-reset local anchor while a post-reset CLI import is bound", async () => {
+    await withPreResetCliHistory(false, true, async (read) => {
+      const current = await read({ messageId: "fresh-question", limit: 2 });
+      expect(ids(current)).toContain("cli-only-answer");
+
+      const reopened = await read({ messageId: "old-answer", limit: 2 });
+      expect(ids(reopened)).toContain("old-answer");
+      expect(ids(reopened)).not.toContain("fresh-question");
+      expect(ids(reopened)).not.toContain("cli-only-answer");
+
+      // The reopened page keeps its own reset-interval sequence for paging.
+      const reopenedTail = await read({ messageId: "old-answer", limit: 1 });
+      expect(ids(reopenedTail)).toEqual(["old-answer"]);
+      expect(reopenedTail.olderCursor).toEqual(expect.any(String));
+
+      expectMissingAnchor(await read({ messageId: "nonexistent-anchor", limit: 2 }));
+    });
+  });
+
+  it("keeps reopened-interval cursors on the closed interval across its reset marker", async () => {
+    // Walk old-answer -> newer (closing reset marker) -> older. The marker is also
+    // indexed in the current window; the bound walk must match the unbound one.
+    const walk = async (bindCli: boolean) => {
+      const pages: Array<{ ids: unknown[]; windowReset?: boolean }> = [];
+      await withPreResetCliHistory(false, bindCli, async (read) => {
+        const reopened = await read({ messageId: "old-answer", limit: 1 });
+        const resetPage = await read({ cursor: reopened.newerCursor, limit: 1 });
+        const back = await read({ cursor: resetPage.olderCursor, limit: 1 });
+        pages.push(
+          ...[reopened, resetPage, back].map((page) => ({
+            ids: ids(page),
+            windowReset: page.windowReset,
+          })),
+        );
+      });
+      return pages;
+    };
+    const bound = await walk(true);
+    expect(bound.slice(0, 2)).toEqual([
+      { ids: ["old-answer"], windowReset: undefined },
+      { ids: ["reset"], windowReset: undefined },
+    ]);
+    expect(bound[2]?.windowReset).toBeUndefined();
+    expect(bound).toEqual(await walk(false));
+  });
+
+  it("pages a reopened interval into a message retained across the reset", async () => {
+    await withPreResetCliHistory(true, true, async (read) => {
+      const reopened = await read({ messageId: "old-question", limit: 1 });
+      expect(ids(reopened)).toEqual(["old-question"]);
+
+      // old-answer lives in both the closed interval and the current index.
+      const newer = await read({ cursor: reopened.newerCursor, limit: 1 });
+      expect(newer.windowReset).toBeUndefined();
+      expect(ids(newer)).toEqual(["old-answer"]);
+    });
+  });
+
+  it("keeps a current-window failure hidden when an imported answer recovers it", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const scope = {
+        agentId: "main",
+        sessionKey: "agent:main:cli-history-hidden-recovered-failure",
+        sessionId: randomUUID(),
+      };
+      const cliSessionId = randomUUID();
+      const timestamp = Date.parse("2026-09-01T10:00:00Z");
+      await upsertSessionEntryCore(scope, {
+        sessionId: scope.sessionId,
+        updatedAt: timestamp,
+        providerOverride: "claude-cli",
+        modelOverride: "claude-sonnet-4-6",
+        cliSessionBindings: { "claude-cli": { sessionId: cliSessionId } },
+      });
+      await appendTranscriptMessage(scope, {
+        message: { role: "user", content: "Question", timestamp },
+      });
+      const failed = await appendTranscriptMessage(scope, {
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: STREAM_ERROR_FALLBACK_TEXT }],
+          timestamp: timestamp + 1,
+          stopReason: "error",
+        },
+      });
+      const projectDir = path.join(state.home, ".claude", "projects", "synthetic-history");
+      await fs.mkdir(projectDir, { recursive: true });
+      await fs.writeFile(
+        path.join(projectDir, `${cliSessionId}.jsonl`),
+        [
+          {
+            type: "user",
+            uuid: randomUUID(),
+            parentUuid: null,
+            sessionId: cliSessionId,
+            timestamp: new Date(timestamp).toISOString(),
+            message: { role: "user", content: "Question" },
+          },
+          {
+            type: "assistant",
+            uuid: "imported-answer",
+            parentUuid: null,
+            sessionId: cliSessionId,
+            timestamp: new Date(timestamp + 2).toISOString(),
+            message: { role: "assistant", content: "Recovered answer" },
+          },
+        ]
+          .map((line) => `${JSON.stringify(line)}\n`)
+          .join(""),
+      );
+      const read = await historyReader(scope.sessionKey);
+      const newest = await read({ limit: 10 });
+      expect(newest.messages.map(readChatHistoryMessageId)).toContain("imported-answer");
+      expect(newest.messages.map(readChatHistoryMessageId)).not.toContain(failed.messageId);
+      const anchored = await read({ messageId: failed.messageId, limit: 2 });
+      expect(anchored.messages.map(readChatHistoryMessageId)).not.toContain(failed.messageId);
+    });
   });
 
   it("does not substitute nearby SQLite messages for a filtered anchor", async () => {

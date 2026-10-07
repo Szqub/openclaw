@@ -95,13 +95,13 @@ async function readNativeHistory<T>(
 // without serializing callbacks or attaching native authority to canonical fallbacks.
 type RetainNativeHistoryAuthorization = (isCurrent: () => boolean) => void;
 
-function historyReadScope(input: ChatHistoryPageParams) {
+function chatHistoryScope(params: ChatHistoryPageParams) {
   return {
-    agentId: input.sessionAgentId,
-    sessionId: input.sessionId ?? "",
-    sessionKey: input.canonicalKey,
-    storePath: input.storePath,
-    sessionEntry: input.entry,
+    agentId: params.sessionAgentId,
+    sessionId: params.sessionId ?? "",
+    sessionKey: params.canonicalKey,
+    storePath: params.storePath,
+    sessionEntry: params.entry,
   };
 }
 
@@ -112,13 +112,7 @@ export async function readChatHistoryMessageById(
 ) {
   const incognito =
     suppliedIncognito ??
-    sessionTranscriptReaders.captureIncognitoSessionHistoryReader({
-      agentId: input.sessionAgentId,
-      sessionId: input.sessionId,
-      sessionKey: input.canonicalKey,
-      storePath: input.storePath,
-      sessionEntry: input.entry,
-    });
+    sessionTranscriptReaders.captureIncognitoSessionHistoryReader(chatHistoryScope(input));
   const source = incognito ? structuredClone(input) : input;
   const {
     params,
@@ -131,13 +125,7 @@ export async function readChatHistoryMessageById(
     historyVisibility: { sessionStartedAt: source.entry?.sessionStartedAt },
   };
   if (incognito) {
-    const scope = {
-      agentId: source.sessionAgentId,
-      sessionId: source.sessionId,
-      sessionKey: source.canonicalKey,
-      storePath: source.storePath,
-      sessionEntry: source.entry,
-    };
+    const scope = chatHistoryScope(source);
     const outcome = await incognito.consume(scope, async (readers) => {
       const readCanonical = () =>
         readers.readSessionMessageByIdAsync(scope, source.messageId, messageOptions);
@@ -161,13 +149,7 @@ export async function readChatHistoryMessageById(
   }
   const readCanonical = () =>
     sessionTranscriptReaders.readSessionMessageByIdAsync(
-      {
-        agentId: input.sessionAgentId,
-        sessionId: input.sessionId,
-        sessionKey: input.canonicalKey,
-        storePath: input.storePath,
-        sessionEntry: input.entry,
-      },
+      chatHistoryScope(input),
       input.messageId,
       messageOptions,
     );
@@ -223,13 +205,7 @@ export async function readChatHistoryPage(
     suppliedIncognito ??
     (input.sessionId && input.storePath
       ? sessionTranscriptReaders.captureIncognitoSessionHistoryReader(
-          {
-            agentId: input.sessionAgentId,
-            sessionId: input.sessionId,
-            sessionKey: input.canonicalKey,
-            storePath: input.storePath,
-            sessionEntry: input.entry,
-          },
+          chatHistoryScope(input),
           signal,
         )
       : undefined);
@@ -247,7 +223,7 @@ export async function readChatHistoryPage(
       return readCanonicalFallback();
     }
     if (incognito) {
-      const scope = historyReadScope(pageParams);
+      const scope = chatHistoryScope(pageParams);
       if (!pageParams.ignoreCliSessionImports) {
         const page = await incognito.consume(scope, async () => {
           const { readProcessHeldCliHistory } =

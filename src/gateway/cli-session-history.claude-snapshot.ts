@@ -99,10 +99,6 @@ async function decodeOversizedClaudeEntry(
   });
 }
 
-function fingerprint(stats: fs.Stats): string {
-  return [stats.dev, stats.ino, stats.size, stats.mtimeMs, stats.ctimeMs].join(":");
-}
-
 export async function resolveClaudeCliHistorySource(
   params: ClaudeCliHistoryParams,
 ): Promise<readonly [filePath: string, cacheKey: string, byteLength: number] | undefined> {
@@ -125,7 +121,9 @@ export async function resolveClaudeCliHistorySource(
   } catch {
     return undefined;
   }
-  const sourceFingerprint = fingerprint(stats);
+  const sourceFingerprint = [stats.dev, stats.ino, stats.size, stats.mtimeMs, stats.ctimeMs].join(
+    ":",
+  );
   const cacheKey = JSON.stringify([
     filePath,
     sourceFingerprint,

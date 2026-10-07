@@ -1,4 +1,3 @@
-// Handles abort requests and active reply run cancellation.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { getAcpSessionManager } from "../../acp/control-plane/manager.js";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-manager-api.js";
@@ -40,9 +39,9 @@ import {
 import { setAbortMemory } from "./abort-primitives.js";
 import type { FastAbortRequestParams, FastAbortResult, PreparedFastAbortRequest } from "./abort.js";
 import { resolveEffectiveResetTargetSessionKey } from "./acp-reset-target.js";
-import { resolveConversationBindingContextFromMessage } from "./conversation-binding-input.js";
 import { clearSessionLifecycleQueues } from "./queue/cleanup.js";
 import { resolveReplyOperationsForSession } from "./reply-run-registry.js";
+import { resolveSessionConversationBindingContext } from "./session-conversation-binding.js";
 
 export function abortSessionRunTargetWithOutcome(params: {
   agentId: string;
@@ -123,19 +122,13 @@ async function resolveBoundAcpAbortTargetSessionKey(params: {
   cfg: OpenClawConfig;
   activeSessionKey: string;
 }): Promise<string | undefined> {
-  const bindingContext = resolveConversationBindingContextFromMessage({
-    cfg: params.cfg,
-    ctx: params.ctx,
-  });
+  const bindingContext = resolveSessionConversationBindingContext(params.cfg, params.ctx);
   if (!bindingContext) {
     return undefined;
   }
   return resolveEffectiveResetTargetSessionKey({
     cfg: params.cfg,
-    channel: bindingContext.channel,
-    accountId: bindingContext.accountId,
-    conversationId: bindingContext.conversationId,
-    parentConversationId: bindingContext.parentConversationId,
+    ...bindingContext,
     activeSessionKey: params.activeSessionKey,
     skipConfiguredFallbackWhenActiveSessionNonAcp: false,
     fallbackToActiveAcpWhenUnbound: false,
@@ -189,11 +182,10 @@ export async function executeFastAbortRequest(
   const { ctx, cfg } = params;
   const { commandSessionKey, targetKey, resolveTargetAgentId } = request;
 
-  const commandAuthorized = ctx.CommandAuthorized;
   const auth = resolveCommandAuthorization({
     ctx,
     cfg,
-    commandAuthorized,
+    commandAuthorized: ctx.CommandAuthorized,
   });
   if (!auth.isAuthorizedSender) {
     return { handled: false, aborted: false };
