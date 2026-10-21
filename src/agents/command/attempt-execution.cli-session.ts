@@ -1,13 +1,11 @@
 import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
 import type { CliSessionBinding, SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { isClaudeCliProvider } from "../cli-output-records.js";
 import { resolveAuthorizedClaudeCliBinding } from "../cli-runner/child-env.js";
 import { hasCliLiveSession } from "../cli-runner/cli-live-session-registry.js";
 import { clearCliSessionInStore } from "../cli-session-store.js";
-import {
-  isClaudeCliProvider,
-  claudeCliSessionTranscriptHasContent,
-} from "./attempt-execution.helpers.js";
+import { claudeCliSessionTranscriptHasContent } from "./attempt-execution.helpers.js";
 
 type MutableCliSessionStore = Pick<
   Parameters<typeof clearCliSessionInStore>[0],

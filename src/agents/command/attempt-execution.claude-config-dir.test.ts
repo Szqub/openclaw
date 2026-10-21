@@ -35,11 +35,16 @@ describe("Claude transcript root probes", () => {
       [defaultFile, [{ type: "text", text: "default-root decoy" }]],
     ] as const) {
       await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, `${JSON.stringify({ message: { role: "assistant", content } })}\n`);
+      await fs.writeFile(
+        file,
+        `${JSON.stringify({ type: "assistant", message: { role: "assistant", content } })}\n`,
+      );
     }
+    vi.stubEnv("HOME", tmpDir);
     vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
     try {
-      const target = { sessionId, workspaceDir, homeDir: tmpDir };
+      // The ambient Gateway root applies; an explicit homeDir would isolate the probe instead.
+      const target = { sessionId, workspaceDir };
       expect(await claudeCliSessionTranscriptHasContent(target)).toBe(true);
       expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(true);
       await fs.unlink(selectedFile);
@@ -68,7 +73,10 @@ describe("Claude transcript root probes", () => {
       [gatewayFile, [{ type: "tool_use", id: "unanswered", name: "Read", input: {} }]],
     ] as const) {
       await fs.mkdir(path.dirname(file), { recursive: true });
-      await fs.writeFile(file, `${JSON.stringify({ message: { role: "assistant", content } })}\n`);
+      await fs.writeFile(
+        file,
+        `${JSON.stringify({ type: "assistant", message: { role: "assistant", content } })}\n`,
+      );
     }
     vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tmpDir, "gateway Claude"));
     const target = { sessionId, workspaceDir, homeDir: tmpDir, projectsRoot: childRoot };

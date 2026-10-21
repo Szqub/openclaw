@@ -5,6 +5,7 @@ import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js"
 import { resolveClaudeCliProjectDirForWorkspace } from "./claude-cli-project-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+afterEach(() => vi.unstubAllEnvs());
 
 describe("resolveClaudeCliProjectDirForWorkspace", () => {
   let homeDir: string;
@@ -39,11 +40,16 @@ describe("resolveClaudeCliProjectDirForWorkspace", () => {
     ).toBe(path.join(expectedRoot, "projects", projectKey));
   });
 
-  it("uses an absolute config root and isolates an explicitly injected environment", () => {
+  it("uses the ambient config root and isolates an explicit home or injected environment", () => {
     const alternate = path.join(homeDir, "selected Claude");
+    vi.stubEnv("HOME", homeDir);
     vi.stubEnv("CLAUDE_CONFIG_DIR", alternate);
-    expect(resolveClaudeCliProjectDirForWorkspace({ workspaceDir, homeDir })).toBe(
+    expect(resolveClaudeCliProjectDirForWorkspace({ workspaceDir })).toBe(
       path.join(alternate, "projects", projectKey),
+    );
+    // An explicit home scopes offline reads away from the Gateway's selected root.
+    expect(resolveClaudeCliProjectDirForWorkspace({ workspaceDir, homeDir })).toBe(
+      path.join(homeDir, ".claude", "projects", projectKey),
     );
     expect(resolveClaudeCliProjectDirForWorkspace({ workspaceDir, homeDir, env: {} })).toBe(
       path.join(homeDir, ".claude", "projects", projectKey),

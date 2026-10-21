@@ -1,14 +1,18 @@
 import type { RouteLocation } from "@openclaw/uirouter";
-import { html } from "lit";
-import { shellLayoutTraits } from "../../app/shell-layout-traits.ts";
-import "./activity-page-view.tsx";
+import { insert } from "@solidjs/web";
+import { createComponent, createEffect } from "solid-js";
+import { useApplication } from "../../lib/reactive/context.ts";
+import { createActivityPageState } from "./activity-page-state.ts";
+import { ActivityPageView } from "./activity-page-view.tsx";
 
-// The Lit shell uses the same Solid-owned tag until the shell migration lands.
-export const activityPageComponent = {
-  header: true,
-  render: (location: RouteLocation | undefined) =>
-    html`<openclaw-activity-page
-      .routeLocation=${location}
-      ${shellLayoutTraits({ activityPage: true, toolbarHeader: true, settingsWorkspace: true })}
-    ></openclaw-activity-page>`,
-};
+export function ActivityPage(props: { routeLocation?: RouteLocation }) {
+  const host = document.createElement("openclaw-activity-page");
+  const page = createActivityPageState(useApplication());
+  // Route changes drive the Activity request owner without remounting the page.
+  createEffect(
+    () => props.routeLocation,
+    (location) => page.setRouteLocation(location),
+  );
+  insert(host, createComponent(ActivityPageView, { page }));
+  return host;
+}

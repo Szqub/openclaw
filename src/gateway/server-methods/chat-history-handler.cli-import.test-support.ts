@@ -3,17 +3,22 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect } from "vitest";
+import type { ChatHistoryParams } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import { captureRuntimeConfigAsyncReader } from "../../config/config.js";
 import {
   appendTranscriptMessage,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
-import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../test-utils/openclaw-test-state.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
+import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
 
 export type HistoryPage = {
   messages: unknown[];
-  completeSnapshot?: boolean;
   hasMore?: boolean;
   nextOffset?: number;
   offset?: number;
@@ -23,105 +28,155 @@ export type HistoryPage = {
   windowReset?: boolean;
 };
 
-export type HistoryRequest = {
-  cursor?: string;
-  limit?: number;
-  maxBytes?: number;
-  messageId?: string;
-  offset?: number;
-};
+export type HistoryRequest = Omit<ChatHistoryParams, "sessionKey">;
 
-export type HistoryReadOptions = {
-  acceptsSerializedJson?: boolean;
-};
+export function appendLocal(
+  scope: Parameters<typeof appendTranscriptMessage>[0],
+  role: string,
+  content: unknown,
+  timestamp?: number,
+  extra: Record<string, unknown> = {},
+  eventId?: string,
+) {
+  return appendTranscriptMessage(scope, {
+    message: { role, content, timestamp, ...extra },
+    eventId,
+  });
+}
 
-export async function historyReader(
+export async function seedCliHistory(
+  state: OpenClawTestState,
   sessionKey: string,
-  method: "chat.history" | "chat.startup" = "chat.history",
+  incognito = false,
+  entry: Parameters<typeof upsertSessionEntryCore>[1] = {},
+) {
+  await captureRuntimeConfigAsyncReader()();
+  const scope = { agentId: "main", sessionKey, sessionId: randomUUID() };
+  const cliSessionId = randomUUID();
+  const timestamp = Date.parse("2026-09-01T10:00:00Z");
+  await upsertSessionEntryCore(scope, {
+    sessionId: scope.sessionId,
+    updatedAt: incognito ? Date.now() : timestamp,
+    ...(incognito ? { incognito: true as const } : {}),
+    providerOverride: "claude-cli",
+    modelOverride: "claude-sonnet-4-6",
+    cliSessionBindings: { "claude-cli": { sessionId: cliSessionId } },
+    ...entry,
+  });
+  const projectDir = path.join(state.home, ".claude", "projects", "synthetic-history");
+  await fs.mkdir(projectDir, { recursive: true });
+  const sourcePath = path.join(projectDir, `${cliSessionId}.jsonl`);
+  return {
+    scope,
+    cliSessionId,
+    timestamp,
+    sourcePath,
+    append: appendLocal.bind(null, scope),
+    native: cliMessage.bind(null, cliSessionId),
+    write: (rows: unknown[]) => writeCliRows(sourcePath, rows),
+  };
+}
+
+export function cliMessage(
+  sessionId: string,
+  uuid: string,
+  role: string,
+  content: string,
+  timestamp: number,
+  parentUuid: string | null = null,
+) {
+  return {
+    type: role,
+    uuid,
+    parentUuid,
+    sessionId,
+    timestamp: new Date(timestamp).toISOString(),
+    message: { role, content },
+  };
+}
+
+export function writeCliRows(sourcePath: string, rows: unknown[]) {
+  return fs.writeFile(sourcePath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+}
+
+async function rpcReader(
+  sessionKey: string,
+  method: "chat.history" | "chat.startup" | "chat.message.get",
 ) {
   const context = await createHistoryReadContext();
-  const handler = expectDefined(chatHistoryHandlers[method], "history handler");
-  return async (params: HistoryRequest, options: HistoryReadOptions = {}): Promise<HistoryPage> => {
-    let result: HistoryPage | undefined;
+  const handler = expectDefined(
+    method === "chat.message.get" ? chatMessageGetHandlers[method] : chatHistoryHandlers[method],
+    "history handler",
+  );
+  return async (params: HistoryRequest) => {
+    let result: unknown;
     await handler({
       params: { sessionKey, ...params },
       context,
       req: { type: "req", id: randomUUID(), method },
       client: null,
-      ...(options.acceptsSerializedJson ? { acceptsSerializedJson: true } : {}),
       isWebchatConnect: () => false,
       respond: (ok, payload, error) => {
-        expect(error).toBeUndefined();
-        expect(ok).toBe(true);
-        result = payload as HistoryPage;
+        expect({ ok, error }).toEqual({ ok: true, error: undefined });
+        result = payload;
       },
     });
     return expectDefined(result, "history response");
   };
 }
 
+export async function historyReader(
+  sessionKey: string,
+  method: "chat.history" | "chat.startup" = "chat.history",
+) {
+  const read = await rpcReader(sessionKey, method);
+  return async (params: HistoryRequest) => (await read(params)) as HistoryPage;
+}
+
+export async function messageReader(sessionKey: string) {
+  const read = await rpcReader(sessionKey, "chat.message.get");
+  return (messageId: string) => read({ messageId });
+}
+
 export async function withImportedHistory(
-  method: "chat.history" | "chat.startup",
   importedCount: number,
   text: string,
-  run: (fixture: {
-    read: (params: HistoryRequest, options?: HistoryReadOptions) => Promise<HistoryPage>;
-    importedIds: string[];
-    sourcePath: string;
-    sessionsDir: string;
-    scope: { agentId: string; sessionId: string; sessionKey: string };
-  }) => Promise<void>,
+  run: (
+    fixture: {
+      read: (params: HistoryRequest) => Promise<HistoryPage>;
+      importedIds: string[];
+      sessionsDir: string;
+    } & Awaited<ReturnType<typeof seedCliHistory>>,
+  ) => Promise<void>,
   incognito = false,
+  method: "chat.history" | "chat.startup" = "chat.history",
 ) {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const scope = {
-      agentId: "main",
-      sessionKey: incognito
-        ? "agent:main:dashboard:incognito-cli-history"
-        : "agent:main:cli-history-anchor",
-      sessionId: randomUUID(),
-    };
-    const cliSessionId = randomUUID();
-    const timestamp = Date.parse("2026-09-01T10:00:00Z");
-    await upsertSessionEntryCore(scope, {
-      sessionId: scope.sessionId,
-      updatedAt: incognito ? Date.now() : timestamp,
-      ...(incognito ? { incognito: true as const } : {}),
-      providerOverride: "claude-cli",
-      modelOverride: "claude-sonnet-4-6",
-      cliSessionBindings: { "claude-cli": { sessionId: cliSessionId } },
-    });
-    await appendTranscriptMessage(scope, {
-      message: { role: "user", content: "Local question", timestamp },
-    });
-    await appendTranscriptMessage(scope, {
-      message: { role: "assistant", content: "Local answer", timestamp: timestamp + 1 },
-    });
+    const fixture = await seedCliHistory(
+      state,
+      incognito ? "agent:main:dashboard:incognito-cli-history" : "agent:main:cli-history-anchor",
+      incognito,
+    );
+    const { scope, timestamp, native, append, write } = fixture;
+    await append("user", "Local question", timestamp);
+    await append("assistant", "Local answer", timestamp + 1);
     const importedIds = Array.from({ length: importedCount }, () => randomUUID());
-    const projectDir = path.join(state.home, ".claude", "projects", "synthetic-history");
-    await fs.mkdir(projectDir, { recursive: true });
-    await fs.writeFile(
-      path.join(projectDir, `${cliSessionId}.jsonl`),
-      importedIds
-        .map((uuid, index) => {
-          const role = index % 2 === 0 ? "user" : "assistant";
-          return JSON.stringify({
-            type: role,
-            uuid,
-            parentUuid: importedIds[index - 1] ?? null,
-            sessionId: cliSessionId,
-            timestamp: new Date(timestamp + index + 2).toISOString(),
-            message: { role, content: `Imported ${index}: ${text}` },
-          });
-        })
-        .join("\n") + "\n",
+    await write(
+      importedIds.map((uuid, index) =>
+        native(
+          uuid,
+          index % 2 === 0 ? "user" : "assistant",
+          `Imported ${index}: ${text}`,
+          timestamp + index + 2,
+          importedIds[index - 1] ?? null,
+        ),
+      ),
     );
     await run({
+      ...fixture,
       read: await historyReader(scope.sessionKey, method),
       importedIds,
-      sourcePath: path.join(projectDir, `${cliSessionId}.jsonl`),
       sessionsDir: state.sessionsDir(),
-      scope,
     });
   });
 }

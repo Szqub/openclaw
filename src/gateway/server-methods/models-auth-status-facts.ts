@@ -6,7 +6,6 @@ import {
 } from "../../agents/auth-health.js";
 import { DEFAULT_OAUTH_REFRESH_MARGIN_MS } from "../../agents/auth-profiles/credential-state.js";
 import { isExternalCliAuthProfileInScope } from "../../agents/auth-profiles/external-cli-sync.js";
-import { getRuntimeExternalCliProfileIds } from "../../agents/auth-profiles/runtime-external-profile-references.js";
 import { getRuntimeAuthProfileStoreSnapshotsRevision } from "../../agents/auth-profiles/runtime-snapshots.js";
 import type { AuthProfileStore } from "../../agents/auth-profiles/types.js";
 import { isNonSecretApiKeyMarker } from "../../agents/model-auth-markers.js";
@@ -16,6 +15,7 @@ import { hasConfiguredSecretInput } from "../../config/types.secrets.js";
 import { resolveUsageProviderId } from "../../infra/provider-usage.shared.js";
 import type { UsageProviderId } from "../../infra/provider-usage.types.js";
 import { NON_ENV_SECRETREF_MARKER } from "../../secrets/provider-credential-values.js";
+import { getOrCreateWeakOwnerMap } from "../../shared/weak-owner-map.js";
 import type { PreparedGatewayModelCatalogSnapshot } from "../server-model-catalog-auth.js";
 import { resolveModelProviderCapabilities } from "./model-provider-capabilities.js";
 import { resolveProviderApiKeys } from "./models-auth-status-api-keys.js";
@@ -139,7 +139,6 @@ function buildModelAuthStatusFacts(
   ];
 
   const externalProfileIds = new Set(store.runtimeExternalProfileIds ?? []);
-  const externalCliProfileIds = new Set(getRuntimeExternalCliProfileIds(store));
   const logoutProfileIds = new Set(
     Object.entries(store.profiles)
       .filter(
@@ -187,7 +186,6 @@ function buildModelAuthStatusFacts(
     readAuthHealth: readsExternalAuth ? readAuthHealth : undefined,
     usageProviderIds,
     externalProfileIds,
-    externalCliProfileIds,
     logoutProfileIds,
     configBoundProfileIds,
     configBoundAuthProviders,
@@ -201,11 +199,7 @@ export function readModelAuthStatusFacts(
   refresh: boolean,
   now: number,
 ) {
-  let agents = authStatusFacts.get(snapshot.config);
-  if (!agents) {
-    agents = new Map();
-    authStatusFacts.set(snapshot.config, agents);
-  }
+  const agents = getOrCreateWeakOwnerMap(authStatusFacts, snapshot.config);
   const revision = getRuntimeAuthProfileStoreSnapshotsRevision();
   const cached = agents.get(snapshot.agentId);
   if (

@@ -8,7 +8,6 @@ export function registerEmbeddedHistoryProjectionTests(params: {
     (
       params?: unknown,
       signal?: AbortSignal,
-      incognito?: unknown,
       retainNativeHistoryAuthorization?: (isCurrent: () => boolean) => void,
     ) => Promise<ChatHistoryPage>
   >;
@@ -63,7 +62,6 @@ export function registerEmbeddedHistoryProjectionTests(params: {
         messageId: undefined,
       },
       undefined,
-      undefined,
       expect.any(Function),
     );
   });
@@ -73,7 +71,7 @@ export function registerEmbeddedHistoryProjectionTests(params: {
     async (current) => {
       const messages = [{ role: "assistant", content: "prepared history" }];
       const isCurrent = vi.fn(() => current);
-      params.readHistory.mockImplementationOnce(async (_params, _signal, _incognito, retain) => {
+      params.readHistory.mockImplementationOnce(async (_params, _signal, retain) => {
         retain?.(isCurrent);
         return { messages };
       });
@@ -119,7 +117,7 @@ export function registerEmbeddedHistoryProjectionTests(params: {
       expect(queries({})).toEqual([target]);
       active = true;
       try {
-        return { kind: "complete", value: consume({ describe, present }) };
+        return consume({ describe, present });
       } finally {
         active = false;
       }

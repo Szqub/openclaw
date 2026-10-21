@@ -183,17 +183,18 @@ async function handleChatHistory(params: Record<string, unknown>) {
   }
 
   const sessionLoadOptions = requestedAgentId ? { agentId: requestedAgentId } : undefined;
-  const { cfg, storePath, entry, canonicalKey } = rt.loadSessionEntry(
-    sessionKey,
-    sessionLoadOptions,
-  );
+  const { cfg, storePath, entry, canonicalKey } = await rt.loadGatewaySessionEntryReadOnlyInWorker({
+    cfg: rt.getRuntimeConfig(),
+    key: sessionKey,
+    ...sessionLoadOptions,
+  });
   const sessionAgentId = rt.resolveSessionAgentId({
     sessionKey,
     config: cfg,
     agentId: requestedAgentId,
   });
   if (requestedSessionId) {
-    const transcriptSessionKey = rt.resolveTranscriptSessionKeyBySessionId({
+    const transcriptSessionKey = await rt.resolveSessionKeyBySessionIdAsync({
       agentId: sessionAgentId,
       sessionId: requestedSessionId,
       storePath,
@@ -232,7 +233,7 @@ async function handleChatHistory(params: Record<string, unknown>) {
     ...(pageCursor ? { pageCursor } : {}),
   };
   let isNativeHistoryCurrent: (() => boolean) | undefined;
-  const page = await rt.readChatHistoryPage(pageParams, undefined, undefined, (isCurrent) => {
+  const page = await rt.readChatHistoryPage(pageParams, undefined, (isCurrent) => {
     isNativeHistoryCurrent = isCurrent;
   });
   const {

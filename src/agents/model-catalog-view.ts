@@ -10,6 +10,7 @@ import type { SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ProviderModelRouteSource } from "../plugin-sdk/provider-model-types.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
+import { groupPluginRecords as groupRecords } from "../plugins/record-groups.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import { getActivePluginRegistry } from "../plugins/runtime.js";
 import { dedupeByKey, indexFirstByKey } from "../shared/dedupe-by-key.js";
@@ -24,10 +25,6 @@ import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import type { ModelAuthAvailabilityEvaluation } from "./model-auth-availability.js";
 import { resolveSelectedModelCredential } from "./model-auth-selected-credential.js";
 import {
-  buildProviderConfigModelCatalogForBrowse,
-  type ModelCatalogBrowseView,
-} from "./model-catalog-browse.js";
-import {
   projectModelCatalogEntryForRoute,
   createConfiguredModelCatalogOverridesResolver,
   type ModelCatalogRoutePolicy,
@@ -37,6 +34,7 @@ import type { ModelCatalogEntry, ModelCatalogSnapshot } from "./model-catalog.ty
 import { hasAuthoredProviderRequestParams } from "./model-extra-params.js";
 import { splitTrailingAuthProfile } from "./model-ref-profile.js";
 import type { ModelRef } from "./model-ref-shared.js";
+import { buildConfiguredModelCatalog as buildInventoryCatalog } from "./model-selection-shared.js";
 import {
   createModelVisibilityPolicy,
   RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
@@ -44,20 +42,28 @@ import {
 import {
   createModelCatalogIdentityKeyResolver,
   openAIModelCatalogRoutePolicy,
-  resolveModelCatalogIdentityKey,
 } from "./openai-model-routes.js";
+
+type ModelCatalogBrowseView = "default" | "configured" | "provider-config" | "all";
 
 /** Keep capability donors bound to one model and runtime without merging sibling metadata. */
 export function selectModelCatalogRuntimeEntry(params: {
   entry: ModelCatalogEntry;
   routeVariants: readonly ModelCatalogEntry[];
   runtimeId: string;
+  /** Capacity belongs to its runtime; API capability donors cannot supply native limits. */
+  allowApiFallback?: boolean;
 }): { entry: ModelCatalogEntry; variants: ModelCatalogEntry[] } {
   const keyOf = createModelCatalogIdentityKeyResolver();
   const key = keyOf(params.entry);
   const observed = params.routeVariants.filter((variant) => keyOf(variant) === key);
   const variants = (observed.length ? observed : [params.entry])
-    .filter((variant) => !variant.nativeRuntime || variant.nativeRuntime === params.runtimeId)
+    .filter((variant) =>
+      variant.nativeRuntime
+        ? variant.nativeRuntime === params.runtimeId
+        : params.allowApiFallback !== false ||
+          ["openclaw", "auto", params.entry.provider].includes(params.runtimeId),
+    )
     .toSorted(
       (a, b) =>
         Number(b.nativeRuntime === params.runtimeId) - Number(a.nativeRuntime === params.runtimeId),
@@ -81,18 +87,10 @@ export function createModelCatalogView(params: {
   keyOf?: ReturnType<typeof createModelCatalogIdentityKeyResolver>;
 }) {
   const keyOf = params.keyOf ?? createModelCatalogIdentityKeyResolver();
-  const variantsByKey = new Map<string, ModelCatalogEntry[]>();
-  for (const entry of params.routeVariants ?? params.catalog) {
-    const key = keyOf(entry);
-    const variants = variantsByKey.get(key) ?? [];
-    variants.push(entry);
-    variantsByKey.set(key, variants);
-  }
-  // Deferred lookups can follow an await or owner reload; only the initial index shares policy.
-  const variantsOf = (
-    entry: Pick<ModelCatalogEntry, "provider" | "id">,
-    key = resolveModelCatalogIdentityKey(entry),
-  ) => variantsByKey.get(key);
+  const variantsByKey = groupRecords(params.routeVariants ?? params.catalog, keyOf);
+  // Identity lookups use the same captured policy as this view's physical index.
+  const variantsOf = (entry: Pick<ModelCatalogEntry, "provider" | "id">, key = keyOf(entry)) =>
+    variantsByKey.get(key);
   const routePolicy = params.routePolicy ?? openAIModelCatalogRoutePolicy;
   const resolveOverrides = createConfiguredModelCatalogOverridesResolver({
     cfg: params.cfg,
@@ -139,11 +137,14 @@ export function createModelCatalogView(params: {
       return row;
     },
     implicitNativeRuntime(entry: Pick<ModelCatalogEntry, "provider" | "id">) {
-      const variants = variantsOf(entry);
-      const runtime = variants?.[0]?.nativeRuntime;
-      return runtime && variants?.every((variant) => variant.nativeRuntime === runtime)
-        ? runtime
-        : undefined;
+      // An API metadata donor is not evidence of API credentials. Host bindings
+      // and credentials still take precedence in evaluateNative below.
+      const runtimes = new Set(
+        variantsOf(entry)?.flatMap((variant) =>
+          variant.nativeRuntime ? [variant.nativeRuntime] : [],
+        ),
+      );
+      return runtimes.size === 1 ? runtimes.values().next().value : undefined;
     },
     project(
       entry: ModelCatalogEntry,
@@ -287,7 +288,11 @@ export function prepareModelCatalogView(params: ModelCatalogViewFacts) {
           config: params.cfg,
           agentScope: { kind: "prepared", agentId: params.agentId },
         });
-        if (!policy.forcedByEnvironment && policy.runtimeSource === "implicit") {
+        if (
+          !policy.forcedByEnvironment &&
+          policy.runtimeSource === "implicit" &&
+          policy.runtime === "auto"
+        ) {
           policy = { ...policy, runtime: routes.implicitNativeRuntime(entry) ?? policy.runtime };
         }
         prepared = { policy };
@@ -339,15 +344,14 @@ export function prepareModelCatalogView(params: ModelCatalogViewFacts) {
       // Native account evidence cannot replace an authored host binding or live host credentials.
       if (
         prepared.hostConfigured ||
-        (host.selectedAuthMode && (host.evidence !== "runtime" || !observedNative))
+        (host.selectedAuthMode &&
+          (host.selectedCredential?.source !== "harness" || !observedNative))
       ) {
         return host;
       }
-      const resolveRegistry = () =>
-        params.observationConfig
-          ? params.pluginRegistry
-          : (params.pluginRegistry ?? getActivePluginRegistry());
-      const registry = resolveRegistry();
+      const registry = params.observationConfig
+        ? params.pluginRegistry
+        : (params.pluginRegistry ?? getActivePluginRegistry());
       const harness = registry?.agentHarnesses.find(
         (registration) => registration.harness.id === runtime,
       )?.harness;
@@ -373,9 +377,7 @@ export function prepareModelCatalogView(params: ModelCatalogViewFacts) {
               endpointOverrides: "none",
               requestTransportOverrides: "none",
             },
-          }).supported &&
-          isCurrent() &&
-          resolveRegistry() === registry;
+          }).supported;
         const observation = ready
           ? harness?.readModelCatalogReadiness?.({
               config: params.observationConfig ?? params.cfg,
@@ -386,11 +388,7 @@ export function prepareModelCatalogView(params: ModelCatalogViewFacts) {
               modelId: entry.id,
             })
           : undefined;
-        ready =
-          ready &&
-          (!harness?.readModelCatalogReadiness || observation !== undefined) &&
-          isCurrent() &&
-          resolveRegistry() === registry;
+        ready = ready && (!harness?.readModelCatalogReadiness || observation !== undefined);
         authMode = ready ? observation?.authMode : undefined;
       } catch {
         // A failed/disposed owner supplies no account observation; do not infer host readiness.
@@ -436,10 +434,17 @@ export function prepareModelCatalogView(params: ModelCatalogViewFacts) {
       );
       const canonicalByKey = indexFirstByKey(canonicalEntries, keyOf);
       // Authored config owns membership; captured catalog rows own route metadata.
-      const authored = buildProviderConfigModelCatalogForBrowse({
+      const authored = buildInventoryCatalog({
         cfg: sourceConfig,
         workspaceDir: params.workspaceDir,
-      }).map((entry) => canonicalByKey.get(keyOf(entry)) ?? entry);
+      })
+        .toSorted(
+          (a, b) =>
+            a.provider.localeCompare(b.provider) ||
+            a.name.localeCompare(b.name) ||
+            a.id.localeCompare(b.id),
+        )
+        .map((entry) => canonicalByKey.get(keyOf(entry)) ?? entry);
       return dedupeByKey(
         [
           ...authored,

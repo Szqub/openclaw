@@ -4,6 +4,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   iterateSqliteQuerySync,
 } from "../../infra/kysely-sync.js";
+import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-turn-transcript.types.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import type {
   TranscriptEvent,
@@ -15,7 +16,6 @@ import { readSessionActorTransactionState } from "./session-actor-transaction.js
 import { projectTranscriptNavigationSql } from "./session-model-context-projection.js";
 import { sessionTranscriptIndexNeedsReconcile } from "./session-transcript-index.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
-import { resolveSessionTranscriptQuestionAnswer } from "./session-transcript-read-fence.js";
 import {
   PREPARED_ASSISTANT_MAX_NEWER_MESSAGES,
   PREPARED_ASSISTANT_MAX_NEWER_BYTES,
@@ -38,6 +38,7 @@ export function canRebasePreparedAssistantInTransaction(
   sessionId: string,
   preparedParentId: string | null,
   admittedUserId?: string,
+  questionAnswers: readonly UserTurnTranscriptAdmissionReceipt[] = [],
 ): boolean {
   const tailId = readActiveTranscriptAppendParentId(database, sessionId);
   if (tailId !== preparedParentId) {
@@ -71,6 +72,16 @@ export function canRebasePreparedAssistantInTransaction(
   if (admittedUserId && !admitted) {
     return false;
   }
+  const actor = readSessionActorTransactionState(database, { sessionId });
+  const admittedIsNewer = admitted !== undefined && admitted.seq > (preparedParent?.seq ?? -1);
+  if (
+    actor?.transcript.complete &&
+    ![...actor.transcript.identities.values()].some(
+      (identity) => identity.event_type === "message" && identity.seq > (preparedParent?.seq ?? -1),
+    )
+  ) {
+    return !admittedIsNewer;
+  }
   const newerMessageMetadata = Array.from(
     iterateSqliteQuerySync(
       database.db,
@@ -101,7 +112,6 @@ export function canRebasePreparedAssistantInTransaction(
   ) {
     return false;
   }
-  const admittedIsNewer = admitted !== undefined && admitted.seq > (preparedParent?.seq ?? -1);
   if (admittedIsNewer && !newerMessageMetadata.some((row) => row.event_id === admittedUserId)) {
     return false;
   }
@@ -133,26 +143,26 @@ export function canRebasePreparedAssistantInTransaction(
           "active.message_position",
           "rewrite.generation",
           /* kysely-allow-raw: validate the canonical message role without hydrating content. */
-          sql<string>`json_extract(${transcriptEventNavigationSql("event")}, '$.message.role')`.as(
+          sql<string>`json_extract(${transcriptEventNavigationSql(database.db, "event")}, '$.message.role')`.as(
             "message_role",
           ),
           /* kysely-allow-raw: only exact canonical booleans exempt a command from model context. */
           sql<
             number | null
-          >`json_type(${transcriptEventNavigationSql("event")}, '$.message.excludeFromContext') = 'true'
-            AND json_type(${transcriptEventNavigationSql("event")}, '$.message.__openclaw.contextFreeCommand') = 'true'`.as(
+          >`json_type(${transcriptEventNavigationSql(database.db, "event")}, '$.message.excludeFromContext') = 'true'
+            AND json_type(${transcriptEventNavigationSql(database.db, "event")}, '$.message.__openclaw.contextFreeCommand') = 'true'`.as(
             "context_free_command",
           ),
           /* kysely-allow-raw: classify realtime voice records without hydrating content. */
           sql<
             string | null
-          >`json_extract(${transcriptEventNavigationSql("event")}, '$.message.provenance.kind')`.as(
+          >`json_extract(${transcriptEventNavigationSql(database.db, "event")}, '$.message.provenance.kind')`.as(
             "provenance_kind",
           ),
           /* kysely-allow-raw: pair the kind with its channel so a partial marker cannot match. */
           sql<
             string | null
-          >`json_extract(${transcriptEventNavigationSql("event")}, '$.message.provenance.sourceChannel')`.as(
+          >`json_extract(${transcriptEventNavigationSql(database.db, "event")}, '$.message.provenance.sourceChannel')`.as(
             "provenance_source_channel",
           ),
         ])
@@ -165,12 +175,7 @@ export function canRebasePreparedAssistantInTransaction(
     ),
   );
   return preparedAssistantMessagesPreserveTurn(newerRoles, admittedUserId, (row) => {
-    const answer = resolveSessionTranscriptQuestionAnswer(
-      database,
-      sessionId,
-      row.event_id,
-      admittedUserId,
-    );
+    const answer = questionAnswers.find((input) => input.entryId === row.event_id);
     return (
       answer !== undefined &&
       answer.rawSeq === row.seq &&
@@ -241,10 +246,14 @@ function transcriptEntryIsAncestor(
       if (current.parent_id === candidateId) {
         return true;
       }
-      current =
-        current.parent_id === null ? undefined : actor.transcript.identities.get(current.parent_id);
+      if (current.parent_id === null) {
+        return false;
+      }
+      current = actor.transcript.identities.get(current.parent_id);
     }
-    return false;
+    if (current || actor.transcript.complete) {
+      return false;
+    }
   }
   const db = getSessionKysely(database.db);
   // Bound ancestry work even for malformed cycles or very deep metadata chains.
@@ -290,7 +299,7 @@ export function readTranscriptVisibleTailEntryIdInTransaction(
   messageId: string,
 ): string | null {
   const actor = readSessionActorTransactionState(database, { sessionId });
-  if (actor) {
+  if (actor?.transcript.complete) {
     const tree = scanSessionTranscriptTree(actor.transcript.navigation);
     return selectSessionTranscriptTreePathNodes(tree, tree.leafId).at(-1)?.id ?? null;
   }
@@ -310,7 +319,10 @@ export function readTranscriptVisibleTailEntryIdInTransaction(
             .onRef("event.seq", "=", "active.event_seq"),
         )
         .select(
-          projectTranscriptNavigationSql(transcriptEventNavigationSql("event")).as("event_json"),
+          projectTranscriptNavigationSql(
+            database.db,
+            transcriptEventNavigationSql(database.db, "event"),
+          ).as("event_json"),
         )
         .where("active.session_id", "=", sessionId)
         .orderBy("active.active_position", "desc")
@@ -332,7 +344,11 @@ export function readTranscriptVisibleTailEntryIdInTransaction(
     database.db,
     db
       .selectFrom("transcript_events")
-      .select(projectTranscriptNavigationSql(transcriptEventNavigationSql()).as("event_json"))
+      .select(
+        projectTranscriptNavigationSql(database.db, transcriptEventNavigationSql(database.db)).as(
+          "event_json",
+        ),
+      )
       .where("session_id", "=", sessionId)
       .where("seq", ">=", message.seq)
       .orderBy("seq", "asc"),
@@ -363,28 +379,37 @@ function readActiveTranscriptAppendParentId(
   sessionId: string,
 ): string | null {
   const actor = readSessionActorTransactionState(database, { sessionId });
-  if (actor) {
+  if (actor?.transcript.complete) {
     return scanSessionTranscriptTree(actor.transcript.navigation).appendParentId;
   }
   const db = getSessionKysely(database.db);
-  const latest = executeSqliteQueryTakeFirstSync(
-    database.db,
-    db
-      .selectFrom("transcript_event_identities as ti")
-      .innerJoin("transcript_events as te", (join) =>
-        join.onRef("te.session_id", "=", "ti.session_id").onRef("te.seq", "=", "ti.seq"),
-      )
-      .select([
-        "ti.event_type",
-        projectTranscriptNavigationSql(transcriptEventNavigationSql("te")).as("event_json"),
-      ])
-      .where("ti.session_id", "=", sessionId)
-      .orderBy("ti.seq", "desc")
-      .limit(1),
-  );
+  const retainedIdentity = actor && [...actor.transcript.identities.values()].at(-1);
+  const retainedNavigation =
+    retainedIdentity &&
+    actor?.transcript.navigation.findLast((event) => event.seq === retainedIdentity.seq);
+  const latest = retainedNavigation
+    ? undefined
+    : executeSqliteQueryTakeFirstSync(
+        database.db,
+        db
+          .selectFrom("transcript_event_identities as ti")
+          .innerJoin("transcript_events as te", (join) =>
+            join.onRef("te.session_id", "=", "ti.session_id").onRef("te.seq", "=", "ti.seq"),
+          )
+          .select([
+            "ti.event_type",
+            projectTranscriptNavigationSql(
+              database.db,
+              transcriptEventNavigationSql(database.db, "te"),
+            ).as("event_json"),
+          ])
+          .where("ti.session_id", "=", sessionId)
+          .orderBy("ti.seq", "desc")
+          .limit(1),
+      );
   const resolveFromNavigation = () =>
     scanSessionTranscriptTree(readTranscriptNavigationEvents(database, sessionId)).appendParentId;
-  if (!latest) {
+  if (!retainedNavigation && !latest) {
     // Exact imports captured the append cursor while rebuilding their projection,
     // even though they did not transfer identity or idempotency ownership.
     const current = executeSqliteQueryTakeFirstSync(
@@ -424,13 +449,18 @@ function readActiveTranscriptAppendParentId(
     return current ? current.leaf_event_id : resolveFromNavigation();
   }
   try {
-    const event = JSON.parse(latest.event_json) as unknown;
+    const event =
+      retainedNavigation ?? (latest ? (JSON.parse(latest.event_json) as unknown) : undefined);
     const treeEntry = parseSessionTranscriptTreeEntry(event);
     if (!treeEntry) {
       return resolveFromNavigation();
     }
-    if (latest.event_type !== "leaf") {
+    if ((retainedNavigation ? retainedIdentity?.event_type : latest?.event_type) !== "leaf") {
       return treeEntry.appendParentId;
+    }
+    if (actor) {
+      // A retained leaf can target older history that a reset normalized away.
+      return resolveFromNavigation();
     }
     const leafReferencesKnown =
       treeEntry.leafId !== undefined &&
@@ -450,7 +480,7 @@ function readTranscriptNavigationEvents(
   sessionId: string,
 ): unknown[] {
   const actor = readSessionActorTransactionState(database, { sessionId });
-  if (actor) {
+  if (actor?.transcript.complete) {
     return structuredClone(actor.transcript.navigation);
   }
   const db = getSessionKysely(database.db);
@@ -459,7 +489,11 @@ function readTranscriptNavigationEvents(
       database.db,
       db
         .selectFrom("transcript_events")
-        .select(projectTranscriptNavigationSql(transcriptEventNavigationSql()).as("event_json"))
+        .select(
+          projectTranscriptNavigationSql(database.db, transcriptEventNavigationSql(database.db)).as(
+            "event_json",
+          ),
+        )
         .where("session_id", "=", sessionId)
         .orderBy("seq", "asc"),
     ),
@@ -475,7 +509,9 @@ function readTranscriptIdentityInTransaction(
   const actor = readSessionActorTransactionState(database, { sessionId });
   if (actor) {
     const row = actor.transcript.identities.get(eventId);
-    return row ? { eventId: row.event_id, parentId: row.parent_id, seq: row.seq } : undefined;
+    if (row || actor.transcript.complete) {
+      return row ? { eventId: row.event_id, parentId: row.parent_id, seq: row.seq } : undefined;
+    }
   }
   const db = getSessionKysely(database.db);
   const row = executeSqliteQueryTakeFirstSync(

@@ -3,7 +3,6 @@ import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { getCliSessionBinding } from "../../config/sessions/cli-session-binding.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
 import { resolveSkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
 import type { SkillSnapshot } from "../../skills/types.js";
 import { resolveAgentRunCwd, resolveAgentWorkspaceDir } from "../agent-scope-config.js";
@@ -12,11 +11,7 @@ import {
   resolveClaudeCliProjectsRoot,
   resolveClaudeCliProjectsRootAsync,
 } from "../command/claude-cli-project-dir.js";
-import {
-  CLAUDE_SELECTED_AUTH_ENV_KEYS,
-  CLI_BACKEND_PRESERVE_ENV,
-  parseCliBackendPreserveEnv,
-} from "./execute-logging.js";
+import { resolveCliChildEnv } from "./execution-env.js";
 import { isClaudeCliBackendId } from "./helpers.js";
 
 export type CliChildEnv = {
@@ -29,8 +24,7 @@ export type CliChildEnv = {
 
 type CliChildEnvParams = {
   provider: string;
-  backend: { env?: Record<string, string>; clearEnv?: readonly string[] };
-  preparedBackend: { env?: Record<string, string>; secretInput?: unknown };
+  preparedBackend: Parameters<typeof resolveCliChildEnv>[0];
   /** Late execution-only overlays; preparation composes the same child env without them. */
   overlays?: readonly (Record<string, string> | undefined)[];
   /** Pure skill snapshot overlay used before execution applies its scoped process env. */
@@ -40,44 +34,11 @@ type CliChildEnvParams = {
 };
 
 function composeCliChildEnv(
-  params: Pick<CliChildEnvParams, "backend" | "preparedBackend" | "overlays" | "skillEnv">,
+  params: Pick<CliChildEnvParams, "preparedBackend" | "overlays" | "skillEnv">,
 ): CliChildEnv {
-  const preparedBackendEnv = params.preparedBackend.env ?? {};
-  const hasSelectedClaudeAuth =
-    Boolean(params.preparedBackend.secretInput) ||
-    [...CLAUDE_SELECTED_AUTH_ENV_KEYS].some((key) => Object.hasOwn(preparedBackendEnv, key));
-  const selectedClaudeClearEnv = hasSelectedClaudeAuth
-    ? new Set(params.backend.clearEnv ?? [])
-    : undefined;
-  const backendEnv = {
-    ...Object.fromEntries(
-      Object.entries(params.backend.env ?? {}).filter(([key]) => !selectedClaudeClearEnv?.has(key)),
-    ),
-    ...preparedBackendEnv,
-  };
-  const env = sanitizeHostExecEnv({ baseEnv: process.env, blockPathOverrides: true });
-  if (params.skillEnv) {
-    Object.assign(
-      env,
-      sanitizeHostExecEnv({
-        baseEnv: {},
-        overrides: params.skillEnv,
-        blockPathOverrides: true,
-      }),
-    );
-  }
-  const preservedEnv = parseCliBackendPreserveEnv(process.env[CLI_BACKEND_PRESERVE_ENV]);
-  for (const key of params.backend.clearEnv ?? []) {
-    if (!preservedEnv.has(key) || selectedClaudeClearEnv?.has(key)) {
-      delete env[key];
-    }
-  }
-  if (Object.keys(backendEnv).length > 0) {
-    Object.assign(
-      env,
-      sanitizeHostExecEnv({ baseEnv: {}, overrides: backendEnv, blockPathOverrides: true }),
-    );
-  }
+  const { env, selectedClaudeClearEnv } = resolveCliChildEnv(params.preparedBackend, {
+    skillEnv: params.skillEnv,
+  });
   Object.assign(env, ...(params.overlays ?? []));
   // Never mark Claude CLI as host-managed. That marker routes runs into
   // Anthropic's separate host-managed usage tier instead of normal CLI use.
@@ -116,10 +77,9 @@ export function resolveAuthorizedClaudeCliBinding(params: {
   const config = params.config ?? getRuntimeConfigSnapshot() ?? undefined;
   const backend = resolveCliBackendConfig("claude-cli", config, { agentId: params.agentId });
   const child = composeCliChildEnv({
-    backend: backend?.config ?? {},
     // History must not rerun effectful per-turn preparation or treat a past
     // prepared override as present authority. Unselected roots fail closed.
-    preparedBackend: {},
+    preparedBackend: { backend: backend?.config ?? {} },
     skillEnv: resolveSkillEnvOverridesFromSnapshot({
       snapshot: params.skillsSnapshot ?? params.entry?.skillsSnapshot,
       config,

@@ -11,16 +11,22 @@ import {
 } from "../../sessions/transcript-events.js";
 import { extractAssistantPhaseText } from "../../shared/chat-message-content.js";
 import type { OpenClawStateWorkerErrorPayload } from "../../state/openclaw-state-worker-error.js";
-import { runWithCliHistoryWriter, type CliHistoryWriterFacts } from "./cli-history-boundary.js";
+import {
+  getCliHistoryWriter,
+  runWithCliHistoryWriter,
+  type CliHistoryWriterFacts,
+} from "./cli-history-boundary.js";
 import {
   applySessionGoalOperation,
   prepareSessionTurnGoalMessage,
 } from "./goals-operation-policy.js";
+import { resolveSqliteSessionKey } from "./session-accessor.sqlite-scope-helpers.js";
 import type { TranscriptMessageAppendResult } from "./session-accessor.types.js";
 import type { SessionActorAppend, SessionActorAppendCommitted } from "./session-actor-contract.js";
 import { createSessionActorMemoryEvents } from "./session-actor-memory-events.js";
 import { createSessionActorMemoryGoals } from "./session-actor-memory-goals.js";
 import { readSessionActorMemoryHistory } from "./session-actor-memory-history.js";
+import { initializeSessionActorMemoryEntry } from "./session-actor-memory-initialize.js";
 import { createSessionActorMemoryMessages } from "./session-actor-memory-messages.js";
 import { createSessionActorMemoryPending } from "./session-actor-memory-pending.js";
 import type { SessionActorMemoryState } from "./session-actor-memory-state.js";
@@ -71,7 +77,7 @@ export function createSessionActorMemoryTranscript(options: {
   const goals = createSessionActorMemoryGoals(options);
   const events = createSessionActorMemoryEvents(options);
   const { version, tree, rebasePrepared, appendRaw } = events;
-  const { findByKey, appendMessage } = createSessionActorMemoryMessages(options, events);
+  const { appendMessage } = createSessionActorMemoryMessages(options, events);
   const requireEntry = () => {
     if (!state.hot.entry) {
       throw new SessionTranscriptWriterClaimReboundError();
@@ -81,7 +87,8 @@ export function createSessionActorMemoryTranscript(options: {
   const bindScope = (scope: MetadataInput["scope"]) => {
     if (
       (scope.agentId !== undefined && scope.agentId !== agentId) ||
-      (scope.sessionKey !== undefined && scope.sessionKey !== state.hot.target.sessionKey) ||
+      (scope.sessionKey !== undefined &&
+        resolveSqliteSessionKey(scope.sessionKey, agentId) !== state.hot.target.sessionKey) ||
       (scope.storePath !== undefined && scope.storePath !== path) ||
       !sessionMatchesExpectedTranscriptTurn(
         state.hot.entry ? { entry: state.hot.entry } : undefined,
@@ -95,23 +102,30 @@ export function createSessionActorMemoryTranscript(options: {
     writer: CliHistoryWriterFacts | undefined,
     sessionId: string,
     run: () => T,
-  ): T =>
-    runWithCliHistoryWriter(
+  ): T => {
+    const target = {
+      agentId,
+      storePath: path,
+      sessionKey: state.hot.target.sessionKey,
+      sessionId,
+    };
+    // This actor runs on the host. A writer that needs the owner check takes it from the
+    // caller's live writer when that is in scope; without it, coverage does not advance.
+    const live = writer?.confirmOwner ? getCliHistoryWriter(target) : undefined;
+    const confirmsOwner = live?.runId === writer?.runId ? live?.confirmsOwner : undefined;
+    return runWithCliHistoryWriter(
       writer
         ? {
             ...writer,
-            target: {
-              agentId,
-              storePath: path,
-              sessionKey: state.hot.target.sessionKey,
-              sessionId,
-            },
+            ...(confirmsOwner ? { confirmsOwner } : {}),
+            target,
             assertCurrent: () => admit("transaction"),
             assertReadable: () => admit("transaction"),
           }
         : undefined,
       run,
     );
+  };
   const metadata = (
     input: MetadataInput,
   ): SessionMetadataOperations["session.metadata.append"]["output"] => {
@@ -123,6 +137,7 @@ export function createSessionActorMemoryTranscript(options: {
       | ReturnType<typeof appendRaw>
       | undefined;
     let receipt: SessionPendingInputWorkerReceipt | undefined;
+    let initialModelParentId: string | null | undefined;
     if (event.type === "message" && input.message) {
       if (input.message.validateTurn && !rebasePrepared(input, event.parentId)) {
         throw new SqliteTranscriptMutationConflictError(input.scope.sessionId);
@@ -147,11 +162,21 @@ export function createSessionActorMemoryTranscript(options: {
       result = readableResult(appended.result, appended.receipt);
       receipt = appended.receipt;
     } else {
+      if (input.initialModel) {
+        const initialModel = appendRaw(input.initialModel, input.options);
+        if (!initialModel.appended) {
+          throw new Error("Initial model metadata was not persisted");
+        }
+        initialModelParentId = initialModel.effectiveParentId;
+      }
       result = appendRaw(
         event,
-        input.options,
+        input.initialModel ? { ...input.options, expectedMutationAt: undefined } : input.options,
         typeof input.event === "string" ? input.event : undefined,
       );
+      if (input.initialModel && !result.appended) {
+        throw new Error("Initial thinking metadata was not persisted");
+      }
     }
     const value: SessionMetadataOperations["session.metadata.append"]["output"] = {
       snapshot: {
@@ -163,6 +188,7 @@ export function createSessionActorMemoryTranscript(options: {
           lifecycleRevision: requireEntry().lifecycleRevision,
         },
       },
+      initialModelParentId,
       projectionNeedsReconcile: false,
       pendingInputReceipt: receipt,
     };
@@ -199,53 +225,12 @@ export function createSessionActorMemoryTranscript(options: {
       return withCliWriter(append.input.cliWriter, append.input.scope.sessionId, () => {
         let initialEntry: InitialSessionEntryCommit | undefined;
         if (append.initialization) {
-          const input = append.initialization;
-          if (
-            input.scope.sessionId !== append.input.scope.sessionId ||
-            input.entry.sessionId !== input.scope.sessionId ||
-            (input.scope.agentId !== undefined && input.scope.agentId !== agentId) ||
-            (input.scope.sessionKey !== undefined &&
-              input.scope.sessionKey !== state.hot.target.sessionKey) ||
-            (input.scope.storePath !== undefined && input.scope.storePath !== path)
-          ) {
+          if (append.initialization.scope.sessionId !== append.input.scope.sessionId) {
             throw new SessionTranscriptWriterClaimReboundError();
           }
-          if (state.hot.entry) {
-            if (
-              input.initialWriterRunId !== undefined ||
-              state.hot.entry.sessionId !== input.entry.sessionId
-            ) {
-              throw new SessionTranscriptWriterClaimReboundError();
-            }
-            initialEntry = { owned: true };
-          } else {
-            if (
-              input.scope.expectedWriterRunId !== undefined &&
-              input.initialWriterRunId === undefined
-            ) {
-              throw new SessionTranscriptWriterClaimReboundError();
-            }
-            state.hot.entry = {
-              ...structuredClone(input.entry),
-              ...(input.initialWriterRunId !== undefined
-                ? { activeWriterRunId: input.initialWriterRunId }
-                : {}),
-            };
-            initialEntry = {
-              owned: true,
-              ...(input.initialWriterRunId !== undefined
-                ? {
-                    fence: {
-                      expectedLifecycleRevision: state.hot.entry.lifecycleRevision,
-                      expectedWriterRunId: input.initialWriterRunId,
-                    },
-                  }
-                : {}),
-              identity: {
-                previous: new Map(),
-                current: new Map([[state.hot.target.sessionKey, structuredClone(state.hot.entry)]]),
-              },
-            };
+          initialEntry = initializeSessionActorMemoryEntry(options, append.initialization);
+          if (!initialEntry.owned) {
+            throw new SessionTranscriptWriterClaimReboundError();
           }
         }
         const header = append.header
@@ -402,16 +387,6 @@ export function createSessionActorMemoryTranscript(options: {
           goal.id = opts.preparedGoalId;
         }
         const transactionVersion = version();
-        for (const append of opts.messages) {
-          if (!append.preparedMessage?.prepared) {
-            continue;
-          }
-          const event = findByKey(append);
-          const current = event ? { messageId: event.id, message: event.message } : undefined;
-          if (!isDeepStrictEqual(current, append.preparedMessage.expected)) {
-            throw new Error("Transcript idempotency changed while preparing the turn");
-          }
-        }
         let custody: SessionPendingInputWorkerReceipt | undefined;
         const appendedMessages: TranscriptMessageAppendResult<unknown>[] = [];
         let predicateSkipped = false;

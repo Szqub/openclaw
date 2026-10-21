@@ -35,7 +35,9 @@ function canonicalizeWorkspaceDir(workspaceDir: string): string {
 }
 
 type ClaudeCliProjectsRootParams = {
+  /** Explicit home for offline reads; without a child environment it isolates the lookup. */
   homeDir?: string;
+  /** The Claude child's effective environment. Omitted: the Gateway's own environment. */
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   /** Root already selected from the Claude child's effective environment and cwd. */
@@ -52,8 +54,14 @@ function retainedProjectsRoot(params: ClaudeCliProjectsRootParams): string | und
 }
 
 function resolveClaudeCliProjectsDir(params: ClaudeCliProjectsRootParams): string {
+  const explicitHomeDir = normalizeOptionalString(params.homeDir);
+  // An explicit home without a child environment scopes offline reads to that home;
+  // ordinary lookups share the config root the Claude child selects.
+  if (!params.env && explicitHomeDir) {
+    return path.join(explicitHomeDir.normalize("NFC"), ".claude", "projects");
+  }
   const env = params.env ?? process.env;
-  const homeDir = normalizeOptionalString(params.homeDir) || env.HOME || os.homedir();
+  const homeDir = explicitHomeDir || env.HOME || os.homedir();
   // Native Claude uses nullish selection and NFC; empty values and spaces are paths.
   const configDir = (env.CLAUDE_CONFIG_DIR ?? path.join(homeDir, ".claude")).normalize("NFC");
   return path.join(configDir, "projects");

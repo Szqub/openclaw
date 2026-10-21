@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as cliBackends from "../agents/cli-backends.js";
+import { captureRuntimeConfigAsyncReader } from "../config/config.js";
 import {
   clearRuntimeConfigSnapshot,
   getRuntimeConfigSnapshot,
@@ -53,6 +54,7 @@ async function createFixture(
     sessionKey?: string;
   } = {},
 ): Promise<Fixture> {
+  await captureRuntimeConfigAsyncReader()();
   const cwd = options.cwd ?? state.workspaceDir;
   await fs.mkdir(cwd, { recursive: true });
   vi.stubEnv("HOME", state.home);
@@ -119,7 +121,7 @@ async function readFixture(
   options?: {
     cwd?: string;
     omitCwd?: true;
-    retainAuthorization?: Parameters<typeof readChatHistoryPage>[3];
+    retainAuthorization?: Parameters<typeof readChatHistoryPage>[2];
   },
 ) {
   const requestedCwd = options?.omitCwd ? undefined : (options?.cwd ?? fixture.cwd);
@@ -138,7 +140,6 @@ async function readFixture(
       messageId: undefined,
       ...(requestedCwd ? { cwd: requestedCwd } : {}),
     },
-    undefined,
     undefined,
     options?.retainAuthorization,
   );

@@ -1,4 +1,3 @@
-// Claude CLI session history importer.
 // Converts Claude project JSONL into OpenClaw transcript-compatible messages.
 import fs from "node:fs";
 import path from "node:path";
@@ -14,12 +13,9 @@ import {
 } from "../agents/cli-image-turn-correlation.js";
 import { hashCliReseedPrompt, parseCliReseedPrompt } from "../agents/cli-runner/reseed-envelope.js";
 import { stripCliSessionDriftNote } from "../agents/cli-session.js";
-import {
-  resolveClaudeCliProjectsRoot,
-  resolveClaudeCliProjectsRootAsync,
-} from "../agents/command/claude-cli-project-dir.js";
+import { resolveClaudeCliProjectsRootAsync } from "../agents/command/claude-cli-project-dir.js";
 import type { AgentMessage } from "../agents/runtime/index.js";
-import { redactTranscriptMessage } from "../agents/transcript-redact.js";
+import { sanitizeTranscriptMessage } from "../agents/transcript-sanitize.js";
 import { HEARTBEAT_PROMPT, HEARTBEAT_RESPONSE_TOOL_PROMPT } from "../auto-reply/heartbeat.js";
 import { isToolCallBlock, isToolResultBlock, resolveToolUseId } from "../chat/tool-content.js";
 import type { CliSessionReseedReceipt, SessionEntry } from "../config/sessions.js";
@@ -83,7 +79,7 @@ export function decodeClaudeCliProjectEntry(line: string): ClaudeCliProjectEntry
 export function redactClaudeCliHistoryMessage(
   message: TranscriptLikeMessage,
 ): TranscriptLikeMessage {
-  return redactTranscriptMessage(
+  return sanitizeTranscriptMessage(
     message as unknown as AgentMessage,
   ) as unknown as TranscriptLikeMessage;
 }
@@ -321,11 +317,6 @@ const INTERNAL_PROMPT_PREFIX = new RegExp(
   "u",
 );
 
-/** Removes the resume note and queued system events OpenClaw put in front of a user turn. */
-function stripClaudeCliGeneratedUserPrefixes(text: string): string {
-  return stripCliPromptDecorations(text);
-}
-
 /**
  * Display copy of an imported user row that survived the history merge. The merge
  * matches on the original text first, so this must not run before it.
@@ -343,7 +334,7 @@ export function cleanClaudeCliImportedUserDisplay(message: unknown): unknown {
   }
   const { content } = message;
   if (typeof content === "string") {
-    return { ...message, content: stripClaudeCliGeneratedUserPrefixes(content) };
+    return { ...message, content: stripCliPromptDecorations(content) };
   }
   if (!Array.isArray(content) || content.some((block) => isToolResultBlock(block))) {
     return message;
@@ -357,7 +348,7 @@ export function cleanClaudeCliImportedUserDisplay(message: unknown): unknown {
     ...message,
     content: content.map((block, index) =>
       index === firstTextIndex && isRecord(block) && typeof block.text === "string"
-        ? Object.assign({}, block, { text: stripClaudeCliGeneratedUserPrefixes(block.text) })
+        ? Object.assign({}, block, { text: stripCliPromptDecorations(block.text) })
         : block,
     ),
   };
@@ -552,35 +543,6 @@ export function parseClaudeCliHistoryEntry(
   ) as TranscriptLikeMessage;
 }
 
-function resolveClaudeCliSessionFilePath(params: ClaudeCliHistoryLookupParams): string | undefined {
-  const sessionId = normalizeClaudeCliSessionId(params.cliSessionId);
-  if (!sessionId) {
-    return undefined;
-  }
-  const projectsDir = resolveClaudeCliProjectsRoot(params);
-  if (!projectsDir) {
-    return undefined;
-  }
-  let projectEntries: fs.Dirent[];
-  try {
-    projectEntries = fs.readdirSync(projectsDir, { withFileTypes: true });
-  } catch {
-    return undefined;
-  }
-
-  for (const entry of projectEntries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const projectDir = path.join(projectsDir, entry.name);
-    const candidate = resolveClaudeSessionCandidate(projectDir, sessionId);
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
-}
-
 export async function resolveClaudeCliSessionFilePathAsync(
   params: ClaudeCliHistoryLookupParams,
 ): Promise<string | undefined> {
@@ -636,17 +598,17 @@ export type ClaudeCliFallbackSeed = {
   recentTurns: TranscriptLikeMessage[];
 };
 
-export function readClaudeCliFallbackSeed(
+export async function readClaudeCliFallbackSeed(
   params: ClaudeCliHistoryLookupParams,
-): ClaudeCliFallbackSeed | undefined {
-  const filePath = resolveClaudeCliSessionFilePath(params);
+): Promise<ClaudeCliFallbackSeed | undefined> {
+  const filePath = await resolveClaudeCliSessionFilePathAsync(params);
   if (!filePath) {
     return undefined;
   }
 
   let content: string;
   try {
-    content = fs.readFileSync(filePath, "utf-8");
+    content = await fs.promises.readFile(filePath, "utf-8");
   } catch {
     return undefined;
   }

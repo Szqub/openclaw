@@ -4,39 +4,18 @@ import type {
   WorkerDesktopAppId,
 } from "@openclaw/gateway-protocol";
 import type { JSX } from "@solidjs/web";
-import { For, Show, untrack } from "solid-js";
+import { For, Show, onSettled } from "solid-js";
 import { registerDesktopEnglish } from "../../i18n/locales/en-desktop.ts";
 import { t, registerEnglishCatalog } from "../../lib/reactive/i18n.ts";
 import { Icon } from "../solid/icon.tsx";
+import { PanelIconButton } from "../solid/panel-icon-button.tsx";
 import { PanelLoadingSkeleton } from "../solid/panel-loading-skeleton.tsx";
 import type { DesktopSizingMode } from "./desktop-client.ts";
 import type { DesktopPanelState } from "./desktop-panel-state.ts";
 import { desktopSourceForEnvironment } from "./desktop-source.ts";
+import { hostDesktopSetupCopy, type DesktopHostSetup } from "./host-desktop-setup.ts";
 
 registerEnglishCatalog(registerDesktopEnglish);
-
-export function DesktopLoading(props: { label: string; overlay?: boolean }) {
-  return <PanelLoadingSkeleton variant="desktop" label={props.label} overlay={props.overlay} />;
-}
-
-function PanelIconButton(props: {
-  class: JSX.IntrinsicElements["button"]["class"];
-  label: string;
-  icon: Parameters<typeof Icon>[0]["name"];
-  onClick: () => void;
-}) {
-  return (
-    <button
-      class={props.class}
-      type="button"
-      title={props.label}
-      aria-label={props.label}
-      onClick={() => props.onClick()}
-    >
-      <Icon name={props.icon} />
-    </button>
-  );
-}
 
 export function DesktopPanelView(props: {
   embedded: boolean;
@@ -45,6 +24,7 @@ export function DesktopPanelView(props: {
   height: number;
   width: number;
   fullscreen: boolean;
+  sectionRef: (element: HTMLElement) => void;
   renderResizer: () => JSX.Element;
   renderFullscreenControl: () => JSX.Element;
   onClose: () => void;
@@ -55,6 +35,7 @@ export function DesktopPanelView(props: {
 }) {
   return (
     <section
+      ref={(element) => props.sectionRef(element)}
       class={["bp", `bp--${props.embedded ? "embedded" : props.dock}`]}
       style={
         props.embedded || props.fullscreen
@@ -73,26 +54,26 @@ export function DesktopPanelView(props: {
             <PanelIconButton
               class={["rail-header__action bp-icon", { "is-active": props.dock === "bottom" }]}
               label={t("desktop.dockBottom")}
-              icon="panelBottomOpen"
+              icon={<Icon name="panelBottomOpen" />}
               onClick={() => props.onDock("bottom")}
             />
             <PanelIconButton
               class={["rail-header__action bp-icon", { "is-active": props.dock === "right" }]}
               label={t("desktop.dockRight")}
-              icon="panelRightOpen"
+              icon={<Icon name="panelRightOpen" />}
               onClick={() => props.onDock("right")}
             />
             <PanelIconButton
               class="rail-header__action bp-icon bp-open-window"
               label={t("desktop.openWindow")}
-              icon="externalLink"
+              icon={<Icon name="externalLink" />}
               onClick={props.onOpenWindow}
             />
             {props.renderFullscreenControl()}
             <PanelIconButton
               class="rail-header__action bp-icon"
               label={t("desktop.hide")}
-              icon="x"
+              icon={<Icon name="x" />}
               onClick={props.onClose}
             />
           </div>
@@ -110,7 +91,7 @@ export function DesktopPanelView(props: {
                   <PanelIconButton
                     class="desktop-toolbar-action"
                     label={t("desktop.openWindow")}
-                    icon="externalLink"
+                    icon={<Icon name="externalLink" />}
                     onClick={props.onOpenWindow}
                   />
                   {props.renderFullscreenControl()}
@@ -132,23 +113,86 @@ export function DesktopPanelContent(props: {
   recovery: () => JSX.Element;
   connection: () => JSX.Element;
 }) {
-  const notice = untrack(() => props.notice());
+  const Notice = () => props.notice();
   return (
     <div class="desktop-content">
-      {notice}
-      <Show when={props.state === "picker"}>
-        {(shown) => untrack(() => shown() && props.picker())}
-      </Show>
+      <Notice />
+      <Show when={props.state === "picker"}>{(shown) => shown() && props.picker()}</Show>
       <Show when={props.state === "inventory-error" || props.state === "disconnected"}>
-        {(shown) => untrack(() => shown() && props.recovery())}
+        {(shown) => shown() && props.recovery()}
       </Show>
-      <Show when={props.state === "credentials"}>
-        {(shown) => untrack(() => shown() && props.credentials())}
-      </Show>
+      <Show when={props.state === "credentials"}>{(shown) => shown() && props.credentials()}</Show>
       {/* Connection transitions update siblings without remounting noVNC's island. */}
       <Show when={props.state === "connecting" || props.state === "connected"}>
-        {(shown) => untrack(() => shown() && props.connection())}
+        {(shown) => shown() && props.connection()}
       </Show>
+    </div>
+  );
+}
+
+// Systems hints sit under the selected machine's row; the panel names the Gateway host instead.
+const HOST_SETUP_HINTS: Record<string, string> = {
+  "systems.desktopSetupEnableHint": "desktop.hostDesktopEnableHint",
+  "systems.screenSharingSetupHint": "desktop.hostScreenSharingSetupHint",
+  "systems.desktopServerSetupHint": "desktop.hostDesktopServerSetupHint",
+};
+
+function DesktopHostSetupNotice(props: { setup: DesktopHostSetup; loading: boolean }) {
+  const state = () => props.setup.environment.desktopSetup?.state;
+  const ready = () => state() === "ready" || state() === "managed";
+  const mac = () => props.setup.environment.platform === "darwin";
+  const copy = () => hostDesktopSetupCopy(state(), mac(), false);
+  return (
+    <div class="desktop-status" role="status">
+      <div>{t("desktop.hostDesktopOff")}</div>
+      <h2>{t(copy().title)}</h2>
+      <div>{t(HOST_SETUP_HINTS[copy().hint] ?? copy().hint)}</div>
+      {state() === "needs-server" || state() === "ready" ? (
+        <div>{t(mac() ? "desktop.screenSharingNetwork" : "desktop.desktopServerNetwork")}</div>
+      ) : null}
+      {state() === "ready" ? (
+        <div>
+          {t(mac() ? "desktop.hostScreenSharingAccount" : "desktop.hostDesktopServerAccount")}
+        </div>
+      ) : null}
+      {state() === "unsupported" && props.setup.environment.desktopSetup?.detail ? (
+        <div>{props.setup.environment.desktopSetup.detail}</div>
+      ) : null}
+      {props.setup.error ? (
+        <div class="desktop-note--error" role="alert">
+          {props.setup.error}
+        </div>
+      ) : null}
+      {ready() ? (
+        <>
+          <button
+            class="desktop-button desktop-button--primary"
+            type="button"
+            disabled={!props.setup.canEnable || props.setup.busy}
+            onClick={props.setup.onEnable}
+          >
+            {t(props.setup.busy ? "systems.desktopSetupEnabling" : "systems.enableDesktopAccess")}
+          </button>
+          <div>
+            {t(
+              props.setup.canEnable
+                ? "systems.desktopSetupApplyHint"
+                : "systems.desktopSetupAdminHint",
+            )}
+          </div>
+        </>
+      ) : null}
+      {/* Systems polls; the panel retests on request whenever it cannot enable here. */}
+      {!ready() || !props.setup.canEnable ? (
+        <button
+          class="desktop-button"
+          type="button"
+          disabled={props.loading}
+          onClick={props.setup.onCheckAgain}
+        >
+          {t(props.loading ? "desktop.refreshing" : "systems.desktopSetupCheckAgain")}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -156,13 +200,16 @@ export function DesktopPanelContent(props: {
 export function DesktopPicker(props: {
   automatic: boolean;
   environments: EnvironmentSummary[];
+  hostSetup?: DesktopHostSetup | null;
   loading: boolean;
   onConnect: (environmentId: string) => void;
   onRefresh: () => void;
 }) {
   return (
     <>
-      {props.automatic ? (
+      {props.automatic && props.hostSetup ? (
+        <DesktopHostSetupNotice setup={props.hostSetup} loading={props.loading} />
+      ) : props.automatic ? (
         <div class="desktop-status" role="status">
           <button class="desktop-button" type="button" onClick={props.onRefresh}>
             {t("common.retry")}
@@ -184,7 +231,7 @@ export function DesktopPicker(props: {
           </div>
           <div class="desktop-picker">
             {props.loading && props.environments.length === 0 ? (
-              <DesktopLoading label={t("desktop.loading")} />
+              <PanelLoadingSkeleton variant="desktop" label={t("desktop.loading")} />
             ) : props.environments.length === 0 ? (
               <div class="desktop-status">{t("desktop.empty")}</div>
             ) : (
@@ -280,6 +327,7 @@ export function DesktopCredentials(props: {
 
 function DesktopConnection(props: {
   state: DesktopPanelState;
+  surfaceRef: (element: HTMLElement | undefined) => void;
   controlling: boolean;
   desktopApps: WorkerDesktopAppId[];
   launchingApp: WorkerDesktopAppId | null;
@@ -358,7 +406,7 @@ function DesktopConnection(props: {
       </div>
       <div class="desktop-stage">
         {/* noVNC owns this island's children for the entire connection. */}
-        <div class="desktop-surface" />
+        <DesktopSurface bind={props.surfaceRef} />
         {!props.controlling && (
           <button
             class="desktop-stage__take-control"
@@ -369,7 +417,9 @@ function DesktopConnection(props: {
             onClick={props.onTakeControl}
           />
         )}
-        {props.state === "connecting" && <DesktopLoading label={t("desktop.connecting")} overlay />}
+        {props.state === "connecting" && (
+          <PanelLoadingSkeleton variant="desktop" label={t("desktop.connecting")} overlay />
+        )}
       </div>
     </>
   );
@@ -466,4 +516,13 @@ export function DesktopPanelRecovery(props: {
       </button>
     </div>
   );
+}
+
+/** Solid owns the target; noVNC owns its children for the whole connection. */
+export function DesktopSurface(props: { bind: (element: HTMLElement | undefined) => void }) {
+  onSettled(() => {
+    const bind = props.bind;
+    return () => bind(undefined);
+  });
+  return <div class="desktop-surface" ref={(element) => props.bind(element)} />;
 }

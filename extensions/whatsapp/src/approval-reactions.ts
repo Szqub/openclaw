@@ -65,7 +65,7 @@ const whatsappApprovalReactionTargets =
     namespace: PERSISTENT_NAMESPACE,
     maxEntries: PERSISTENT_MAX_ENTRIES,
     defaultTtlMs: DEFAULT_REACTION_TARGET_TTL_MS,
-    openStore: (storeParams) => getOptionalWhatsAppRuntime()?.state.openKeyedStore(storeParams),
+    openStore: (storeParams) => getOptionalWhatsAppRuntime()?.state.openKeyedStoreV2(storeParams),
     logPersistentError: reportPersistentApprovalReactionError,
     readPersistedTarget: readApprovalReactionTargetRecord,
   });
@@ -425,8 +425,4 @@ export async function maybeResolveWhatsAppApprovalReaction(params: {
     logVerboseMessage: params.logVerboseMessage,
   });
   return true;
-}
-
-export function clearWhatsAppApprovalReactionTargetsForTest(): void {
-  whatsappApprovalReactionTargets.clearForTest();
 }

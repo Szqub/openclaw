@@ -1,8 +1,8 @@
 import os from "node:os";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveAuthorizedClaudeCliBinding } from "../../agents/cli-runner/child-env.js";
-import { captureTranscriptRedactionSnapshot } from "../../agents/transcript-redact-text.js";
 import { readLegacyCompactionMetrics } from "../../config/sessions/legacy-compaction-history.js";
+import { captureSessionActorTranscriptRead } from "../../config/sessions/session-actor-transcript-read.js";
 import type {
   ChatHistoryPage,
   ChatHistoryPageParams,
@@ -19,43 +19,36 @@ import {
   projectForwardedMessages,
 } from "../chat-display-projection.history.js";
 import { resolveCurrentUserProfileDisplay } from "../current-user-profile-display.js";
-import type { IncognitoSessionHistoryReader } from "../session-history-snapshot.js";
+import { createSessionActorTranscriptReader } from "../session-transcript-memory-reader.js";
 import * as sessionTranscriptReaders from "../session-transcript-readers.js";
 import { readChatHistoryPageKernel } from "./chat-history-page-kernel.js";
 import { projectChatHistoryWithReplies } from "./chat-history-reply-messages.js";
 import { encodeChatHistoryResponsePage } from "./chat-history-response-page.js";
 
+// Kept outside worker params: the consumer retains this guard until publication,
+// without serializing callbacks or attaching native authority to canonical fallbacks.
+type RetainNativeHistoryAuthorization = (isCurrent: () => boolean) => void;
+
+/** Native Claude history is readable only while the current environment still selects its root. */
 function prepareChatHistoryParams<Params extends ChatHistoryPageParams>(input: Params) {
-  const homeDir = process.env.HOME || os.homedir();
-  const authorization = !input.ignoreCliSessionImports
-    ? resolveAuthorizedClaudeCliBinding({
-        entry: input.entry,
-        agentId: input.sessionAgentId,
-        cwd: input.cwd,
-        homeDir,
-      })
-    : undefined;
-  const params = authorization
+  const authorize = () =>
+    input.ignoreCliSessionImports
+      ? undefined
+      : resolveAuthorizedClaudeCliBinding({
+          entry: input.entry,
+          agentId: input.sessionAgentId,
+          cwd: input.cwd,
+        });
+  const authorization = authorize();
+  const params: Params = authorization
     ? {
         ...input,
-        cliHistoryHomeDir: homeDir,
-        cliHistoryRedaction: captureTranscriptRedactionSnapshot(),
+        cliHistoryHomeDir: process.env.HOME || os.homedir(),
         cliHistoryProjectsRoot: authorization.transcriptRoot,
       }
     : { ...input, ignoreCliSessionImports: true };
-  const sameAuthorization = () => {
-    if (!authorization) {
-      return true;
-    }
-    const currentHomeDir = process.env.HOME || os.homedir();
-    const current = resolveAuthorizedClaudeCliBinding({
-      entry: input.entry,
-      agentId: input.sessionAgentId,
-      cwd: input.cwd,
-      homeDir: currentHomeDir,
-    });
-    return JSON.stringify(current) === JSON.stringify(authorization);
-  };
+  const sameAuthorization = () =>
+    !authorization || JSON.stringify(authorize()) === JSON.stringify(authorization);
   const assertNativeHistoryAuthorized = async () => {
     if (!authorization || !sameAuthorization()) {
       throw new Error(NATIVE_HISTORY_AUTHORIZATION_DENIED);
@@ -69,6 +62,7 @@ function prepareChatHistoryParams<Params extends ChatHistoryPageParams>(input: P
   };
   return {
     params,
+    native: Boolean(authorization),
     sameAuthorization,
     assertNativeHistoryAuthorized,
     onNativeHistoryAuthorizationRequest,
@@ -91,10 +85,6 @@ async function readNativeHistory<T>(
   }
 }
 
-// Kept outside worker params: the consumer retains this guard until publication,
-// without serializing callbacks or attaching native authority to canonical fallbacks.
-type RetainNativeHistoryAuthorization = (isCurrent: () => boolean) => void;
-
 function chatHistoryScope(params: ChatHistoryPageParams) {
   return {
     agentId: params.sessionAgentId,
@@ -107,169 +97,113 @@ function chatHistoryScope(params: ChatHistoryPageParams) {
 
 export async function readChatHistoryMessageById(
   input: ChatHistoryMessageParams,
-  suppliedIncognito?: IncognitoSessionHistoryReader,
   retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
 ) {
-  const incognito =
-    suppliedIncognito ??
-    sessionTranscriptReaders.captureIncognitoSessionHistoryReader(chatHistoryScope(input));
-  const source = incognito ? structuredClone(input) : input;
+  const scope = chatHistoryScope(input);
+  const memory = captureSessionActorTranscriptRead(scope);
+  const captured = memory ? structuredClone(input) : input;
   const {
     params,
+    native,
     sameAuthorization,
     assertNativeHistoryAuthorized,
     onNativeHistoryAuthorizationRequest,
-  } = prepareChatHistoryParams(source);
-  const messageOptions = {
-    allowResetArchiveFallback: true,
-    historyVisibility: { sessionStartedAt: source.entry?.sessionStartedAt },
-  };
-  if (incognito) {
-    const scope = chatHistoryScope(source);
-    const outcome = await incognito.consume(scope, async (readers) => {
-      const readCanonical = () =>
-        readers.readSessionMessageByIdAsync(scope, source.messageId, messageOptions);
-      if (params.ignoreCliSessionImports || !sameAuthorization()) {
-        return { result: await readCanonical(), native: false };
-      }
-      const { readProcessHeldCliHistoryMessage } =
-        await import("../cli-session-history.process-held.js");
-      const native = await readNativeHistory(sameAuthorization, () =>
-        readProcessHeldCliHistoryMessage(params, incognito, assertNativeHistoryAuthorized),
-      );
-      if (!native || !sameAuthorization()) {
-        return { result: await readCanonical(), native: false };
-      }
-      return { result: native.result, native: true };
+  } = prepareChatHistoryParams(captured);
+  const readCanonical = async () => {
+    const readers = memory ? createSessionActorTranscriptReader(memory) : sessionTranscriptReaders;
+    const result = await readers.readSessionMessageByIdAsync(scope, captured.messageId, {
+      allowResetArchiveFallback: true,
+      historyVisibility: { sessionStartedAt: captured.entry?.sessionStartedAt },
     });
-    if (outcome.native) {
-      retainNativeHistoryAuthorization?.(sameAuthorization);
-    }
-    return outcome.result;
-  }
-  const readCanonical = () =>
-    sessionTranscriptReaders.readSessionMessageByIdAsync(
-      chatHistoryScope(input),
-      input.messageId,
-      messageOptions,
-    );
-  const storePath = input.storePath;
-  if (params.ignoreCliSessionImports || !storePath) {
-    return readCanonical();
-  }
-  if (params.entry?.incognito || isIncognitoSessionKey(params.canonicalKey)) {
+    memory?.assertCurrent();
+    return result;
+  };
+  if (memory && native) {
     const { readProcessHeldCliHistoryMessage } =
       await import("../cli-session-history.process-held.js");
-    if (!sameAuthorization()) {
-      return readCanonical();
-    }
-    const native = await readNativeHistory(sameAuthorization, () =>
-      readProcessHeldCliHistoryMessage(params, undefined, assertNativeHistoryAuthorized),
+    const resolved = await readNativeHistory(sameAuthorization, () =>
+      readProcessHeldCliHistoryMessage(params, memory, assertNativeHistoryAuthorized),
     );
-    if (!native || !sameAuthorization()) {
+    memory.assertCurrent();
+    if (!resolved || !sameAuthorization()) {
       return readCanonical();
     }
     retainNativeHistoryAuthorization?.(sameAuthorization);
-    return native.result;
+    return resolved.result;
+  }
+  const storePath = input.storePath;
+  if (
+    memory ||
+    !native ||
+    !storePath ||
+    input.entry?.incognito ||
+    isIncognitoSessionKey(input.canonicalKey)
+  ) {
+    return readCanonical();
   }
   const { readSessionHistoryPageInWorker } =
     await import("../../config/sessions/session-history-worker-runtime.js");
-  if (!sameAuthorization()) {
-    return readCanonical();
-  }
-  const native = await readNativeHistory(sameAuthorization, () =>
+  const resolved = await readNativeHistory(sameAuthorization, () =>
     readSessionHistoryPageInWorker(
-      {
-        kind: "rpc-message",
-        params: { ...params, storePath },
-      },
+      { kind: "rpc-message", params: { ...params, storePath } },
       undefined,
       onNativeHistoryAuthorizationRequest,
     ),
   );
-  if (!native || !sameAuthorization()) {
+  if (!resolved || !sameAuthorization()) {
     return readCanonical();
   }
   retainNativeHistoryAuthorization?.(sameAuthorization);
-  return native.result;
+  return resolved.result;
 }
 
 export async function readChatHistoryPage(
   input: ChatHistoryPageParams,
   signal?: AbortSignal,
-  suppliedIncognito?: IncognitoSessionHistoryReader,
   retainNativeHistoryAuthorization?: RetainNativeHistoryAuthorization,
 ): Promise<ChatHistoryPage> {
   signal?.throwIfAborted();
-  const incognito =
-    suppliedIncognito ??
-    (input.sessionId && input.storePath
-      ? sessionTranscriptReaders.captureIncognitoSessionHistoryReader(
-          chatHistoryScope(input),
-          signal,
-        )
-      : undefined);
-  const source = incognito ? structuredClone(input) : input;
+  const scope = chatHistoryScope(input);
+  const memory = captureSessionActorTranscriptRead(scope, signal);
   const {
-    params,
+    params: prepared,
     sameAuthorization,
     assertNativeHistoryAuthorized,
     onNativeHistoryAuthorizationRequest,
-  } = prepareChatHistoryParams(source);
-  const readPage = async (pageParams: ChatHistoryPageParams): Promise<ChatHistoryPage> => {
+  } = prepareChatHistoryParams(memory ? structuredClone(input) : input);
+  const readPage = async (params: ChatHistoryPageParams): Promise<ChatHistoryPage> => {
     signal?.throwIfAborted();
-    const readCanonicalFallback = () => readPage({ ...source, ignoreCliSessionImports: true });
-    if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
+    const useCliHistory = !params.ignoreCliSessionImports;
+    const readCanonicalFallback = () => readPage({ ...params, ignoreCliSessionImports: true });
+    if (useCliHistory && !sameAuthorization()) {
       return readCanonicalFallback();
     }
-    if (incognito) {
-      const scope = chatHistoryScope(pageParams);
-      if (!pageParams.ignoreCliSessionImports) {
-        const page = await incognito.consume(scope, async () => {
-          const { readProcessHeldCliHistory } =
-            await import("../cli-session-history.process-held.js");
-          const native = await readNativeHistory(sameAuthorization, () =>
-            readProcessHeldCliHistory(pageParams, signal, incognito, assertNativeHistoryAuthorized),
-          );
-          if (!native) {
-            return undefined;
-          }
-          const messages = await refreshForwardedLabels(native.result.messages);
-          signal?.throwIfAborted();
-          return { ...native.result, messages };
-        });
-        if (!page || !sameAuthorization()) {
+    if (memory) {
+      let page: ChatHistoryPage;
+      if (useCliHistory) {
+        const { readProcessHeldCliHistory } =
+          await import("../cli-session-history.process-held.js");
+        const resolved = await readNativeHistory(sameAuthorization, () =>
+          readProcessHeldCliHistory(params, signal, memory, assertNativeHistoryAuthorized),
+        );
+        if (!resolved) {
           return readCanonicalFallback();
         }
-        retainNativeHistoryAuthorization?.(sameAuthorization);
-        return page;
+        page = resolved.result;
+      } else {
+        page = await readChatHistoryPageKernel(params, {
+          readers: createSessionActorTranscriptReader(memory),
+          readOnly: true,
+          resolveCurrentUserProfileDisplay,
+          resolveCronJobName: () => undefined,
+        });
       }
-      const reader = incognito;
-      return reader.consume(scope, async () => {
-        const page = await reader.rpc({ ...pageParams, encodeResponse: false });
-        const messages = await refreshForwardedLabels(page.messages);
-        signal?.throwIfAborted();
-        return encodeChatHistoryResponsePage({ ...page, messages }, pageParams);
-      });
-    }
-    if (
-      pageParams.sessionId &&
-      pageParams.storePath &&
-      (pageParams.entry?.incognito || isIncognitoSessionKey(pageParams.canonicalKey)) &&
-      !pageParams.ignoreCliSessionImports
-    ) {
-      const { readProcessHeldCliHistory } = await import("../cli-session-history.process-held.js");
-      if (!sameAuthorization()) {
-        return readCanonicalFallback();
-      }
-      const native = await readNativeHistory(sameAuthorization, () =>
-        readProcessHeldCliHistory(pageParams, signal, undefined, assertNativeHistoryAuthorized),
-      );
-      if (!native) {
-        return readCanonicalFallback();
-      }
-      const page = native.result;
       const refreshed = { ...page, messages: await refreshForwardedLabels(page.messages) };
+      signal?.throwIfAborted();
+      memory.assertCurrent();
+      if (!useCliHistory) {
+        return encodeChatHistoryResponsePage(refreshed, params);
+      }
       if (!sameAuthorization()) {
         return readCanonicalFallback();
       }
@@ -277,31 +211,28 @@ export async function readChatHistoryPage(
       return refreshed;
     }
     if (
-      !pageParams.sessionId ||
-      !pageParams.storePath ||
-      pageParams.entry?.incognito ||
-      isIncognitoSessionKey(pageParams.canonicalKey)
+      !params.sessionId ||
+      !params.storePath ||
+      params.entry?.incognito ||
+      isIncognitoSessionKey(params.canonicalKey)
     ) {
-      const page = await readChatHistoryPageKernel(pageParams, {
+      const page = await readChatHistoryPageKernel(params, {
         readers: sessionTranscriptReaders,
         resolveCurrentUserProfileDisplay,
         resolveCronJobName: () => undefined,
       });
       return { ...page, messages: await refreshForwardedLabels(page.messages) };
     }
-    const { sessionId, storePath } = pageParams;
+    const { sessionId, storePath } = params;
     const { readSessionHistoryPageInWorker } =
       await import("../../config/sessions/session-history-worker-runtime.js");
-    if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-      return readCanonicalFallback();
-    }
-    const native = await readNativeHistory(sameAuthorization, () =>
+    const resolved = await readNativeHistory(sameAuthorization, () =>
       readSessionHistoryPageInWorker(
         {
           kind: "rpc",
           params: {
-            ...pageParams,
-            compactionMetrics: readLegacyCompactionMetrics(pageParams.entry),
+            ...params,
+            compactionMetrics: readLegacyCompactionMetrics(params.entry),
             sessionId,
             storePath,
           },
@@ -310,18 +241,18 @@ export async function readChatHistoryPage(
         onNativeHistoryAuthorizationRequest,
       ),
     );
-    if (!native) {
+    if (!resolved) {
       return readCanonicalFallback();
     }
-    if (!sameAuthorization() && !pageParams.ignoreCliSessionImports) {
-      return readCanonicalFallback();
-    }
-    if (!pageParams.ignoreCliSessionImports) {
+    if (useCliHistory) {
+      if (!sameAuthorization()) {
+        return readCanonicalFallback();
+      }
       retainNativeHistoryAuthorization?.(sameAuthorization);
     }
-    return native.result;
+    return resolved.result;
   };
-  return readPage(params);
+  return readPage(prepared);
 }
 
 async function refreshForwardedLabels(messages: unknown[]): Promise<unknown[]> {

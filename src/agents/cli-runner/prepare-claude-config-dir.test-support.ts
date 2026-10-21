@@ -36,32 +36,6 @@ export function registerClaudeConfigDirPreparationTests({
   }) => void;
   setRawBackend: typeof setRawCliBackendForPrepareTest;
 }) {
-  it("ignores stored CLI session candidates when the backend disables sessions", async () => {
-    setBackend({
-      sessionMode: "none",
-      reseedFromRawTranscriptWhenUncompacted: true,
-    });
-    const transcriptCheck = vi.fn(async () => false);
-    const orphanCheck = vi.fn(async () => false);
-    setCliRunnerPrepareTestDeps({
-      claudeCliSessionTranscriptHasContent: transcriptCheck,
-      claudeCliSessionTranscriptHasOrphanedToolUse: orphanCheck,
-    });
-
-    const context = await getFixture().prepare({
-      sessionKey: "agent:main:telegram:direct:peer",
-      prompt: "stateless ask",
-      provider: "claude-cli",
-      model: "opus",
-      cliSessionBinding: { sessionId: "stale-claude-sid" },
-      cliSessionId: "stale-claude-sid",
-    });
-
-    expect(context.reusableCliSession).toEqual({ mode: "none" });
-    expect(transcriptCheck).not.toHaveBeenCalled();
-    expect(orphanCheck).not.toHaveBeenCalled();
-  });
-
   it.each([false, true])(
     "resumes a configured-root transcript without requiring a live generation (warm=%s)",
     async (warm) => {

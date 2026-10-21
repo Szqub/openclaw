@@ -1,5 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { captureRuntimeConfigAsyncReader } from "../../config/config.js";
 import {
   appendTranscriptMessage,
   upsertSessionEntryCore,
@@ -22,6 +23,7 @@ const scope = {
 const message = { role: "assistant", content: "History fixture" };
 
 async function prepareSession() {
+  await captureRuntimeConfigAsyncReader()();
   await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
   await appendTranscriptMessage(scope, { message });
   return createHistoryReadContext();
@@ -49,12 +51,10 @@ describe("history publication authority", () => {
         for (const retained of [false, true]) {
           for (const allowed of [false, true]) {
             let current = true;
-            read.mockImplementationOnce(
-              async (_params, _signal, _incognito, retainAuthorization) => {
-                retainAuthorization?.(() => current);
-                return { messages: [message] };
-              },
-            );
+            read.mockImplementationOnce(async (_params, _signal, retainAuthorization) => {
+              retainAuthorization?.(() => current);
+              return { messages: [message] };
+            });
             context.readChatStartupProjection = async () => {
               if (!retained) {
                 current = allowed;
@@ -101,7 +101,7 @@ describe("history publication authority", () => {
       for (const native of [false, true]) {
         for (const allowed of [false, true]) {
           let current = true;
-          read.mockImplementationOnce(async (_params, _incognito, retainAuthorization) => {
+          read.mockImplementationOnce(async (_params, retainAuthorization) => {
             if (native) {
               retainAuthorization?.(() => current);
             }

@@ -50,6 +50,11 @@ async function runWithChildConfigDir(params: {
       authFingerprint: "f".repeat(64),
       assertCurrent: () => {},
       assertReadable: () => {},
+      bindsNativeLogin: false,
+      checkNativeLoginBoundary: () => {},
+      bindExecutionEnv: () => {},
+      replaysHistory: true,
+      settleNativeLogin: async () => {},
     };
   }
   supervisorSpawnMock.mockResolvedValue(

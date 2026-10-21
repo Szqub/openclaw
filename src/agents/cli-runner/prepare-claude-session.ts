@@ -50,8 +50,11 @@ export async function prepareClaudeCliSession(params: {
   const claudeCliTranscriptRoot = hasClaudeCliCandidate
     ? await resolveClaudeChildTranscriptRoot({
         provider: params.provider,
-        backend: params.backend,
-        preparedBackend: params.preparedBackend,
+        preparedBackend: {
+          backend: params.backend,
+          env: params.preparedBackend.env,
+          secretInput: params.preparedBackend.secretInput,
+        },
         skillEnv: resolveSkillEnvOverridesFromSnapshot({
           snapshot: params.skillsSnapshot,
           config: params.config,
