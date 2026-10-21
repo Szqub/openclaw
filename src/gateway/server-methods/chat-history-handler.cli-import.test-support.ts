@@ -1,8 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expectDefined } from "@openclaw/normalization-core";
-import { expect } from "vitest";
 import type { ChatHistoryParams } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { captureRuntimeConfigAsyncReader } from "../../config/config.js";
 import {
@@ -13,9 +11,8 @@ import {
   withOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
-import { chatHistoryHandlers } from "./chat-history-handler.js";
+import { historyPayload, historyRpc } from "./chat-history-fixture.test-support.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
-import { chatMessageGetHandlers } from "./chat-message-get-handler.js";
 
 export type HistoryPage = {
   messages: unknown[];
@@ -103,26 +100,8 @@ async function rpcReader(
   sessionKey: string,
   method: "chat.history" | "chat.startup" | "chat.message.get",
 ) {
-  const context = await createHistoryReadContext();
-  const handler = expectDefined(
-    method === "chat.message.get" ? chatMessageGetHandlers[method] : chatHistoryHandlers[method],
-    "history handler",
-  );
-  return async (params: HistoryRequest) => {
-    let result: unknown;
-    await handler({
-      params: { sessionKey, ...params },
-      context,
-      req: { type: "req", id: randomUUID(), method },
-      client: null,
-      isWebchatConnect: () => false,
-      respond: (ok, payload, error) => {
-        expect({ ok, error }).toEqual({ ok: true, error: undefined });
-        result = payload;
-      },
-    });
-    return expectDefined(result, "history response");
-  };
+  const request = historyRpc(await createHistoryReadContext(), sessionKey);
+  return async (params: HistoryRequest) => historyPayload(await request(method, params));
 }
 
 export async function historyReader(

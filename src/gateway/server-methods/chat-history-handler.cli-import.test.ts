@@ -280,9 +280,13 @@ it("filters recovered failures on metadata-only pages", async () => {
   });
 });
 
-it.each(["chat.history", "chat.startup"] as const)(
-  "%s pages local and external history within the requested limits",
-  async (method) => {
+it.each([
+  ["chat.history", false],
+  ["chat.startup", false],
+  ["chat.history", true],
+] as const)(
+  "%s pages local and external history within the requested limits (incognito=%s)",
+  async (method, incognito) => {
     await withImportedHistory(
       6,
       "External conversation",
@@ -291,6 +295,10 @@ it.each(["chat.history", "chat.startup"] as const)(
         expect(newest.messages.length).toBeLessThanOrEqual(2);
         expect(newest).toMatchObject({ hasMore: true, totalMessages: 8 });
         expect(newest).not.toHaveProperty("completeSnapshot");
+        if (incognito) {
+          expect(ids(newest)).toEqual(importedIds.slice(-2));
+          expect(newest.nextOffset).toBe(2);
+        }
         const restored = [...newest.messages];
         let page = newest;
         while (page.hasMore) {
@@ -310,28 +318,11 @@ it.each(["chat.history", "chat.startup"] as const)(
         expectMissingAnchor(await read({ messageId: "nonexistent-anchor", limit: 2 }));
         expect((await read({ offset: 9999, limit: 2 })).messages).toEqual([]);
       },
-      false,
+      incognito,
       method,
     );
   },
 );
-
-it("paginates process-held incognito imports", async () => {
-  await withImportedHistory(
-    2,
-    "Private native history",
-    async ({ read, importedIds }) => {
-      const newest = await read({ limit: 2 });
-      expect(ids(newest)).toEqual(importedIds);
-      expect(newest).toMatchObject({ totalMessages: 4, hasMore: true, nextOffset: 2 });
-      const older = await read({ offset: newest.nextOffset, limit: 2 });
-      expect(older).toMatchObject({ hasMore: false, totalMessages: 4 });
-      expect(JSON.stringify(older.messages)).toContain("Local question");
-      expect(JSON.stringify(older.messages)).toContain("Local answer");
-    },
-    true,
-  );
-});
 
 it("deduplicates native history independently of log redaction", async () => {
   const text = "opaqueSeedQ customMask7 laterRegV7 laterCfgV8";

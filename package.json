@@ -15,7 +15,7 @@
       "team-reports"
     ],
     "schemaVersions": {
-      "state": 29,
+      "state": 30,
       "agent": 31
     }
   },
@@ -1631,6 +1631,10 @@
       "types": "./dist/plugin-sdk/decisions.d.ts",
       "default": "./dist/plugin-sdk/decisions.js"
     },
+    "./plugin-sdk/decisions-openai-runtime": {
+      "types": "./dist/plugin-sdk/decisions-openai-runtime.d.ts",
+      "default": "./dist/plugin-sdk/decisions-openai-runtime.js"
+    },
     "./plugin-sdk/secret-ref-readonly": {
       "types": "./dist/plugin-sdk/secret-ref-readonly.d.ts",
       "default": "./dist/plugin-sdk/secret-ref-readonly.js"
@@ -1773,6 +1777,7 @@
     "check:agents-md-size": "node --import ./scripts/tsx.mjs scripts/check-agents-md-size.mts",
     "check:architecture": "pnpm check:import-cycles && pnpm check:madge-import-cycles && pnpm check:deprecated-api-usage && pnpm check:wrapper-shadowing && pnpm check:deprecated-jsdoc && pnpm db:kysely:check && pnpm db:postgres:check && pnpm lint:kysely && pnpm check:database-first-legacy-stores",
     "check:assertion-safety": "node --import ./scripts/tsx.mjs scripts/check-assertion-safety-ratchet.mts",
+    "check:baseline-ratchets": "node --import ./scripts/tsx.mjs scripts/ci-baseline-ratchets.mts",
     "check:base-config-schema": "node --import ./scripts/tsx.mjs scripts/generate-base-config-schema.ts --check",
     "check:bundled-channel-config-metadata": "node --import ./scripts/tsx.mjs scripts/generate-bundled-channel-config-metadata.ts --check",
     "check:changed": "node scripts/check-changed.mjs",

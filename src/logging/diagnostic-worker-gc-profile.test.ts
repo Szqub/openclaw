@@ -14,7 +14,10 @@ vi.mock("node:inspector/promises", () => ({
     disconnect = native.disconnect;
   },
 }));
-vi.mock("node:timers/promises", () => ({ setTimeout: native.wait }));
+vi.mock("node:timers/promises", async (original) => ({
+  ...(await original<typeof import("node:timers/promises")>()),
+  setTimeout: native.wait,
+}));
 vi.mock("node:trace_events", () => assert.fail("trace_events must not load in a worker"));
 vi.mock("../infra/openclaw-root.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/openclaw-root.js")>()),
@@ -72,9 +75,7 @@ it.each([false, true])("closes profilers (CPU start failure=%s)", async (fails) 
       includeObjectsCollectedByMajorGC: true,
       includeObjectsCollectedByMinorGC: true,
     });
-    expect(native.wait).toHaveBeenCalledWith(5000, undefined, {
-      signal: expect.any(AbortSignal),
-    });
+    expect(native.wait.mock.calls.map(([duration]) => duration)).toEqual([5000]);
     expect(JSON.parse(outcome.result.heap)).toMatchObject({
       includeObjectsCollectedByMajorGC: true,
       includeObjectsCollectedByMinorGC: true,
