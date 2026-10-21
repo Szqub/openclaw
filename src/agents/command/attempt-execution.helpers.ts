@@ -350,6 +350,8 @@ export async function buildClaudeCliFallbackContextPrelude(params: {
   homeDir?: string;
   cwd?: string;
   projectsRoot?: string;
+  /** Live native-root authority; rechecked after every awaited discovery or read step. */
+  assertNativeHistoryAuthorized?: () => Promise<void>;
 }): Promise<string> {
   const sessionId = params.cliSessionId?.trim();
   if (!sessionId) {
@@ -360,10 +362,12 @@ export async function buildClaudeCliFallbackContextPrelude(params: {
     homeDir: params.homeDir,
     cwd: params.cwd,
     projectsRoot: params.projectsRoot,
+    assertNativeHistoryAuthorized: params.assertNativeHistoryAuthorized,
   });
   if (!seed) {
     return "";
   }
+  await params.assertNativeHistoryAuthorized?.();
   const heading = "## Prior session context (from claude-cli)";
   const sections: string[] = [heading];
   let remaining = CLAUDE_CLI_FALLBACK_PRELUDE_DEFAULT_CHAR_BUDGET - heading.length;

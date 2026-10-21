@@ -612,6 +612,8 @@ export async function readClaudeCliFallbackSeed(
   } catch {
     return undefined;
   }
+  // The selection may have changed while the file was read; a revoked root yields no seed.
+  await params.assertNativeHistoryAuthorized?.();
 
   let pendingSummary: string | undefined;
   let lastSummary: string | undefined;

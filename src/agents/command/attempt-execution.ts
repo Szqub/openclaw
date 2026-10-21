@@ -8,6 +8,10 @@ import {
 import { messageToolOwnsVisibleReply } from "../../auto-reply/source-reply-delivery-mode.js";
 import { readSessionEntryInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import {
+  NATIVE_HISTORY_AUTHORIZATION_DENIED,
+  isNativeHistoryAuthorizationDenied,
+} from "../../config/sessions/session-history-types.js";
+import {
   injectTimestamp,
   timestampOptsFromConfig,
 } from "../../gateway/server-methods/agent-timestamp.js";
@@ -160,46 +164,69 @@ export async function runAgentAttempt(params: AgentAttemptParams) {
     completionToolPolicies !== undefined &&
     isToolAllowedByPolicies("message", Object.values(completionToolPolicies)) &&
     isRuntimeToolAllowed("message", params.opts.toolsAllow);
-  const claudeCliBinding =
+  const fallbackChildCwd = params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir;
+  const seedsClaudeCliFallback =
     !isRawModelRun &&
     params.isFallbackRetry &&
     isClaudeCliProvider(params.originalProvider) &&
-    !isClaudeCliProvider(params.providerOverride)
-      ? resolveAuthorizedClaudeCliBinding({
-          entry: params.sessionEntry,
-          config: params.cfg,
-          agentId: params.sessionAgentId,
-          skillsSnapshot: params.skillsSnapshot,
-          cwd: params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir,
-        })
-      : undefined;
-  const claudeCliFallbackPrelude =
-    !isRawModelRun &&
-    params.isFallbackRetry &&
-    isClaudeCliProvider(params.originalProvider) &&
-    !isClaudeCliProvider(params.providerOverride)
-      ? await buildClaudeCliFallbackContextPrelude({
-          cliSessionId: claudeCliBinding?.sessionId,
-          cwd:
-            claudeCliBinding?.cwd ??
-            (params.cwd ? resolveUserPath(params.cwd) : params.workspaceDir),
-          projectsRoot: claudeCliBinding?.transcriptRoot,
-        })
-      : "";
-  const resolvedPrompt = resolveFallbackRetryPrompt({
-    body: params.body,
-    isFallbackRetry: params.isFallbackRetry,
-    sessionHasHistory: params.sessionHasHistory,
-    priorContextPrelude: claudeCliFallbackPrelude,
-  });
-  const effectivePrompt = isRawModelRun
-    ? resolvedPrompt
-    : annotateInterSessionPromptText(resolvedPrompt, params.opts.inputProvenance);
-  const embeddedExecApprovalContinuationPromptRange = rebaseExecApprovalContinuationPromptRange({
-    body: params.body,
-    prompt: effectivePrompt,
-    range: params.opts.execApprovalContinuationPromptRange,
-  });
+    !isClaudeCliProvider(params.providerOverride);
+  const authorizeClaudeCliFallback = () =>
+    resolveAuthorizedClaudeCliBinding({
+      entry: params.sessionEntry,
+      config: params.cfg,
+      agentId: params.sessionAgentId,
+      skillsSnapshot: params.skillsSnapshot,
+      cwd: fallbackChildCwd,
+    });
+  const claudeCliBinding = seedsClaudeCliFallback ? authorizeClaudeCliFallback() : undefined;
+  // The retained root only locates the transcript; the current selection must still authorize
+  // it after every await, up to the moment the prelude enters the fallback request.
+  const sameClaudeCliAuthorization = () =>
+    JSON.stringify(authorizeClaudeCliFallback()) === JSON.stringify(claudeCliBinding);
+  const claudeCliFallbackPrelude = claudeCliBinding
+    ? await buildClaudeCliFallbackContextPrelude({
+        cliSessionId: claudeCliBinding.sessionId,
+        cwd: claudeCliBinding.cwd ?? fallbackChildCwd,
+        projectsRoot: claudeCliBinding.transcriptRoot,
+        assertNativeHistoryAuthorized: async () => {
+          if (!sameClaudeCliAuthorization()) {
+            throw new Error(NATIVE_HISTORY_AUTHORIZATION_DENIED);
+          }
+        },
+      }).catch((error: unknown) => {
+        if (isNativeHistoryAuthorizationDenied(error)) {
+          return "";
+        }
+        throw error;
+      })
+    : "";
+  const derivePrompts = (priorContextPrelude: string) => {
+    const resolvedPrompt = resolveFallbackRetryPrompt({
+      body: params.body,
+      isFallbackRetry: params.isFallbackRetry,
+      sessionHasHistory: params.sessionHasHistory,
+      priorContextPrelude,
+    });
+    const effectivePrompt = isRawModelRun
+      ? resolvedPrompt
+      : annotateInterSessionPromptText(resolvedPrompt, params.opts.inputProvenance);
+    return {
+      priorContextPrelude,
+      resolvedPrompt,
+      effectivePrompt,
+      embeddedExecApprovalContinuationPromptRange: rebaseExecApprovalContinuationPromptRange({
+        body: params.body,
+        prompt: effectivePrompt,
+        range: params.opts.execApprovalContinuationPromptRange,
+      }),
+    };
+  };
+  const preparedPrompts = derivePrompts(claudeCliFallbackPrelude);
+  /** Prompts for the request about to be sent: a revoked native prelude is dropped. */
+  const currentPrompts = () =>
+    preparedPrompts.priorContextPrelude && !sameClaudeCliAuthorization()
+      ? derivePrompts("")
+      : preparedPrompts;
   const continuationTranscriptBody = params.opts.execApprovalContinuationPromptRange
     ? (params.transcriptBody ?? params.body)
     : params.transcriptBody;
@@ -437,17 +464,18 @@ export async function runAgentAttempt(params: AgentAttemptParams) {
               maxOutputUtf16Units: DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS,
             })
           : params.body;
+        const cliPrompts = currentPrompts();
         const cliResolvedPrompt = params.opts.execApprovalContinuationPromptRange
           ? resolveFallbackRetryPrompt({
               body: cliContinuationBody,
               isFallbackRetry: params.isFallbackRetry,
               sessionHasHistory: params.sessionHasHistory,
-              priorContextPrelude: claudeCliFallbackPrelude,
+              priorContextPrelude: cliPrompts.priorContextPrelude,
             })
-          : resolvedPrompt;
+          : cliPrompts.resolvedPrompt;
         const cliEffectivePrompt = params.opts.execApprovalContinuationPromptRange
           ? annotateInterSessionPromptText(cliResolvedPrompt, params.opts.inputProvenance)
-          : effectivePrompt;
+          : cliPrompts.effectivePrompt;
         const cliTranscriptPrompt =
           continuationTranscriptBody === undefined || !continuationTranscriptPromptRange
             ? continuationTranscriptBody
@@ -676,6 +704,8 @@ export async function runAgentAttempt(params: AgentAttemptParams) {
     );
   }
 
+  // Selection may have changed during the awaited preparation above: re-derive at the effect.
+  const embeddedPrompts = currentPrompts();
   const embeddedRunParams: RunEmbeddedAgentInternalParams = {
     ...buildCommonRunParams(),
     sandboxSessionKey: params.sessionKey,
@@ -691,7 +721,7 @@ export async function runAgentAttempt(params: AgentAttemptParams) {
     agentHarnessRuntimeOverride: embeddedAgentHarnessOverride,
     agentHarnessRuntimePreparationHint:
       agentHarnessPolicy.runtimeSource !== "implicit" ? agentHarnessPolicy.runtime : undefined,
-    prompt: effectivePrompt,
+    prompt: embeddedPrompts.effectivePrompt,
     transcriptPrompt: continuationTranscriptBody,
     // CLI retries cannot replay a persisted turn after orphan-user repair removes it.
     images: shouldForwardImagesToEmbedded ? params.opts.images : undefined,
@@ -708,7 +738,8 @@ export async function runAgentAttempt(params: AgentAttemptParams) {
     isFinalFallbackAttempt: params.isFinalFallbackAttempt,
     verboseLevel: params.resolvedVerboseLevel,
     execSession: params.sessionEntry,
-    execApprovalContinuationPromptRange: embeddedExecApprovalContinuationPromptRange,
+    execApprovalContinuationPromptRange:
+      embeddedPrompts.embeddedExecApprovalContinuationPromptRange,
     execApprovalContinuationTranscriptPromptRange: continuationTranscriptPromptRange,
     // Hidden internal runs lack an event consumer; visible lanes still feed UI and parent relays.
     suppressLiveStreamOutput:

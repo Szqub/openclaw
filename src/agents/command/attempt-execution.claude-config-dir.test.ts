@@ -1,9 +1,12 @@
+import rawFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { NATIVE_HISTORY_AUTHORIZATION_DENIED } from "../../config/sessions/session-history-types.js";
 import { cliBackendLog } from "../cli-runner/log.js";
 import {
+  buildClaudeCliFallbackContextPrelude,
   claudeCliSessionTranscriptHasContent,
   claudeCliSessionTranscriptHasOrphanedToolUse,
 } from "./attempt-execution.helpers.js";
@@ -83,5 +86,76 @@ describe("Claude transcript root probes", () => {
     expect(await claudeCliSessionTranscriptHasContent(target)).toBe(true);
     // The Gateway-root decoy is the only transcript holding an unanswered tool_use.
     expect(await claudeCliSessionTranscriptHasOrphanedToolUse(target)).toBe(false);
+  });
+
+  it("rechecks native authority through asynchronous fallback discovery and reads", async () => {
+    const workspaceDir = await fs.realpath(await makeWorkspace());
+    const projectKey = workspaceDir.replace(/[^a-zA-Z0-9]/g, "-");
+    const projectsRoot = path.join(tmpDir, "selected Claude", "projects");
+    const sessionId = "fallback-session";
+    const file = path.join(projectsRoot, projectKey, `${sessionId}.jsonl`);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(
+      file,
+      [
+        { type: "user", uuid: "u1", message: { role: "user", content: "earlier question" } },
+        {
+          type: "assistant",
+          uuid: "a1",
+          message: { role: "assistant", content: "native fallback answer" },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    let authorized = true;
+    let checks = 0;
+    const build = () =>
+      buildClaudeCliFallbackContextPrelude({
+        cliSessionId: sessionId,
+        cwd: workspaceDir,
+        projectsRoot,
+        assertNativeHistoryAuthorized: async () => {
+          checks += 1;
+          if (!authorized) {
+            throw new Error(NATIVE_HISTORY_AUTHORIZATION_DENIED);
+          }
+        },
+      });
+    expect(await build()).toContain("native fallback answer");
+    const allowedChecks = checks;
+    expect(allowedChecks).toBeGreaterThanOrEqual(3);
+
+    // Revoked while directory discovery is pending: no file access or read follows.
+    const originalReaddir = rawFs.promises.readdir.bind(rawFs.promises);
+    const readdir = vi.spyOn(rawFs.promises, "readdir").mockImplementationOnce(async (...args) => {
+      const entries = await originalReaddir(...args);
+      authorized = false;
+      return entries;
+    });
+    const readFile = vi.spyOn(rawFs.promises, "readFile");
+    try {
+      await expect(build()).rejects.toThrow(NATIVE_HISTORY_AUTHORIZATION_DENIED);
+      expect(readFile).not.toHaveBeenCalled();
+    } finally {
+      readdir.mockRestore();
+      readFile.mockRestore();
+    }
+
+    // Revoked after the transcript was read: its content never becomes a prelude.
+    authorized = true;
+    const originalReadFile = rawFs.promises.readFile.bind(rawFs.promises);
+    const lateReadFile = vi
+      .spyOn(rawFs.promises, "readFile")
+      .mockImplementationOnce(async (...args) => {
+        const content = await originalReadFile(...args);
+        authorized = false;
+        return content;
+      });
+    try {
+      await expect(build()).rejects.toThrow(NATIVE_HISTORY_AUTHORIZATION_DENIED);
+    } finally {
+      lateReadFile.mockRestore();
+    }
   });
 });

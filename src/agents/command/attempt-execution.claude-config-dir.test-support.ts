@@ -1,3 +1,4 @@
+import rawFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
@@ -52,6 +53,85 @@ export function registerClaudeConfigDirAttemptTests(
 ) {
   registerNodeOwnedClaudeCliBindingTest({ getFixture });
   registerClaudeConfigDirFallbackPromptTests({ getFixture });
+  registerClaudeConfigDirFallbackRevocationTest({ getFixture });
+}
+
+/** Production path: the profile changes while native discovery is pending inside the attempt. */
+function registerClaudeConfigDirFallbackRevocationTest({
+  getFixture,
+}: {
+  getFixture: () => ClaudeConfigDirAttemptFixture;
+}) {
+  it("drops native history revoked during asynchronous fallback discovery", async () => {
+    const fixture = getFixture();
+    const tmpDir = fixture.getTmpDir();
+    const homeDir = path.join(tmpDir, "revocation-home");
+    const childCwd = path.join(tmpDir, "revocation-task");
+    await fs.mkdir(childCwd, { recursive: true });
+    const configDir = path.join(tmpDir, "revoked Claude");
+    vi.stubEnv("HOME", homeDir);
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const cliSessionId = "revoked-fallback-session";
+    const projectDir = path.join(
+      configDir,
+      "projects",
+      (await fs.realpath(childCwd)).replace(/[^a-zA-Z0-9]/g, "-"),
+    );
+    await fs.mkdir(projectDir, { recursive: true });
+    const nativeFile = path.join(projectDir, `${cliSessionId}.jsonl`);
+    await fs.writeFile(
+      nativeFile,
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: "Revoked native history" },
+      }) + "\n",
+    );
+    // The first directory listing completes under the old profile; the host then selects a
+    // different profile before the attempt can touch the discovered transcript.
+    const originalReaddir = rawFs.promises.readdir.bind(rawFs.promises);
+    const readdir = vi.spyOn(rawFs.promises, "readdir").mockImplementationOnce(async (...args) => {
+      const entries = await originalReaddir(...args);
+      vi.stubEnv("CLAUDE_CONFIG_DIR", path.join(tmpDir, "new profile"));
+      return entries;
+    });
+    const access = vi.spyOn(rawFs.promises, "access");
+    const readFile = vi.spyOn(rawFs.promises, "readFile");
+    try {
+      const attempt = await fixture.runFallbackAttempt({
+        originalProvider: "claude-cli",
+        isFallbackRetry: true,
+        cwd: childCwd,
+        body: "Continue after revocation",
+        sessionEntry: {
+          cliSessionBindings: {
+            "claude-cli": {
+              sessionId: cliSessionId,
+              cwd: childCwd,
+              transcriptRoot: path.join(configDir, "projects"),
+            },
+          },
+        },
+      });
+      const prompt = attempt.prompt;
+      if (typeof prompt !== "string") {
+        throw new Error("Expected the fallback model to receive a text prompt");
+      }
+      expect(readdir).toHaveBeenCalledOnce();
+      expect(prompt).not.toContain("Revoked native history");
+      expect(prompt).not.toContain("Prior session context");
+      expect(prompt.match(/Continue after revocation/g)).toHaveLength(1);
+      const touched = (calls: readonly (readonly unknown[])[]) =>
+        calls
+          .map(([target]) => target)
+          .filter((target): target is string => typeof target === "string");
+      expect(touched(access.mock.calls)).not.toContain(nativeFile);
+      expect(touched(readFile.mock.calls)).not.toContain(nativeFile);
+    } finally {
+      readdir.mockRestore();
+      access.mockRestore();
+      readFile.mockRestore();
+    }
+  });
 }
 
 function registerNodeOwnedClaudeCliBindingTest({
