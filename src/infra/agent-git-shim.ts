@@ -355,6 +355,14 @@ $1
   [ "$blob_verb" != grep ] || [ -n "$blob_args" ] || return 1
   return 0
 }
+lock_owner() {
+  # A reservation is a pid file; an older shim kept the pid inside a directory.
+  owner=
+  read -r owner 2>/dev/null < "$lock"
+  case $owner in ''|*[!0-9]*) read -r owner 2>/dev/null < "$lock/pid" ;; esac
+  case $owner in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s\\n' "$owner"
+}
 prepare_blobs() (
   [ "$no_lazy_fetch" != 1 ] || return 0
   case \${GIT_NO_LAZY_FETCH:-} in 1|true|yes|on) return 0 ;; esac
@@ -382,24 +390,34 @@ EOF
   # overlapping callers fetch only the part not already supplied by the leader.
   lock=$common/openclaw-history-blobs.lock
   attempts=0
-  until mkdir "$lock" 2>/dev/null; do
+  # Reserve with O_EXCL: the creating redirect wins the race and publishes the
+  # owner pid in one step, so a live reservation is never ownerless. mkdir is
+  # unusable here; uutils coreutils reports success for a path another caller
+  # just created, and both then hydrate the same object store. A caller
+  # preempted between the re-read and the unlink below could still steal a
+  # just-published reservation; that crash-only path stays named, not fenced.
+  while :; do
+    ( set -C; echo $$ > "$lock" ) 2>/dev/null && break
     attempts=$((attempts + 1))
     [ "$attempts" -lt 300 ] || return 0
-    # A large live batch may exceed thirty seconds; do not start lazy fetches
-    # beside it. Only an ownerless lock retains the bounded fallback.
-    if read -r owner 2>/dev/null < "$lock/pid"; then
-      if kill -0 "$owner" 2>/dev/null; then
-        attempts=0
-      else
-        rm -f "$lock/pid"
-        rmdir "$lock" 2>/dev/null && continue
-      fi
+    previous=$(lock_owner)
+    if [ -n "$previous" ] && kill -0 "$previous" 2>/dev/null; then
+      # A large live batch may exceed thirty seconds; wait for it instead of
+      # hydrating beside it. The attempt cap bounds only ownerless locks.
+      attempts=0
+      sleep 0.1
+      continue
     fi
-    sleep 0.1
+    # An absent or dead owner is abandoned. Re-read first so a live successor
+    # that just replaced the marker keeps its reservation. The second removal
+    # clears the directory an older shim left behind.
+    current=$(lock_owner)
+    [ "$current" = "$previous" ] || { sleep 0.1; continue; }
+    rm -f "$lock" "$lock/pid" 2>/dev/null
+    rmdir "$lock" 2>/dev/null
   done
-  trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null' 0
+  trap 'rm -f "$lock"' 0
   trap 'exit 1' HUP INT TERM
-  echo $$ > "$lock/pid"
   missing=$(query_repository objects "$@" <<EOF | awk '$2 == "missing" { print $1 }'
 $missing
 EOF

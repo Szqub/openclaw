@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -189,6 +189,89 @@ it.skipIf(process.platform === "win32")(
       expect(shown.code, shown.stderr).toBe(0);
       expect(shown.stdout).toBe(git(origin, unsupported));
       expect(await requests()).toHaveLength(1);
+    }),
+);
+
+it.skipIf(process.platform === "win32")(
+  "keeps lazy blob fetches serialised when mkdir reports a concurrent path as created",
+  () =>
+    withHistoryFixture(async ({ root, origin, file, git, reader }) => {
+      const { base, linked, invoke, newPacks } = await reader();
+      const peer = path.join(root, "double win peer");
+      git(base, ["worktree", "add", "--detach", peer]);
+      // uutils coreutils reports success for a path another caller created, and
+      // the shim then hydrates the shared store twice.
+      const bin = path.join(root, "faulty mkdir");
+      const record = path.join(root, "double win records");
+      const mkdirPath = execFileSync("sh", ["-c", "command -v mkdir"], { encoding: "utf8" }).trim();
+      await fs.mkdir(bin, { recursive: true });
+      await fs.writeFile(
+        path.join(bin, "mkdir"),
+        `#!/bin/sh
+for last; do :; done
+if "${mkdirPath}" "$@"; then
+  case $last in *openclaw-history-blobs.lock) sleep 5 ;; esac
+  exit 0
+fi
+case $last in
+  *openclaw-history-blobs.lock) printf '%s\\n' "$last" >> "${record}"; exit 0 ;;
+esac
+exit 1
+`,
+        { mode: 0o755 },
+      );
+      const args = ["log", "-S", "history line 3", "--", file];
+      const pathEnv = { PATH: `${bin}:${process.env.PATH ?? ""}` };
+      const results = await Promise.all([
+        invoke(args, linked, pathEnv),
+        invoke(args, peer, pathEnv),
+      ]);
+      const expected = git(origin, args);
+      for (const result of results) {
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toBe(expected);
+      }
+      // The leader's fetch supplies both callers, so a second hydration would
+      // be the double win this test forbids.
+      expect(await newPacks()).toHaveLength(1);
+      expect(await fs.readFile(record, "utf8").catch(() => "")).toBe("");
+      expect(await fs.readdir(path.join(base, ".git"))).not.toContain(
+        "openclaw-history-blobs.lock",
+      );
+    }),
+);
+
+it.skipIf(process.platform === "win32")(
+  "recovers an abandoned lazy fetch reservation and waits for a live owner",
+  () =>
+    withHistoryFixture(async ({ origin, file, git, reader }) => {
+      const args = ["log", "-S", "history line 3", "--", file];
+      const dead = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      for (const marker of [`${dead}\n`, ""]) {
+        const fixture = await reader();
+        const lock = path.join(fixture.base, ".git/openclaw-history-blobs.lock");
+        await fs.writeFile(lock, marker);
+        const result = await fixture.invoke(args, fixture.linked);
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toBe(git(origin, args));
+        expect(await fs.readdir(path.join(fixture.base, ".git"))).not.toContain(
+          "openclaw-history-blobs.lock",
+        );
+      }
+      const held = await reader();
+      const owner = spawn("sleep", ["1.5"]);
+      try {
+        await fs.writeFile(
+          path.join(held.base, ".git/openclaw-history-blobs.lock"),
+          `${owner.pid}\n`,
+        );
+        const result = await held.invoke(args, held.linked);
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toBe(git(origin, args));
+        expect(await held.newPacks()).toHaveLength(1);
+      } finally {
+        owner.kill();
+      }
     }),
 );
 
