@@ -276,6 +276,122 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32")(
+  "serialises reclaim so a live owner never loses its reservation",
+  () =>
+    withHistoryFixture(async ({ root, origin, file, git, reader }) => {
+      // A deletion of the reservation path while its pid is alive is the defect:
+      // the record then belongs to somebody else. The guard records the pid it
+      // deletes and the shim that asked, so an owner releasing its own record is
+      // not counted.
+      const guards = path.join(root, "lock guards");
+      const violations = path.join(root, "lock violations");
+      const realRm = execFileSync("sh", ["-c", "command -v rm"], { encoding: "utf8" }).trim();
+      const realRmdir = execFileSync("sh", ["-c", "command -v rmdir"], { encoding: "utf8" }).trim();
+      const probe = `
+    pth=$a
+    if [ -d "$pth" ]; then pth=$pth/pid; fi
+    p=
+    read -r p 2>/dev/null < "$pth"
+    case $p in
+      ''|*[!0-9]*) ;;
+      *)
+        deleter=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')
+        case $p in
+          "$PPID"|"$deleter") ;;
+          *)
+            if kill -0 "$p" 2>/dev/null; then
+              printf '%s %s %s\\n' "$0" "$p" "$deleter" >> "$VIOL"
+            fi ;;
+        esac ;;
+    esac`;
+      await fs.mkdir(guards, { recursive: true });
+      for (const [name, real] of [
+        ["rm", realRm],
+        ["rmdir", realRmdir],
+      ]) {
+        await fs.writeFile(
+          path.join(guards, name),
+          `#!/bin/sh
+for a do
+  if [ "$a" = "$LOCK" ]; then${probe}
+  fi
+done
+exec "${real}" "$@"
+`,
+          { mode: 0o755 },
+        );
+      }
+      const dead = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      const rounds = 5;
+      const workers = 6;
+      const scenarios = [
+        ["dead pid", async (lock: string) => fs.writeFile(lock, `${dead}\n`)],
+        [
+          "legacy directory",
+          async (lock: string) => {
+            await fs.mkdir(lock);
+            await fs.writeFile(path.join(lock, "pid"), `${dead}\n`);
+          },
+        ],
+      ] as const;
+      for (const [label, seed] of scenarios) {
+        const { base, linked, invoke, newPacks } = await reader();
+        const gitDir = path.join(base, ".git");
+        const lock = path.join(gitDir, "openclaw-history-blobs.lock");
+        for (let round = 0; round < rounds; round++) {
+          await fs.rm(lock, { recursive: true, force: true });
+          await seed(lock);
+          const before = (await newPacks()).length;
+          const args = ["log", "-S", `history line ${round}`, "--", file];
+          const env = { PATH: `${guards}:${process.env.PATH ?? ""}`, VIOL: violations, LOCK: lock };
+          const results = await Promise.all(
+            Array.from({ length: workers }, () => invoke(args, linked, env)),
+          );
+          for (const result of results) {
+            expect(result.code, result.stderr).toBe(0);
+            expect(result.stdout).toBe(git(origin, args));
+          }
+          expect((await newPacks()).length - before, `${label} round ${round}`).toBe(1);
+          expect(await fs.readFile(violations, "utf8").catch(() => "")).toBe("");
+          expect(await fs.readdir(gitDir)).not.toContain("openclaw-history-blobs.lock");
+        }
+      }
+    }),
+  180_000,
+);
+
+it.skipIf(process.platform === "win32")(
+  "leaves a live owner's reservation untouched while concurrent callers wait",
+  () =>
+    withHistoryFixture(async ({ origin, file, git, reader }) => {
+      const { base, linked, invoke, newPacks } = await reader();
+      const lock = path.join(base, ".git/openclaw-history-blobs.lock");
+      const owner = spawn("sleep", ["5"]);
+      expect(owner.pid).toBeTypeOf("number");
+      await fs.writeFile(lock, `${owner.pid}\n`);
+      const args = ["log", "-S", "history line 7", "--", file];
+      const waiters = Promise.all(Array.from({ length: 6 }, () => invoke(args, linked)));
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        // The reservation must still name the live owner: a reclaim that unlinked
+        // and replaced it would let a second caller hydrate the same store.
+        expect(await fs.readFile(lock, "utf8")).toBe(`${owner.pid}\n`);
+      } finally {
+        owner.kill();
+      }
+      for (const result of await waiters) {
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toBe(git(origin, args));
+      }
+      expect(await newPacks()).toHaveLength(1);
+      expect(await fs.readdir(path.join(base, ".git"))).not.toContain(
+        "openclaw-history-blobs.lock",
+      );
+    }),
+  120_000,
+);
+
+it.skipIf(process.platform === "win32")(
   "bounds show and blame discovery but batches large pickaxe searches",
   () =>
     withTempDir("agent-git-blob-bound-", async (root) => {

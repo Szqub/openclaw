@@ -355,13 +355,29 @@ $1
   [ "$blob_verb" != grep ] || [ -n "$blob_args" ] || return 1
   return 0
 }
-lock_owner() {
+lock_owner_at() {
   # A reservation is a pid file; an older shim kept the pid inside a directory.
   owner=
-  read -r owner 2>/dev/null < "$lock"
-  case $owner in ''|*[!0-9]*) read -r owner 2>/dev/null < "$lock/pid" ;; esac
+  read -r owner 2>/dev/null < "$1"
+  case $owner in ''|*[!0-9]*) read -r owner 2>/dev/null < "$1/pid" ;; esac
   case $owner in ''|*[!0-9]*) return 0 ;; esac
   printf '%s\\n' "$owner"
+}
+lock_owner() { lock_owner_at "$lock"; }
+lock_exists() { [ -f "$1" ] || [ -d "$1" ] || [ -L "$1" ]; }
+release_blob_lock() {
+  # No unlink ever runs against the shared path: move the record first, judge the
+  # copy, and put a foreign record back instead of deleting it.
+  [ "$(lock_owner)" = "$$" ] || return 0
+  released=$lock.released.$$
+  if mv "$lock" "$released" 2>/dev/null; then
+    if [ "$(lock_owner_at "$released")" = "$$" ]; then
+      rm -rf "$released"
+    else
+      mv "$released" "$lock" 2>/dev/null || :
+    fi
+  fi
+  return 0
 }
 prepare_blobs() (
   [ "$no_lazy_fetch" != 1 ] || return 0
@@ -389,34 +405,100 @@ EOF
   # Serialize across linked worktrees, then inspect the objects under the lock:
   # overlapping callers fetch only the part not already supplied by the leader.
   lock=$common/openclaw-history-blobs.lock
+  # One caller at a time may judge an abandoned reservation. The lease is taken
+  # before the record is read and every other caller waits for the verdict, so
+  # two reclaimers cannot clear each other's successor.
+  lease=$lock.reclaim
+  abandoned=$lock.abandoned
   attempts=0
-  # Reserve with O_EXCL: the creating redirect wins the race and publishes the
-  # owner pid in one step, so a live reservation is never ownerless. mkdir is
-  # unusable here; uutils coreutils reports success for a path another caller
-  # just created, and both then hydrate the same object store. A caller
-  # preempted between the re-read and the unlink below could still steal a
-  # just-published reservation; that crash-only path stays named, not fenced.
+  ownerless=0
+  # Reserve with O_EXCL and publish the owner pid in one atomic link, so a live
+  # reservation is never ownerless and a paused winner cannot be taken over.
+  # mkdir is unusable here; uutils coreutils reports success for a path another
+  # caller just created, and both then hydrate the same object store.
   while :; do
-    ( set -C; echo $$ > "$lock" ) 2>/dev/null && break
+    if ! lock_exists "$lease"; then
+      # ln into an existing directory would link *inside* it, so a directory at
+      # the reservation path is only ever reclaimed, never published over.
+      if [ ! -d "$lock" ]; then
+        publish=$lock.$$.new
+        if printf '%s\\n' "$$" > "$publish" 2>/dev/null; then
+          if ln "$publish" "$lock" 2>/dev/null && [ "$(lock_owner)" = "$$" ]; then
+            rm -f "$publish"
+            break
+          fi
+          rm -f "$publish"
+        fi
+      fi
+    fi
     attempts=$((attempts + 1))
     [ "$attempts" -lt 300 ] || return 0
-    previous=$(lock_owner)
-    if [ -n "$previous" ] && kill -0 "$previous" 2>/dev/null; then
-      # A large live batch may exceed thirty seconds; wait for it instead of
-      # hydrating beside it. The attempt cap bounds only ownerless locks.
-      attempts=0
+    leased=0
+    lease_publish=$lease.$$.new
+    if printf '%s\\n' "$$" > "$lease_publish" 2>/dev/null; then
+      if ln "$lease_publish" "$lease" 2>/dev/null; then leased=1; fi
+      rm -f "$lease_publish"
+    fi
+    if [ "$leased" != 1 ]; then
+      # An abandoned lease must not block hydration forever.
+      held=$(lock_owner_at "$lease")
+      case $held in
+        ''|"$$") ;;
+        *)
+          if ! kill -0 "$held" 2>/dev/null; then
+            if mv "$lease" "$abandoned.lease.$$" 2>/dev/null; then
+              moved=$(lock_owner_at "$abandoned.lease.$$")
+              case $moved in
+                ''|"$$") rm -f "$abandoned.lease.$$" ;;
+                *) mv "$abandoned.lease.$$" "$lease" 2>/dev/null || : ;;
+              esac
+            fi
+          fi ;;
+      esac
       sleep 0.1
       continue
     fi
-    # An absent or dead owner is abandoned. Re-read first so a live successor
-    # that just replaced the marker keeps its reservation. The second removal
-    # clears the directory an older shim left behind.
-    current=$(lock_owner)
-    [ "$current" = "$previous" ] || { sleep 0.1; continue; }
-    rm -f "$lock" "$lock/pid" 2>/dev/null
-    rmdir "$lock" 2>/dev/null
+    # The lease is ours: read the record now, never before it.
+    previous=$(lock_owner)
+    case $previous in
+      ''|"$$") ;;
+      *)
+        if kill -0 "$previous" 2>/dev/null; then
+          # A live owner keeps its reservation; a long batch is not abandonment.
+          rm -f "$lease"
+          attempts=0
+          ownerless=0
+          sleep 0.1
+          continue
+        fi ;;
+    esac
+    if [ -z "$previous" ] && lock_exists "$lock" && [ "$ownerless" -lt 1 ]; then
+      # An ownerless record is an older shim mid-publish or a corrupt marker;
+      # judge it only after a second observation.
+      ownerless=1
+      rm -f "$lease"
+      sleep 0.1
+      continue
+    fi
+    # Rename the record out of the way, then judge the copy that was actually
+    # moved: a successor published in the meantime is restored, never unlinked
+    # by path. The rename is atomic and mv handles a file and a legacy directory.
+    if mv "$lock" "$abandoned.$$" 2>/dev/null; then
+      moved=$(lock_owner_at "$abandoned.$$")
+      case $moved in
+        ''|"$$") rm -rf "$abandoned.$$" 2>/dev/null ;;
+        *)
+          if kill -0 "$moved" 2>/dev/null; then
+            mv "$abandoned.$$" "$lock" 2>/dev/null || :
+          else
+            rm -rf "$abandoned.$$" 2>/dev/null
+          fi ;;
+      esac
+    fi
+    ownerless=0
+    rm -f "$lease"
   done
-  trap 'rm -f "$lock"' 0
+  trap 'release_blob_lock' 0
   trap 'exit 1' HUP INT TERM
   missing=$(query_repository objects "$@" <<EOF | awk '$2 == "missing" { print $1 }'
 $missing
