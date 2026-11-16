@@ -355,35 +355,34 @@ $1
   [ "$blob_verb" != grep ] || [ -n "$blob_args" ] || return 1
   return 0
 }
-lock_owner_at() {
-  # A reservation is a pid file; an older shim kept the pid inside a directory.
-  owner=
-  read -r owner 2>/dev/null < "$1"
-  case $owner in ''|*[!0-9]*) read -r owner 2>/dev/null < "$1/pid" ;; esac
-  case $owner in ''|*[!0-9]*) return 0 ;; esac
-  printf '%s\\n' "$owner"
+lock_read() {
+  # Sets owner and nonce; an older marker carries only a pid.
+  owner=; nonce=
+  { read -r owner; read -r nonce; } 2>/dev/null < "$1"
+  case $owner in ''|*[!0-9]*) owner=; nonce=; { read -r owner; read -r nonce; } 2>/dev/null < "$1/pid" ;; esac
+  case $owner in ''|*[!0-9]*) owner= ;; esac
 }
-lock_owner() { lock_owner_at "$lock"; }
+lock_owner() { lock_read "$lock"; printf '%s\\n' "$owner"; }
 lock_exists() { [ -f "$1" ] || [ -d "$1" ] || [ -L "$1" ]; }
+lock_nonce() { sequence=$((sequence + 1)); printf '%s.%s.%s\\n' "$$" "$(date +%s)" "$sequence"; }
+restore_moved() {
+  # A link refuses an existing path, so a restore never replaces a newer record.
+  [ -d "$2" ] || if ln "$1" "$2" 2>/dev/null; then rm -rf "$1"; fi
+}
 judge_moved() {
-  # $1 = moved record, $2 = path it returns to when its owner is still alive.
-  moved=$(lock_owner_at "$1")
-  case $moved in
-    ''|"$$") rm -rf "$1" ;;
-    *) if kill -0 "$moved" 2>/dev/null; then mv "$1" "$2" 2>/dev/null || :; else rm -rf "$1"; fi ;;
-  esac
+  # $1 = moved record, $2 = shared path, $3/$4 = the identity judged dead. A record
+  # whose identity changed is never unlinked and only put back onto a free path.
+  lock_read "$1"
+  if [ "$owner" != "$3" ] || [ "$nonce" != "$4" ]; then restore_moved "$1" "$2"; return 0; fi
+  case $owner in ''|"$$") rm -rf "$1" ;; *) if kill -0 "$owner" 2>/dev/null; then restore_moved "$1" "$2"; else rm -rf "$1"; fi ;; esac
 }
 release_blob_lock() {
-  # No unlink ever runs against the shared path: move the record first, judge the
-  # copy, and put a foreign record back instead of deleting it.
+  # No unlink runs against the shared path: judge the copy, and put a foreign record back only onto a free path.
   [ "$(lock_owner)" = "$$" ] || return 0
   released=$lock.released.$$
   if mv "$lock" "$released" 2>/dev/null; then
-    if [ "$(lock_owner_at "$released")" = "$$" ]; then
-      rm -rf "$released"
-    else
-      mv "$released" "$lock" 2>/dev/null || :
-    fi
+    lock_read "$released"
+    if [ "$owner" = "$$" ]; then rm -rf "$released"; else restore_moved "$released" "$lock"; fi
   fi
   return 0
 }
@@ -419,6 +418,7 @@ EOF
   abandoned=$lock.abandoned
   attempts=0
   ownerless=0
+  round=0
   # Publish the owner pid as one atomic link: a live reservation is never
   # ownerless, and mkdir is unusable because uutils reports a lost race as won.
   while :; do
@@ -427,7 +427,7 @@ EOF
       # reservation path is only ever reclaimed, never published over.
       if [ ! -d "$lock" ]; then
         publish=$lock.$$.new
-        if printf '%s\\n' "$$" > "$publish" 2>/dev/null &&
+        if printf '%s\\n%s\\n' "$$" "$(lock_nonce)" > "$publish" 2>/dev/null &&
           ln "$publish" "$lock" 2>/dev/null && [ "$(lock_owner)" = "$$" ]; then
           rm -f "$publish"
           break
@@ -439,19 +439,20 @@ EOF
     [ "$attempts" -lt 300 ] || return 0
     leased=0
     lease_publish=$lease.$$.new
-    if printf '%s\\n' "$$" > "$lease_publish" 2>/dev/null; then
+    if printf '%s\\n%s\\n' "$$" "$(lock_nonce)" > "$lease_publish" 2>/dev/null; then
       if ln "$lease_publish" "$lease" 2>/dev/null; then leased=1; fi
       rm -f "$lease_publish"
     fi
     if [ "$leased" != 1 ]; then
       # An abandoned lease must not block hydration forever.
-      held=$(lock_owner_at "$lease")
-      case $held in
+      lock_read "$lease"
+      case $owner in
         ''|"$$") ;;
         *)
-          if ! kill -0 "$held" 2>/dev/null; then
-            if mv "$lease" "$abandoned.lease.$$" 2>/dev/null; then
-              judge_moved "$abandoned.lease.$$" "$lease"
+          if ! kill -0 "$owner" 2>/dev/null; then
+            round=$((round + 1))
+            if mv "$lease" "$abandoned.lease.$$.$round" 2>/dev/null; then
+              judge_moved "$abandoned.lease.$$.$round" "$lease" "$owner" "$nonce"
             fi
           fi ;;
       esac
@@ -459,11 +460,11 @@ EOF
       continue
     fi
     # The lease is ours: read the record now, never before it.
-    previous=$(lock_owner)
-    case $previous in
+    lock_read "$lock"
+    case $owner in
       ''|"$$") ;;
       *)
-        if kill -0 "$previous" 2>/dev/null; then
+        if kill -0 "$owner" 2>/dev/null; then
           # A live owner keeps its reservation; a long batch is not abandonment.
           rm -f "$lease"
           attempts=0
@@ -472,7 +473,7 @@ EOF
           continue
         fi ;;
     esac
-    if [ -z "$previous" ] && lock_exists "$lock" && [ "$ownerless" -lt 1 ]; then
+    if [ -z "$owner" ] && lock_exists "$lock" && [ "$ownerless" -lt 1 ]; then
       # An ownerless record is an older shim mid-publish or a corrupt marker;
       # judge it only after a second observation.
       ownerless=1
@@ -480,11 +481,11 @@ EOF
       sleep 0.1
       continue
     fi
-    # Rename the record out of the way, then judge the copy that was actually
-    # moved: a successor published in the meantime is restored, never unlinked
-    # by path. The rename is atomic and mv handles a file and a legacy directory.
-    if mv "$lock" "$abandoned.$$" 2>/dev/null; then
-      judge_moved "$abandoned.$$" "$lock"
+    # Rename the record aside, then judge the copy that was actually moved: an
+    # identity that changed is never unlinked and never restored over a successor.
+    round=$((round + 1))
+    if mv "$lock" "$abandoned.$$.$round" 2>/dev/null; then
+      judge_moved "$abandoned.$$.$round" "$lock" "$owner" "$nonce"
     fi
     ownerless=0
     rm -f "$lease"

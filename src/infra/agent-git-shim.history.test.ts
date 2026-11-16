@@ -405,6 +405,91 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32")(
+  "does not restore a reclaimed lease over a successor that arrived meanwhile",
+  () =>
+    withHistoryFixture(async ({ root, origin, file, git, reader }) => {
+      const { base, linked, invoke, newPacks } = await reader();
+      const gitDir = path.join(base, ".git");
+      const lock = path.join(gitDir, "openclaw-history-blobs.lock");
+      const lease = `${lock}.reclaim`;
+      const dead = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      const arrived = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      const successor = spawn("sleep", ["2"]);
+      try {
+        expect(successor.pid).toBeTypeOf("number");
+        await fs.writeFile(lock, `${dead}\n`);
+        await fs.writeFile(lease, `${dead}\n7\n`);
+        // The shim's own mv is the rendezvous: it holds the move of the lease until
+        // this test has removed the dead lease and published a live successor, then
+        // it installs a third caller's record at the freed path. The reclaim that
+        // read the dead lease has judged a record that no longer exists, so it must
+        // not remove or restore anything, and above all must not overwrite.
+        const bin = path.join(root, "lease mv");
+        const parked = path.join(root, "lease parked");
+        const go = path.join(root, "lease go");
+        const injected = path.join(root, "lease injected");
+        const restores = path.join(root, "lease restores");
+        const realMv = execFileSync("sh", ["-c", "command -v mv"], { encoding: "utf8" }).trim();
+        await fs.mkdir(bin, { recursive: true });
+        await fs.writeFile(
+          path.join(bin, "mv"),
+          `#!/bin/sh
+for last; do :; done
+if [ "$1" = "${lease}" ] && [ ! -f "${parked}" ]; then
+  : > "${parked}"
+  while [ ! -f "${go}" ]; do sleep 0.02; done
+fi
+"${realMv}" "$@"
+status=$?
+if [ "$1" = "${lease}" ] && [ ! -f "${injected}" ]; then
+  : > "${injected}"
+  echo "${arrived}" > "${lease}"
+  echo 0 >> "${lease}"
+elif [ "$last" = "${lease}" ] && [ -f "${injected}" ]; then
+  { read -r first; echo "$first"; } < "${lease}" >> "${restores}"
+fi
+exit $status
+`,
+          { mode: 0o755 },
+        );
+        const args = ["log", "-S", "history line 3", "--", file];
+        const run = invoke(args, linked, { PATH: `${bin}:${process.env.PATH ?? ""}` });
+        const waitFor = async (name: string, marker: string) => {
+          for (let attempt = 0; attempt < 500; attempt++) {
+            if (await fs.stat(marker).catch(() => null)) {
+              return;
+            }
+            await new Promise((resolve) => {
+              setTimeout(resolve, 20);
+            });
+          }
+          throw new Error(`timed out waiting for ${name}`);
+        };
+        await waitFor("the move of the lease", parked);
+        await fs.rm(lease);
+        await fs.writeFile(lease, `${successor.pid}\n8\n`);
+        await fs.writeFile(go, "");
+        const result = await run;
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stdout).toBe(git(origin, args));
+        expect(await newPacks()).toHaveLength(1);
+        // A restore through mv silently replaces the third caller's record. The
+        // shim must refuse instead, and keep the record it moved but did not judge.
+        const overwritten = (await fs.readFile(restores, "utf8").catch(() => "")).trim();
+        expect(overwritten, "restored over a lease that another caller had acquired").toBe("");
+        const kept = (await fs.readdir(gitDir)).filter((name) =>
+          name.includes(".abandoned.lease."),
+        );
+        expect(kept, "the moved successor record was deleted").toHaveLength(1);
+        expect(await fs.readFile(path.join(gitDir, kept[0]), "utf8")).toBe(`${successor.pid}\n8\n`);
+      } finally {
+        successor.kill();
+      }
+    }),
+  60_000,
+);
+
+it.skipIf(process.platform === "win32")(
   "leaves a live owner's reservation untouched while concurrent callers wait",
   () =>
     withHistoryFixture(async ({ origin, file, git, reader }) => {
