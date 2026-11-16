@@ -365,6 +365,14 @@ lock_owner_at() {
 }
 lock_owner() { lock_owner_at "$lock"; }
 lock_exists() { [ -f "$1" ] || [ -d "$1" ] || [ -L "$1" ]; }
+judge_moved() {
+  # $1 = moved record, $2 = path it returns to when its owner is still alive.
+  moved=$(lock_owner_at "$1")
+  case $moved in
+    ''|"$$") rm -rf "$1" ;;
+    *) if kill -0 "$moved" 2>/dev/null; then mv "$1" "$2" 2>/dev/null || :; else rm -rf "$1"; fi ;;
+  esac
+}
 release_blob_lock() {
   # No unlink ever runs against the shared path: move the record first, judge the
   # copy, and put a foreign record back instead of deleting it.
@@ -405,30 +413,26 @@ EOF
   # Serialize across linked worktrees, then inspect the objects under the lock:
   # overlapping callers fetch only the part not already supplied by the leader.
   lock=$common/openclaw-history-blobs.lock
-  # One caller at a time may judge an abandoned reservation. The lease is taken
-  # before the record is read and every other caller waits for the verdict, so
-  # two reclaimers cannot clear each other's successor.
+  # One caller at a time may judge an abandoned reservation: the lease is taken
+  # before the record is read, so two reclaimers cannot clear a successor.
   lease=$lock.reclaim
   abandoned=$lock.abandoned
   attempts=0
   ownerless=0
-  # Reserve with O_EXCL and publish the owner pid in one atomic link, so a live
-  # reservation is never ownerless and a paused winner cannot be taken over.
-  # mkdir is unusable here; uutils coreutils reports success for a path another
-  # caller just created, and both then hydrate the same object store.
+  # Publish the owner pid as one atomic link: a live reservation is never
+  # ownerless, and mkdir is unusable because uutils reports a lost race as won.
   while :; do
     if ! lock_exists "$lease"; then
-      # ln into an existing directory would link *inside* it, so a directory at
-      # the reservation path is only ever reclaimed, never published over.
+      # ln into an existing directory links *inside* it, so a directory at the
+      # reservation path is only ever reclaimed, never published over.
       if [ ! -d "$lock" ]; then
         publish=$lock.$$.new
-        if printf '%s\\n' "$$" > "$publish" 2>/dev/null; then
-          if ln "$publish" "$lock" 2>/dev/null && [ "$(lock_owner)" = "$$" ]; then
-            rm -f "$publish"
-            break
-          fi
+        if printf '%s\\n' "$$" > "$publish" 2>/dev/null &&
+          ln "$publish" "$lock" 2>/dev/null && [ "$(lock_owner)" = "$$" ]; then
           rm -f "$publish"
+          break
         fi
+        rm -f "$publish"
       fi
     fi
     attempts=$((attempts + 1))
@@ -447,11 +451,7 @@ EOF
         *)
           if ! kill -0 "$held" 2>/dev/null; then
             if mv "$lease" "$abandoned.lease.$$" 2>/dev/null; then
-              moved=$(lock_owner_at "$abandoned.lease.$$")
-              case $moved in
-                ''|"$$") rm -f "$abandoned.lease.$$" ;;
-                *) mv "$abandoned.lease.$$" "$lease" 2>/dev/null || : ;;
-              esac
+              judge_moved "$abandoned.lease.$$" "$lease"
             fi
           fi ;;
       esac
@@ -484,16 +484,7 @@ EOF
     # moved: a successor published in the meantime is restored, never unlinked
     # by path. The rename is atomic and mv handles a file and a legacy directory.
     if mv "$lock" "$abandoned.$$" 2>/dev/null; then
-      moved=$(lock_owner_at "$abandoned.$$")
-      case $moved in
-        ''|"$$") rm -rf "$abandoned.$$" 2>/dev/null ;;
-        *)
-          if kill -0 "$moved" 2>/dev/null; then
-            mv "$abandoned.$$" "$lock" 2>/dev/null || :
-          else
-            rm -rf "$abandoned.$$" 2>/dev/null
-          fi ;;
-      esac
+      judge_moved "$abandoned.$$" "$lock"
     fi
     ownerless=0
     rm -f "$lease"

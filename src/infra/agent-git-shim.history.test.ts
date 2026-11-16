@@ -200,7 +200,9 @@ it.skipIf(process.platform === "win32")(
       const peer = path.join(root, "double win peer");
       git(base, ["worktree", "add", "--detach", peer]);
       // uutils coreutils reports success for a path another caller created, and
-      // the shim then hydrates the shared store twice.
+      // the shim then hydrates the shared store twice. The fake records whether
+      // the second success happened while the first caller still held the path,
+      // which is the concurrency the fix has to remove, not just the call.
       const bin = path.join(root, "faulty mkdir");
       const record = path.join(root, "double win records");
       const mkdirPath = execFileSync("sh", ["-c", "command -v mkdir"], { encoding: "utf8" }).trim();
@@ -210,11 +212,19 @@ it.skipIf(process.platform === "win32")(
         `#!/bin/sh
 for last; do :; done
 if "${mkdirPath}" "$@"; then
-  case $last in *openclaw-history-blobs.lock) sleep 5 ;; esac
+  case $last in *openclaw-history-blobs.lock)
+    printf '%s\\n' entered >> "${record}"
+    sleep 5
+    printf '%s\\n' left >> "${record}" ;;
+  esac
   exit 0
 fi
 case $last in
-  *openclaw-history-blobs.lock) printf '%s\\n' "$last" >> "${record}"; exit 0 ;;
+  *openclaw-history-blobs.lock)
+    if grep -qx entered "${record}" 2>/dev/null && ! grep -qx left "${record}" 2>/dev/null; then
+      printf '%s\\n' double-win-inside >> "${record}"
+    fi
+    exit 0 ;;
 esac
 exit 1
 `,
@@ -231,10 +241,12 @@ exit 1
         expect(result.code, result.stderr).toBe(0);
         expect(result.stdout).toBe(expected);
       }
-      // The leader's fetch supplies both callers, so a second hydration would
-      // be the double win this test forbids.
+      // One hydration, and no second success while the first caller still held
+      // the reservation: the record proves the concurrent win, the pack count
+      // proves it did not turn into a second hydration this time.
       expect(await newPacks()).toHaveLength(1);
-      expect(await fs.readFile(record, "utf8").catch(() => "")).toBe("");
+      const records = (await fs.readFile(record, "utf8").catch(() => "")).trim();
+      expect(records.split("\n").filter(Boolean)).not.toContain("double-win-inside");
       expect(await fs.readdir(path.join(base, ".git"))).not.toContain(
         "openclaw-history-blobs.lock",
       );
@@ -313,8 +325,10 @@ it.skipIf(process.platform === "win32")(
           path.join(guards, name),
           `#!/bin/sh
 for a do
-  if [ "$a" = "$LOCK" ]; then${probe}
-  fi
+  case $a in *openclaw-history-blobs.lock*)
+    if [ -f "$a" ] || [ -d "$a" ]; then${probe}
+    fi ;;
+  esac
 done
 exec "${real}" "$@"
 `,
@@ -335,13 +349,13 @@ exec "${real}" "$@"
         ],
       ] as const;
       for (const [label, seed] of scenarios) {
-        const { base, linked, invoke, newPacks } = await reader();
-        const gitDir = path.join(base, ".git");
-        const lock = path.join(gitDir, "openclaw-history-blobs.lock");
         for (let round = 0; round < rounds; round++) {
-          await fs.rm(lock, { recursive: true, force: true });
+          // A fresh reader per round: a reused store can satisfy a later search
+          // from an earlier hydration and never take the lock at all.
+          const { base, linked, invoke, newPacks } = await reader();
+          const gitDir = path.join(base, ".git");
+          const lock = path.join(gitDir, "openclaw-history-blobs.lock");
           await seed(lock);
-          const before = (await newPacks()).length;
           const args = ["log", "-S", `history line ${round}`, "--", file];
           const env = { PATH: `${guards}:${process.env.PATH ?? ""}`, VIOL: violations, LOCK: lock };
           const results = await Promise.all(
@@ -351,13 +365,43 @@ exec "${real}" "$@"
             expect(result.code, result.stderr).toBe(0);
             expect(result.stdout).toBe(git(origin, args));
           }
-          expect((await newPacks()).length - before, `${label} round ${round}`).toBe(1);
+          expect(await newPacks(), `${label} round ${round}`).toHaveLength(1);
           expect(await fs.readFile(violations, "utf8").catch(() => "")).toBe("");
           expect(await fs.readdir(gitDir)).not.toContain("openclaw-history-blobs.lock");
         }
       }
     }),
-  180_000,
+  240_000,
+);
+
+it.skipIf(process.platform === "win32")(
+  "drops a lease left by a dead reclaimer instead of restoring it",
+  () =>
+    withHistoryFixture(async ({ origin, file, git, reader }) => {
+      const { base, linked, invoke, newPacks } = await reader();
+      const gitDir = path.join(base, ".git");
+      const lock = path.join(gitDir, "openclaw-history-blobs.lock");
+      const lease = `${lock}.reclaim`;
+      const deadOwner = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      const deadLease = execFileSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).trim();
+      expect(deadLease).not.toBe(deadOwner);
+      await fs.writeFile(lock, `${deadOwner}\n`);
+      await fs.writeFile(lease, `${deadLease}\n`);
+      const args = ["log", "-S", "history line 8", "--", file];
+      const result = await invoke(args, linked);
+      // Restoring a dead lease forever makes the caller hit the attempt bound and
+      // skip hydration silently, which is exactly what this test forbids.
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toBe(git(origin, args));
+      expect(await newPacks()).toHaveLength(1);
+      expect(await fs.readdir(gitDir)).not.toContain("openclaw-history-blobs.lock");
+      expect(await fs.readdir(gitDir)).not.toContain("openclaw-history-blobs.lock.reclaim");
+      const leftovers = (await fs.readdir(gitDir)).filter((name) =>
+        name.startsWith("openclaw-history-blobs"),
+      );
+      expect(leftovers).toEqual([]);
+    }),
+  60_000,
 );
 
 it.skipIf(process.platform === "win32")(
@@ -372,7 +416,9 @@ it.skipIf(process.platform === "win32")(
       const args = ["log", "-S", "history line 7", "--", file];
       const waiters = Promise.all(Array.from({ length: 6 }, () => invoke(args, linked)));
       try {
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await new Promise((resolve) => {
+          setTimeout(resolve, 300);
+        });
         // The reservation must still name the live owner: a reclaim that unlinked
         // and replaced it would let a second caller hydrate the same store.
         expect(await fs.readFile(lock, "utf8")).toBe(`${owner.pid}\n`);
