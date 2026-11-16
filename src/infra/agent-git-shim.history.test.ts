@@ -193,7 +193,7 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32")(
-  "keeps lazy blob fetches serialised when mkdir reports a concurrent path as created",
+  "keeps lazy blob fetches serialized when mkdir reports a concurrent path as created",
   () =>
     withHistoryFixture(async ({ root, origin, file, git, reader }) => {
       const { base, linked, invoke, newPacks } = await reader();
@@ -288,7 +288,7 @@ it.skipIf(process.platform === "win32")(
 );
 
 it.skipIf(process.platform === "win32")(
-  "serialises reclaim so a live owner never loses its reservation",
+  "serializes reclaim so a live owner never loses its reservation",
   () =>
     withHistoryFixture(async ({ root, origin, file, git, reader }) => {
       // A deletion of the reservation path while its pid is alive is the defect:
