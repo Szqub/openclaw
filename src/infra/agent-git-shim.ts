@@ -123,12 +123,13 @@ query_repository() {
       done
       return 1 ;;
     blobless)
-      remote_settings=$(git "$@" config --get-regexp '^remote\\..*\\.(url|promisor|partialclonefilter)$' 2>/dev/null) || return 1
+      remote_settings=$(git "$@" config --get-regexp '^(remote\\..*\\.(url|promisor|partialclonefilter)|log[.]follow)$' 2>/dev/null) || return 1
       remote_settings="
 $remote_settings
 "
       case $remote_settings in *'.partialclonefilter blob:none
 '*) ;; *) return 1 ;; esac ;;
+    log_follow) git "$@" config --bool --get log.follow 2>/dev/null ;;
     register_remotes)
       remotes=$(git "$@" remote) || return 1
       fetch_cwd=
@@ -191,6 +192,18 @@ $remotes
 EOF
       ;;
     objects) GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= exec git "$@" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null ;;
+    missing_blobs)
+      # Unlike cat-file on older Git, missing=print never hydrates these blob roots.
+      present=$(GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= git "$@" rev-list --objects --no-walk --ignore-missing --missing=print --stdin 2>/dev/null <<EOF
+$missing
+EOF
+      ) || return 1
+      printf '%s\\n--\\n%s\\n' "$present" "$missing" | awk '
+        $0 == "--" { candidates=1; next }
+        candidates { if (!seen[$1]) print $1; next }
+        { seen[$1]=1 }
+      '
+      ;;
     resolve) GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= exec git "$@" rev-parse --verify --end-of-options "$revision" 2>/dev/null ;;
     revisions)
       marker='HEAD^{commit}'
@@ -225,35 +238,46 @@ EOF
 $missing
 EOF
       ;;
-    history_blobs)
+    history_blobs|history_paths)
+      [ "$query" != history_paths ] || set -- "$@" -c core.quotePath=false
       # Raw changes include both sides of range/limit boundaries without opening blobs.
       [ "$blob_literal" != 1 ] || set -- "$@" --no-literal-pathspecs
       case $blob_verb in
         grep) set -- "$@" rev-list --objects --no-walk --missing=print ;;
         diff) set -- "$@" diff ;;
         log) set -- "$@" log ;;
+        blame) set -- "$@" -c log.follow=false log -m --root ;;
         *) set -- "$@" log -m ;;
       esac
       while IFS= read -r arg; do [ -z "$arg" ] || set -- "$@" "$arg"; done <<EOF
 $blob_args
 EOF
       if [ "$blob_verb" != grep ]; then
-        set -- "$@" --format= --no-patch --raw --no-abbrev --no-renames --no-ext-diff --no-textconv --color=never
+        set -- "$@" --format= --no-patch --raw --no-abbrev --no-renames --no-relative --no-ext-diff --no-textconv --color=never
       fi
+      [ "$query" != history_paths ] || set -- "$@" --full-diff --diff-filter=D
       set -- "$@" --
       while IFS= read -r arg; do [ -z "$arg" ] || set -- "$@" "$arg"; done <<EOF
 $blob_paths
 EOF
-      { GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= git "$@" 2>/dev/null && echo complete; } | LC_ALL=C awk -v verb="$blob_verb" '
-        BEGIN { speculative = verb == "show" || verb == "blame" }
+      { GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= git "$@" 2>/dev/null && echo complete; } | LC_ALL=C awk -v query="$query" '
         function add(oid, mode) {
           if (mode == "160000" || oid ~ /^0+$/ || seen[oid]++) return
-          if (speculative && (++count > 2048 || (bytes += length(oid) + 1) > 131072)) exit
+          if (++count > 2048 || (bytes += length(oid) + 1) > 131072) exit
         }
-        { if (speculative && (scanned += length($0) + 1) > 8388608) exit }
+        { if ((scanned += length($0) + 1) > 8388608) exit }
         /^\\?/ { add(substr($1, 2), "100644") }
-        /^:[0-7]+ [0-7]+ [0-9a-f]+ [0-9a-f]+ / {
-          add($3, substr($1, 2)); add($4, $2)
+        /^:+[0-7]+ / {
+          if (query == "history_paths") {
+            path = substr($0, index($0, "\\t") + 1)
+            # Git-quoted names cannot enter the line-delimited pathspec batch.
+            if (path ~ /^"/) exit
+            add(":(top,literal)" path, substr($1, 2))
+          } else {
+            parents = match($0, /[0-7]/) - 1
+            for (i=1; i<=parents+1; i++)
+              add($(parents+1+i), i == 1 ? substr($1, parents+1) : $i)
+          }
         }
         /^complete$/ { complete=1 }
         END { if (!complete) print "skip"; else for (oid in seen) print oid }
@@ -351,13 +375,76 @@ $1
   # Pickaxe counts matching commits, so limits cannot bound the content scan.
   [ "$blob_pickaxe" = 1 ] || blob_args="$blob_args$blob_limits"
   [ "$blob_patch$blob_pickaxe" != "" ] || return 1
-  [ "$blob_verb" != blame ] || [ -n "$blob_paths" ] || return 1
+  if [ "$blob_verb" = blame ]; then
+    [ -n "$blob_paths" ] || return 1
+    blob_paths=":(literal)\${blob_paths%'
+'}"
+    blob_literal=1
+  fi
   [ "$blob_verb" != grep ] || [ -n "$blob_args" ] || return 1
   return 0
 }
-prepare_blobs() (
+wait_for_legacy_prefix() {
+  # An older shim may still hold its mkdir directory lock from before the
+  # upgrade. Serve a live owner first and never reclaim or remove the record.
+  # kill -0 only shows that the pid exists, so a reused pid could hold us for
+  # good; bound the wait the way the directory lock was bounded. This runs
+  # before the kernel lock so parallel callers wait 30 s together instead of
+  # queueing behind each other for another 30 s.
+  legacy=$common/openclaw-history-blobs.lock
+  attempts=0
+  while read -r owner 2>/dev/null < "$legacy/pid" && kill -0 "$owner" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 300 ] || return 1
+    sleep 0.1
+  done
+  return 0
+}
+prefetch_with_lock() {
+  # The kernel lock file is never unlinked and stays in .git as an empty file.
+  # A failed open or an unavailable command must fall back, so the open and the
+  # lock run in a nested subshell; a failed exec cannot end this shell. The
+  # kernel drops the descriptor lock when that subshell exits, so there is no
+  # reclaim step and no interval in which two callers believe they own it.
+  if ! (
+    { exec 9>>"$common/openclaw-history-blobs.lock.kernel"; } 2>/dev/null || exit 1
+    case $(uname -s) in
+      Linux) flock -x 9 2>/dev/null || exit 1 ;;
+      *) lockf -s 9 2>/dev/null || exit 1 ;;
+    esac
+    missing=$(query_repository missing_blobs "$@")
+    [ -n "$missing" ] || exit 0
+    query_repository fetch_blobs "$@" 2>/dev/null || :
+  ); then
+    # No usable kernel lock: keep an mkdir mutex without the old reclaim step.
+    # Cleanup only removes the record while this process still owns the pid
+    # file, so it cannot delete a successor's lock. If this process is killed
+    # before cleanup, the directory stays and every later prefetch on this
+    # path waits 30 s and skips. The directory is in $common (the
+    # git-common-dir), not in a linked worktree's .git file. Stop every process
+    # that may use it, then remove it with:
+    # rm -r "$(git rev-parse --git-common-dir)/openclaw-history-blobs.lock.fallback"
+    # The kernel lock and this mutex are different names, so environments that
+    # resolve different binaries can still fetch beside each other.
+    lock=$common/openclaw-history-blobs.lock.fallback; attempts=0
+    until mkdir "$lock" 2>/dev/null; do
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 300 ] || return 1
+      sleep 0.1
+    done
+    trap 'if [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null; fi' 0
+    trap 'exit 1' HUP INT TERM
+    echo $$ > "$lock/pid"
+    missing=$(query_repository missing_blobs "$@")
+    [ -n "$missing" ] || return 0
+    query_repository fetch_blobs "$@" 2>/dev/null || :
+  fi
+}
+prepare_blobs() {
   [ "$no_lazy_fetch" != 1 ] || return 0
   case \${GIT_NO_LAZY_FETCH:-} in 1|true|yes|on) return 0 ;; esac
+  # Log arguments that are implicit paths retain their native handling.
+  [ "$verb" != log ] || [ "$unresolved_revision" != 1 ] || return 0
   # This portable shell helper uses line-delimited arguments and object IDs.
   for arg do case $arg in *'
 '*) return 0 ;; esac; done
@@ -367,70 +454,68 @@ prepare_blobs() (
 $blob_expression
 EOF
     )
-    case $object in *' missing') ;; *) return 0 ;; esac
+    case $object in *' missing'|'') ;; *) return 0 ;; esac
   fi
   query_repository blobless "$@" || return 0
-  candidates=$(query_repository history_blobs "$@")
-  case $candidates in ''|skip) return 0 ;; esac
-  missing=$(query_repository objects "$@" <<EOF | awk '$2 == "missing" { print $1 }'
-$candidates
-EOF
-  )
-  [ -n "$missing" ] || return 0
   query_repository shared "$@" || return 0
-  # Serialize across linked worktrees, then inspect the objects under the lock:
-  # overlapping callers fetch only the part not already supplied by the leader.
-  lock=$common/openclaw-history-blobs.lock
-  attempts=0
-  until mkdir "$lock" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 300 ] || return 0
-    # A large live batch may exceed thirty seconds; do not start lazy fetches
-    # beside it. Only an ownerless lock retains the bounded fallback.
-    if read -r owner 2>/dev/null < "$lock/pid"; then
-      if kill -0 "$owner" 2>/dev/null; then
-        attempts=0
-      else
-        rm -f "$lock/pid"
-        rmdir "$lock" 2>/dev/null && continue
-      fi
-    fi
-    sleep 0.1
-  done
-  trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null' 0
-  trap 'exit 1' HUP INT TERM
-  echo $$ > "$lock/pid"
-  missing=$(query_repository objects "$@" <<EOF | awk '$2 == "missing" { print $1 }'
-$missing
-EOF
-  )
-  [ -n "$missing" ] || return 0
-  count=$(printf '%s\n' "$missing" | wc -l)
-  if [ "$count" -ge 2048 ]; then
-    echo "OpenClaw: fetching $count missing Git objects for this content search." >&2
+  if [ "$blob_verb" = log ] && [ -n "$blob_paths" ]; then
+    case $remote_settings in *'
+log.follow'*)
+      # Implicit follow has the same native contract as unsupported --follow.
+      [ "$(query_repository log_follow "$@")" != true ] || return 0 ;;
+    esac
   fi
-  # Keep large searches under the shared lock, with bounded pack construction.
-  if [ "$count" -gt 2048 ]; then
-    printf '%s\\n' "$missing" | (
-      IFS= read -r missing || exit 0
-      count=1
-      while IFS= read -r oid; do
-        if [ "$count" = 2048 ]; then
-          query_repository fetch_blobs "$@" 2>/dev/null || exit 0
-          missing=$oid
-          count=1
-        else
-          missing="$missing
-$oid"
-          count=$((count + 1))
-        fi
+  # Show prepares history speculatively; other content searches must stay offline
+  # after this bounded prefetch, even when discovery or the fetch cannot finish.
+  # A legacy or lock timeout skips the prefetch; non-show searches then take the
+  # offline path, while show keeps its speculative native fallback.
+  [ "$blob_verb" = show ] || prepared_blobs=1
+  (
+    if [ "$blob_verb" = blame ]; then
+      # Rename detection needs content. Follow deleted-path candidates in the
+      # same commits offline first, including earlier names across rename chains.
+      while :; do
+        paths=$(query_repository history_paths "$@")
+        case $paths in skip) return 0 ;; '') break ;; esac
+        paths=$(printf '%s\\n%s\\n' "$blob_paths" "$paths" | LC_ALL=C awk '
+          NF && !seen[$0]++ {
+            if (++count > 2048 || (bytes += length($0) + 1) > 131072) { bounded=1; exit }
+            rows[count]=$0
+          }
+          END { if (bounded) print "skip"; else for (i=1; i<=count; i++) print rows[i] }
+        ')
+        [ "$paths" != skip ] || return 0
+        [ "$paths" != "$blob_paths" ] || break
+        blob_paths=$paths
       done
-      query_repository fetch_blobs "$@" 2>/dev/null || :
-    )
-    return
-  fi
-  query_repository fetch_blobs "$@" 2>/dev/null || :
-)
+    fi
+    candidates=$(query_repository history_blobs "$@")
+    if [ -z "$candidates" ] && [ "$blob_verb" = blame ]; then
+      # An unchanged range still needs its endpoint content. Let Git expand the
+      # range, then read the last path change reachable from its positive tip.
+      revisions=$(printf %s "$blob_args")
+      query_repository revisions "$@" || return 0
+      blob_args=$(printf '%s\\n' "$resolved" | awk 'substr($0, 1, 1) != "^" { print; exit }')
+      blob_args="$blob_args
+-n
+1"
+      candidates=$(query_repository history_blobs "$@")
+    fi
+    case $candidates in ''|skip) return 0 ;; esac
+    missing=$candidates
+    missing=$(query_repository missing_blobs "$@")
+    [ -n "$missing" ] || return 0
+    # Serialize across linked worktrees, then inspect the objects under the lock:
+    # overlapping callers fetch only the part not already supplied by the leader.
+    # An old shim cannot see the kernel lock: it can still create its directory
+    # marker while a new prefetch runs, so the upgrade window is one-sided. The
+    # new side reads the old marker first and serves a live owner, which orders
+    # the common case without changing processes that are already running.
+    wait_for_legacy_prefix || return 0
+    prefetch_with_lock "$@"
+  )
+}
+
 append_revision_roots() {
   arg=$1
   traverse=
@@ -447,7 +532,7 @@ append_revision_roots() {
     fi
     revision=\${revision%%:*}
     revision=\${revision%%[~^]*}
-    case $revision in ''|*[[:space:]]*) continue ;; esac
+    case $revision in '') continue ;; *[[:space:]]*) unresolved_revision=1; continue ;; esac
     revisions="$revisions$revision
 "
   done
@@ -506,7 +591,7 @@ EOF
   ) || return 0
   while read -r revision kind; do
     [ "$kind" = missing ] || continue
-    oid=$(query_repository resolve "$@") || continue
+    oid=$(query_repository resolve "$@") || { unresolved_revision=1; continue; }
     if [ -z "$missing" ]; then
       query_repository blobless "$@" || return 0
       query_repository shared "$@" || return 0
@@ -525,6 +610,7 @@ EOF
 }
 prepare_commits() {
   revision_marker=
+  unresolved_revision=
   [ "$no_lazy_fetch" != 1 ] || return 0
   case \${GIT_NO_LAZY_FETCH:-} in 1|true|yes|on) return 0 ;; esac
   revision_roots "$@"
@@ -578,6 +664,14 @@ if ! is_probe "$@"; then
   if [ "$prepare_history" = 1 ]; then
     prepare_commits "$@" || exit 2
     case $verb in log|blame|show|diff|grep) prepare_blobs "$@" ;; esac
+    if [ "$prepared_blobs" = 1 ]; then
+      GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL= git "$@"
+      result=$?
+      [ "$result" = 0 ] && exit 0
+      [ "$blob_verb" = grep ] && [ "$result" = 1 ] && exit 1
+      echo 'OpenClaw: content search could not finish within the shared partial-clone blob budget; command stopped without lazy fetching. Add a narrower pathspec after --, use git grep on specific revisions, or set a --since bound (a revision range for blame), then retry.' >&2
+      exit 2
+    fi
   fi
   if [ "$projection_fetch" = 1 ]; then fetch_defaults "$@" || exit 2; fi
   if [ "$shallow_change" = 1 ] || [ -n "$fetch_depth" ]; then
